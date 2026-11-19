@@ -1,0 +1,7 @@
+/target
+# The spike's deployment specifics (account, names, keys) never enter the
+# repository: they live in a local config outside it (docs/spike.md, Musts).
+/worker/node_modules
+/worker/.wrangler
+/worker/wrangler.jsonc
+/local
