@@ -14,27 +14,32 @@ to the engineering style, evidence as files, one reset.
 
 ## Status
 
-**A spike in progress, not production.** Phases P1 (the design) and P2
-(the probe and the path) are done; the store (P3), the device and binary
-(P4) and the wakes on krun and Cloudflare (P5) are next. See
-[docs/spike.md](docs/spike.md), Results, and the evidence in
-`docs/evidence/`. No number here comes from a stand-in unless it says so.
+**A spike, not production.** All five phases have run: the design (P1),
+the probe and the path (P2), the store (P3), the daemon (P4) and the
+wakes on krun and Cloudflare (P5). See [docs/spike.md](docs/spike.md),
+Results, and the evidence in `docs/evidence/`. No number here comes from
+a stand-in unless it says so.
 
-Measured in P2 (2026-11-19):
+What it showed (2026-11-19):
 
 | | |
 | -- | -- |
-| The face on Cloudflare (kernel 6.18.64) and on krun (6.12.115) | a loop device over one FUSE file, with direct I/O, and ext4 on it: works on both; FUSE mount 2 ms, loop attach 8 ms, ext4 mount 17 ms on Cloudflare |
-| Through the face on Cloudflare, 256 MiB written and synced, read cold | 74% and 94% of the container's own disk (a local file behind the FUSE file) |
-| Local workerd's Docker container | no face: no `/dev/fuse`, no loop device, no `CAP_SYS_ADMIN` |
-| The path on Cloudflare: guest → intercept → handler → R2 | a 64 KiB ranged get 111 ms to first byte (p50), of which R2 98 ms and the intercept about 7 ms; an 8 MiB put 709 ms; a 50 MiB stream 25–50 MB/s |
+| The face, on Cloudflare (kernel 6.18.64) and krun (6.12.115) | ext4 on a loop device over one FUSE file, with direct I/O, works on both; local workerd's Docker container has no face |
+| Nothing flushed is lost | 150 crash rounds on krun and 20 on Cloudflare: `e2fsck`, SQLite and `git fsck` clean, every acknowledged write present |
+| A wake on Cloudflare, from the second on | the mount in 0.65–1.24 s and the boot's files read with no miss, the same at 1, 5 and 10 GB (it took 3.3–8.9 s and grew with the data before the open fetched its map in one round). The plan's 150 ms mount needs the platform to hand the guest its checkpoint (spike.md, proposals) |
+| Hermes on krun | first reply a median 2.9 s against 5.7 s on the container's own disk; WAL kept; ext4 on `/dev/loop0` |
+| Tools | git and SQLite within the plan's lines; a write larger than 256 MiB goes at R2's shipping rate (47–51 MB/s), which misses them |
+| Wrong bytes | two wrong ranged reads on Cloudflare in P2; none in 1,050,000 checked reads since. Every extent is checked and fetched again on a mismatch |
 
 ## Layout
 
 | Crate | What |
 | -- | -- |
 | `crates/device` | `fpac-device`: the face. One file served over `/dev/fuse` by hand, a loop device over it with direct I/O, ext4 made and mounted (Linux only; the protocol is pure) |
-| `crates/remote` | `fpac-remote`: the gate to the remote (open, ranged get, put-if-absent) over plain HTTP/1.1 |
+| `crates/remote` | `fpac-remote`: the gate to the remote (open, ranged get, put-if-absent, the head) over plain HTTP/1.1 |
+| `crates/format` | `fpac-format`: the store's objects (segments, map pages, checkpoints, packs) and its limits |
+| `crates/store` | `fpac-store`: the store's logic, pure, behind two gates; the head's rules; the simulator |
+| `crates/fpac` | `fpac`: the daemon in the guest (`fpac mount`, `fpac status`); one static binary |
 | `crates/testkit` | `fpac-testkit`: the folder remote (a stand-in) and the conformance suite |
 | `crates/probe` | `fpac-probe`: the guest's half of the evidence driver; one static binary |
 | `crates/bench` | `fpac-bench`: the evidence driver, `deploy`, `inventory`, `reset` |
@@ -43,13 +48,13 @@ Measured in P2 (2026-11-19):
 
 ## Build and test
 
-Rust stable (1.99 tested), on Linux or macOS:
+Rust stable (1.99 on Linux and 1.98 on macOS tested):
 
 ```sh
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo build --release --target x86_64-unknown-linux-musl -p fpac-probe
+cargo build --release --target x86_64-unknown-linux-musl -p fpac-probe -p fpac
 ```
 
 The evidence (Linux, with Docker; the krun place needs a sandcastle
@@ -63,6 +68,8 @@ cargo run --release -p fpac-bench -- probe --place docker --write
 cargo run --release -p fpac-bench -- deploy
 cargo run --release -p fpac-bench -- probe --place cloudflare --write
 cargo run --release -p fpac-bench -- path --place cloudflare --write
+cargo run --release -p fpac-bench -- wake --place krun --gb 10 --write --label 10gb
+cargo run --release -p fpac-bench -- crash --place cloudflare --rounds 10 --write
 cargo run --release -p fpac-bench -- reset
 ```
 

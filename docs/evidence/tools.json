@@ -3,42 +3,46 @@
   "places": {
     "cloudflare": {
       "bulk_data_deleted": {
-        "deleted": 529,
+        "deleted": 550,
         "pages": 1
       },
       "commit": {
-        "dirty": true,
-        "fpac": "795074e4ebdc"
+        "dirty": false,
+        "fpac": "a6d8f4bf33d1"
       },
       "daemon": {
-        "bytes_shipped": 1638717344,
+        "bytes_shipped": 1671210608,
         "checkpoints": 3,
-        "cuts": 35,
+        "cuts": 41,
         "dirty_extents": 0,
-        "durable_ms": 1795123415702,
-        "epoch": 1795123283114,
+        "durable_ms": 1795124679563,
+        "epoch": 1795124535080,
         "fenced": false,
         "fetch_retries": 0,
-        "full_waits": 344,
+        "full_waits": 423,
         "head_posted": true,
         "misses": 0,
-        "now_ms": 1795123514324,
+        "now_ms": 1795124777059,
+        "pack_waits": 0,
         "read_errors": 0,
-        "segments": 482,
+        "segments": 503,
         "shipping_segments": 0,
-        "syncs": 13478,
-        "up_ms": 230768
+        "syncs": 13493,
+        "up_ms": 241495
       },
-      "measured_at_ms": 1795123525178,
+      "measured_at_ms": 1795124786868,
       "mount": {
         "dir": "/data",
         "fpac": "mounted",
-        "ms": 69.58816
+        "misses": 0,
+        "ms": 79.473608,
+        "pack_waits": 0,
+        "waited_at": []
       },
       "npm": "not run: the guests have no internet (enableInternet is off), and npm ci needs its registry",
       "objects_at_end": {
-        "bytes": 1697339884,
-        "objects": 529
+        "bytes": 1727065716,
+        "objects": 550
       },
       "results": {
         "fpac": {
@@ -47,68 +51,68 @@
             "dir": "/data",
             "dir_30k": {
               "entries": 30000,
-              "list_cold_ms": 16.185993999999997,
-              "list_warm_ms": 11.42416
+              "list_cold_ms": 13.079421,
+              "list_warm_ms": 11.50639
             },
             "evidence": "fsbench",
             "random_4k_write_10s": {
-              "iops": 88949.0,
-              "writes": 1569453
+              "iops": 40437.0,
+              "writes": 905966
             },
             "saves": {
               "office_save_ms": {
-                "max": 318.288,
-                "mean": 4.34,
-                "min": 0.37,
+                "max": 260.54,
+                "mean": 12.47,
+                "min": 0.629,
                 "n": 500,
-                "p50": 3.919,
-                "p99": 10.161
+                "p50": 10.431,
+                "p99": 30.379
               },
               "scratch_file_ms": {
-                "max": 0.275,
-                "mean": 0.077,
-                "min": 0.049,
+                "max": 0.355,
+                "mean": 0.096,
+                "min": 0.052,
                 "n": 500,
-                "p50": 0.07,
-                "p99": 0.151
+                "p50": 0.094,
+                "p99": 0.182
               }
             },
             "sequential_1gib": {
               "page_cache_dropped": true,
-              "read_cold_mbs": 822.4,
-              "write_fsync_mbs": 49.8
+              "read_cold_mbs": 855.3,
+              "write_fsync_mbs": 46.9
             },
             "small_files": {
               "create_write_close_ms_each": 0.032,
-              "delete_all_ms": 225.077972,
+              "delete_all_ms": 221.227308,
               "files": 10000,
-              "read_cold_ms_each": 0.144,
+              "read_cold_ms_each": 0.188,
               "stat_cold_ms_each": 0.009,
-              "stat_warm_ms_each": 0.002
+              "stat_warm_ms_each": 0.003
             },
             "write_4k_osync_ms": {
-              "max": 5398.886,
-              "mean": 5.732,
-              "min": 0.148,
+              "max": 5421.509,
+              "mean": 5.82,
+              "min": 0.158,
               "n": 1000,
-              "p50": 0.21,
-              "p99": 0.906
+              "p50": 0.255,
+              "p99": 1.033
             }
           },
           "tools": {
-            "find_cold": 60,
-            "git_checkout_7260_changed": 28527,
-            "git_clone_7260_files": 31083,
-            "git_status_cold": 1040,
-            "git_status_warm": 114,
-            "grep_rl_cold": 1331,
-            "grep_rl_warm": 62,
+            "find_cold": 82,
+            "git_checkout_7260_changed": 28530,
+            "git_clone_7260_files": 30664,
+            "git_status_cold": 1071,
+            "git_status_warm": 97,
+            "grep_rl_cold": 1486,
+            "grep_rl_warm": 63,
             "journal_mode": "wal",
-            "rm_rf_checkout": 159,
-            "sqlite_100k_point_reads_warm": 31,
-            "sqlite_10k_txns_full": 3697,
-            "sqlite_10k_txns_normal": 255,
-            "sqlite_1m_rows_one_txn": 1675
+            "rm_rf_checkout": 163,
+            "sqlite_100k_point_reads_warm": 27,
+            "sqlite_10k_txns_full": 4118,
+            "sqlite_10k_txns_normal": 265,
+            "sqlite_1m_rows_one_txn": 1439
           }
         },
         "local": {
@@ -117,77 +121,77 @@
             "dir": "/var/tmp/local",
             "dir_30k": {
               "entries": 30000,
-              "list_cold_ms": 60.660082,
-              "list_warm_ms": 12.930651
+              "list_cold_ms": 53.457816,
+              "list_warm_ms": 12.830611
             },
             "evidence": "fsbench",
             "random_4k_write_10s": {
-              "iops": 17097.0,
-              "writes": 173873
+              "iops": 15968.0,
+              "writes": 163890
             },
             "saves": {
               "office_save_ms": {
-                "max": 21.306,
-                "mean": 1.81,
-                "min": 0.78,
+                "max": 9.77,
+                "mean": 1.423,
+                "min": 0.867,
                 "n": 500,
-                "p50": 1.507,
-                "p99": 5.435
+                "p50": 1.235,
+                "p99": 3.923
               },
               "scratch_file_ms": {
-                "max": 1.047,
-                "mean": 0.127,
-                "min": 0.087,
+                "max": 0.245,
+                "mean": 0.115,
+                "min": 0.083,
                 "n": 500,
-                "p50": 0.117,
-                "p99": 0.232
+                "p50": 0.112,
+                "p99": 0.174
               }
             },
             "sequential_1gib": {
               "page_cache_dropped": true,
-              "read_cold_mbs": 1484.9,
-              "write_fsync_mbs": 501.5
+              "read_cold_mbs": 1799.3,
+              "write_fsync_mbs": 464.4
             },
             "small_files": {
-              "create_write_close_ms_each": 0.068,
-              "delete_all_ms": 399.981281,
+              "create_write_close_ms_each": 0.113,
+              "delete_all_ms": 405.705436,
               "files": 10000,
-              "read_cold_ms_each": 0.221,
-              "stat_cold_ms_each": 0.027,
-              "stat_warm_ms_each": 0.007
+              "read_cold_ms_each": 0.286,
+              "stat_cold_ms_each": 0.022,
+              "stat_warm_ms_each": 0.003
             },
             "write_4k_osync_ms": {
-              "max": 47.239,
-              "mean": 1.765,
-              "min": 0.79,
+              "max": 18.779,
+              "mean": 1.446,
+              "min": 0.529,
               "n": 1000,
-              "p50": 1.442,
-              "p99": 4.867
+              "p50": 1.207,
+              "p99": 4.883
             }
           },
           "tools": {
-            "find_cold": 86,
-            "git_checkout_7260_changed": 28968,
-            "git_clone_7260_files": 29475,
-            "git_status_cold": 243,
-            "git_status_warm": 109,
-            "grep_rl_cold": 443,
-            "grep_rl_warm": 66,
+            "find_cold": 46,
+            "git_checkout_7260_changed": 28928,
+            "git_clone_7260_files": 31121,
+            "git_status_cold": 260,
+            "git_status_warm": 120,
+            "grep_rl_cold": 406,
+            "grep_rl_warm": 61,
             "journal_mode": "wal",
-            "rm_rf_checkout": 1001,
-            "sqlite_100k_point_reads_warm": 35,
-            "sqlite_10k_txns_full": 16497,
-            "sqlite_10k_txns_normal": 397,
-            "sqlite_1m_rows_one_txn": 1621
+            "rm_rf_checkout": 414,
+            "sqlite_100k_point_reads_warm": 30,
+            "sqlite_10k_txns_full": 15584,
+            "sqlite_10k_txns_normal": 373,
+            "sqlite_1m_rows_one_txn": 1546
           }
         }
       },
-      "sleep_ms": 3658,
+      "sleep_ms": 2927,
       "start": {
         "object_colo": "DFW",
-        "ready_ms": 220,
-        "start_ms": 336.510323,
-        "version": "cc8c604f-0411-4194-b4bd-45fdddab28a2"
+        "ready_ms": 277,
+        "start_ms": 362.71328400000004,
+        "version": "6ced511a-abe6-4864-a4fe-ee410e06f0c1"
       },
       "what": "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
     },
@@ -195,37 +199,41 @@
       "bulk_data_deleted": "the folder removed",
       "commit": {
         "dirty": false,
-        "fpac": "795074e4ebdc"
+        "fpac": "a6d8f4bf33d1"
       },
       "daemon": {
-        "bytes_shipped": 1963102472,
-        "checkpoints": 3,
-        "cuts": 23,
+        "bytes_shipped": 2272809064,
+        "checkpoints": 4,
+        "cuts": 26,
         "dirty_extents": 0,
-        "durable_ms": 1795122545290,
+        "durable_ms": 1795124215742,
         "epoch": 1,
         "fenced": false,
         "fetch_retries": 0,
-        "full_waits": 209,
+        "full_waits": 259,
         "head_posted": true,
         "misses": 0,
-        "now_ms": 1795122628903,
+        "now_ms": 1795124269925,
+        "pack_waits": 0,
         "read_errors": 0,
-        "segments": 427,
+        "segments": 586,
         "shipping_segments": 0,
-        "syncs": 13439,
-        "up_ms": 127854
+        "syncs": 13437,
+        "up_ms": 99850
       },
-      "measured_at_ms": 1795122630197,
+      "measured_at_ms": 1795124271034,
       "mount": {
         "dir": "/data",
         "fpac": "mounted",
-        "ms": 23.507952
+        "misses": 0,
+        "ms": 10.166402,
+        "pack_waits": 0,
+        "waited_at": []
       },
       "npm": "not run: the guests have no internet (enableInternet is off), and npm ci needs its registry",
       "objects_at_end": {
-        "bytes": 2023271432,
-        "objects": 473
+        "bytes": 2331320992,
+        "objects": 637
       },
       "results": {
         "fpac": {
@@ -234,68 +242,68 @@
             "dir": "/data",
             "dir_30k": {
               "entries": 30000,
-              "list_cold_ms": 4.711376,
-              "list_warm_ms": 3.781487
+              "list_cold_ms": 4.263366,
+              "list_warm_ms": 3.733567
             },
             "evidence": "fsbench",
             "random_4k_write_10s": {
-              "iops": 827342.0,
-              "writes": 8749720
+              "iops": 807210.0,
+              "writes": 8959148
             },
             "saves": {
               "office_save_ms": {
-                "max": 12.923,
-                "mean": 0.35,
-                "min": 0.237,
+                "max": 1053.895,
+                "mean": 2.461,
+                "min": 0.08,
                 "n": 500,
-                "p50": 0.309,
-                "p99": 0.423
+                "p50": 0.31,
+                "p99": 2.795
               },
               "scratch_file_ms": {
-                "max": 0.068,
+                "max": 0.1,
                 "mean": 0.031,
-                "min": 0.024,
+                "min": 0.012,
                 "n": 500,
-                "p50": 0.027,
-                "p99": 0.055
+                "p50": 0.028,
+                "p99": 0.064
               }
             },
             "sequential_1gib": {
               "page_cache_dropped": true,
-              "read_cold_mbs": 1272.7,
-              "write_fsync_mbs": 83.7
+              "read_cold_mbs": 1113.4,
+              "write_fsync_mbs": 67.9
             },
             "small_files": {
-              "create_write_close_ms_each": 0.012,
-              "delete_all_ms": 114.916008,
+              "create_write_close_ms_each": 0.01,
+              "delete_all_ms": 84.26331200000001,
               "files": 10000,
-              "read_cold_ms_each": 0.088,
+              "read_cold_ms_each": 0.09,
               "stat_cold_ms_each": 0.003,
-              "stat_warm_ms_each": 0.001
+              "stat_warm_ms_each": 0.0
             },
             "write_4k_osync_ms": {
-              "max": 1302.481,
-              "mean": 1.438,
-              "min": 0.078,
+              "max": 1380.75,
+              "mean": 2.716,
+              "min": 0.076,
               "n": 1000,
-              "p50": 0.091,
-              "p99": 0.418
+              "p50": 0.083,
+              "p99": 0.308
             }
           },
           "tools": {
-            "find_cold": 21,
-            "git_checkout_7260_changed": 159,
-            "git_clone_7260_files": 1260,
-            "git_status_cold": 691,
-            "git_status_warm": 27,
-            "grep_rl_cold": 644,
-            "grep_rl_warm": 11,
+            "find_cold": 33,
+            "git_checkout_7260_changed": 160,
+            "git_clone_7260_files": 1170,
+            "git_status_cold": 686,
+            "git_status_warm": 29,
+            "grep_rl_cold": 701,
+            "grep_rl_warm": 15,
             "journal_mode": "wal",
-            "rm_rf_checkout": 58,
-            "sqlite_100k_point_reads_warm": 9,
-            "sqlite_10k_txns_full": 1287,
-            "sqlite_10k_txns_normal": 61,
-            "sqlite_1m_rows_one_txn": 444
+            "rm_rf_checkout": 60,
+            "sqlite_100k_point_reads_warm": 12,
+            "sqlite_10k_txns_full": 1416,
+            "sqlite_10k_txns_normal": 48,
+            "sqlite_1m_rows_one_txn": 594
           }
         },
         "local": {
@@ -304,75 +312,75 @@
             "dir": "/var/tmp/local",
             "dir_30k": {
               "entries": 30000,
-              "list_cold_ms": 14.262759,
-              "list_warm_ms": 4.0622560000000005
+              "list_cold_ms": 19.756994,
+              "list_warm_ms": 4.1473070000000005
             },
             "evidence": "fsbench",
             "random_4k_write_10s": {
-              "iops": 1504739.0,
-              "writes": 17082313
+              "iops": 1112361.0,
+              "writes": 14458267
             },
             "saves": {
               "office_save_ms": {
-                "max": 2180.211,
-                "mean": 14.757,
-                "min": 2.428,
+                "max": 113.384,
+                "mean": 4.593,
+                "min": 0.634,
                 "n": 500,
-                "p50": 8.973,
-                "p99": 22.293
+                "p50": 1.125,
+                "p99": 42.297
               },
               "scratch_file_ms": {
-                "max": 0.213,
-                "mean": 0.056,
+                "max": 0.224,
+                "mean": 0.064,
                 "min": 0.034,
                 "n": 500,
-                "p50": 0.051,
-                "p99": 0.129
+                "p50": 0.056,
+                "p99": 0.149
               }
             },
             "sequential_1gib": {
               "page_cache_dropped": true,
-              "read_cold_mbs": 6314.3,
-              "write_fsync_mbs": 447.8
+              "read_cold_mbs": 7775.6,
+              "write_fsync_mbs": 162.0
             },
             "small_files": {
-              "create_write_close_ms_each": 0.041,
-              "delete_all_ms": 89.498248,
+              "create_write_close_ms_each": 0.039,
+              "delete_all_ms": 96.431593,
               "files": 10000,
-              "read_cold_ms_each": 0.045,
-              "stat_cold_ms_each": 0.004,
+              "read_cold_ms_each": 0.048,
+              "stat_cold_ms_each": 0.006,
               "stat_warm_ms_each": 0.001
             },
             "write_4k_osync_ms": {
-              "max": 55.157,
-              "mean": 4.529,
-              "min": 0.584,
+              "max": 120.291,
+              "mean": 3.765,
+              "min": 0.388,
               "n": 1000,
-              "p50": 4.586,
-              "p99": 22.148
+              "p50": 3.99,
+              "p99": 10.042
             }
           },
           "tools": {
-            "find_cold": 13,
-            "git_checkout_7260_changed": 186,
-            "git_clone_7260_files": 2878,
-            "git_status_cold": 21,
-            "git_status_warm": 35,
-            "grep_rl_cold": 310,
+            "find_cold": 10,
+            "git_checkout_7260_changed": 181,
+            "git_clone_7260_files": 1633,
+            "git_status_cold": 300,
+            "git_status_warm": 37,
+            "grep_rl_cold": 304,
             "grep_rl_warm": 14,
             "journal_mode": "wal",
-            "rm_rf_checkout": 71,
-            "sqlite_100k_point_reads_warm": 8,
-            "sqlite_10k_txns_full": 52921,
-            "sqlite_10k_txns_normal": 223,
-            "sqlite_1m_rows_one_txn": 923
+            "rm_rf_checkout": 68,
+            "sqlite_100k_point_reads_warm": 13,
+            "sqlite_10k_txns_full": 23974,
+            "sqlite_10k_txns_normal": 86,
+            "sqlite_1m_rows_one_txn": 1534
           }
         }
       },
-      "sleep_ms": 510,
+      "sleep_ms": 834,
       "start": {
-        "engine_ready_us": 129510,
-        "start_ms": 129.740179
+        "engine_ready_us": 153382,
+        "start_ms": 153.61245000000002
       },
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine: a STAND-IN for the route and for R2"
     }

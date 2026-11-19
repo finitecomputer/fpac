@@ -201,6 +201,20 @@ unless it says otherwise; the probe's timings are one sample per place
 8. **The stream is 50 MiB** (52.4 MB), not 50 MB.
 9. **The stand-in's `/null` route** answers 64 KiB from memory, outside
    the contract, to time the intercept with no store behind it.
+10. **P5's samples are fewer than ten:** three wakes per size and place
+    (two from the second wake on), ten crash rounds on Cloudflare rather
+    than fifty (fifty on krun, three times), one run of the tools per
+    place. Each Cloudflare wake at 10 GB costs a 10 GB fill.
+11. **Hermes ran on krun only:** on Cloudflare it needs fragment's fake
+    API behind the intercept, which the stand-in Worker does not carry.
+12. **`npm ci` was not run:** the guests have no internet.
+13. **The folder stand-in can delay each object call**
+    (`FPAC_FOLDER_OBJECT_MS`), to count a wake's round trips on krun; every
+    result it shaped says so.
+14. **A wake's time is given two ways:** the daemon's own (opened,
+    mounted, the boot's files read, from its start) and the driver's
+    (from asking for a container to the files read), since on Cloudflare
+    the driver's own calls cross the internet several times a step.
 
 ### P2, acceptance 1: the probe (`probe.json`)
 
@@ -430,3 +444,242 @@ reads stopped at 15,000 reads (none wrong) when its container went away
 mid-run; the driver's poll then hung on the dead container and was
 stopped by hand, so that run wrote no file. The new bucket's first byte
 (32 ms p50 against 97) is one sample of one bucket.
+
+### P4: the daemon, on krun (commits `ac0a939`, `2baa60d`)
+
+`fpac mount` (crates/fpac) is the disk in the guest: it opens the disk
+from the remote, serves one FUSE file on four threads, puts a loop
+device with direct I/O over it and ext4 on that (making ext4 on a new
+disk), cuts about once a second and ships eight segments at once,
+checkpoints after 128 segments or five minutes, and on SIGTERM unmounts,
+makes its last flush, the pack and a checkpoint, posts the head and
+exits. It writes its state each second to `/run/fpac/status.json`.
+
+What krun taught it, each now in design.md:
+
+- **fsync returns at once and is counted** (Q4's answer): the cache file
+  dies with the container, so syncing it protects nothing.
+- **The guest's writeback is set to 5 s** at the mount (Linux's default
+  is 30 s): a page only written reaches the device, and so the store,
+  within 5 s.
+- **A sleep freezes `/data` when it stays busy** past 2 s of unmounting
+  (Hermes keeps files open): `FIFREEZE` makes the device consistent with
+  files open.
+- **`mlockall` with `MCL_ONFAULT`**: locking every page at once cost about
+  100 ms of the mount; locking as pages are touched costs nothing.
+- **The pack carries the life's newest written extents** after the
+  boot's reads, and **reads of pack extents wait for them** rather than
+  fetching them twice: Hermes' first wakes had 13 to 50 misses before
+  this, 0 to 2 after.
+- **A crash test needs its programs to sync:** git does not fsync by
+  default, so a crash test's git repository lost objects until it set
+  `core.fsync=all`, as on any disk. Not a bug of the disk.
+
+### P5: the wakes, on krun and on Cloudflare (commit `079dfc2`)
+
+Every number here is from `docs/evidence/` written at `a6d8f4b` (the
+code of `079dfc2` and its evidence), unless it says otherwise.
+
+**A bug, found by the 1 GB wake on krun** (`e60f6bc`): a full pack was
+1,536 extents (96 MiB) plus its 24,632-byte header, which the route
+refused (413), so a sleep after a large write shipped no pack. The
+simulator's remote now refuses what the route refuses, and
+`a_full_pack_fits_one_object` failed first with the same byte count. The
+pack now holds 1,535 extents, and every kind of object is asserted
+against the contract's `OBJECT_BYTES_MAX` at compile time.
+
+**The open took seconds on Cloudflare, and grew with the data.** The
+first wakes there (`795074e`, kept in `wake.json` as
+`*-pages-one-at-a-time`) opened in 2.5 to 12.8 s. The open fetched the
+checkpoint's map pages one at a time, about 100 ms each on R2, and a map
+page holds every mapped extent of its 256 MiB, so their count grows with
+the data: 21 pages at 1 GB, 36 at 5 GB, 51 at 10 GB. The open now reads
+in **two rounds**: the checkpoint, then at once its pages, the replay's
+first 16 segment headers and the pack's head (its header and first 64
+extents, which hold an ext4 mount's own reads). The simulator checks it
+(`an_open_reads_in_two_rounds`). To see the rounds on krun, the folder
+stand-in can delay each object call by R2's 90 ms
+(`*-object-90ms` in `wake.json`, named as such).
+
+#### Acceptance 3: a wake that doesn't grow (`wake.json`)
+
+From the second wake on (two wakes per size; the first wake after the
+fill is the disk's first wake and is below). Opened, mounted and the
+boot's files read are the daemon's own times from its start; wake to
+files read is the driver's, from asking for a container to the files
+read, and on Cloudflare it carries the driver's own calls over the
+internet (several per step).
+
+| Place | Size | Map pages | Opened | Mounted | Boot's files read | Wake to files read (driver) |
+| -- | -- | -- | -- | -- | -- | -- |
+| krun, folder stand-in | 1 GB | 21 | 17–19 ms | **86–87 ms** | 62–64 ms | 315–316 ms |
+| | 5 GB | 36 | 31–34 ms | **96–104 ms** | 62–64 ms | 312–315 ms |
+| | 10 GB | 51 | 63–79 ms | **178–198 ms** | 110–123 ms | 500–520 ms |
+| krun, each object call 90 ms | 1 GB | 22 | 211–212 ms | **252–254 ms** | 119–122 ms | 522 ms (and 1,563 with a slow engine start) |
+| | 10 GB | 49 | 320–321 ms | **370–375 ms** | 148–180 ms | 863–878 ms |
+| **Cloudflare**, stand-in Worker and R2 | 1 GB | 22 | 566–1,149 ms | **652–1,240 ms** | 247–334 ms | **1.66–2.54 s** |
+| | 5 GB | 31 | 667–909 ms | **761–1,013 ms** | 448–569 ms | **1.92–2.09 s** |
+| | 10 GB | 50 | 690–895 ms | **789–989 ms** | 251–486 ms | **1.97–2.00 s** |
+| Cloudflare before the round (`795074e`) | 1 GB | – | 2.5–3.8 s | 3.3–4.6 s | 0.27–0.60 s | 4.6–5.6 s |
+| | 5 GB | – | 3.9–5.1 s | 4.5–5.8 s | 0.25–2.0 s | 6.8–7.4 s |
+| | 10 GB | – | 6.3–8.2 s | 7.5–8.9 s | 0.21–0.25 s | 8.9–9.9 s |
+
+- **On Cloudflare the wake no longer grows from 1 to 10 GB** (driver's
+  wake to files read 1.66–2.54 s at every size, against 4.6–9.9 s
+  before), with no miss on the boot's path. **It does not meet the
+  plan's lines:** the mount takes 0.65–1.24 s, not 150 ms, and two
+  samples per size spread wider than 0.3 s.
+- **Where the Cloudflare mount's time goes:** the round of 39 to 67
+  parallel gets takes 395–888 ms there, against 104–197 ms on krun with
+  90 ms per call; so it is R2's tail under that many parallel calls (or
+  the intercept's, for that many new connections), not the count of
+  round trips. Fewer calls in the round is the fix (below).
+- **The map still loads whole at the open:** pages grow with the data,
+  so the round grows too (krun with the delay: 211 ms at 1 GB, 321 ms at
+  10 GB; 67 asks at 10 GB is two waves of 64 connections). At 100 GB it
+  would be about 400 pages. **Lazy map pages** remove it: the open loads
+  the checkpoint only, a page comes on the first read of one of its
+  extents, and the pack's own sums stand for its extents' pages.
+- **The first wake of a disk** misses 52 to 73 times on its boot's path
+  (10.6 s to read the boot's files on Cloudflare; 4.1–4.2 s on krun with
+  the delay): its first life
+  made those files rather than read them, so its pack holds the fill's
+  newest extents. From the second wake on the pack holds what the boot
+  read.
+- **After an hour asleep:** below (the run follows the others).
+- **Sleeps** after a wake: 2.1–3.0 s on Cloudflare (the pack, the
+  checkpoint and the head are three puts of 0.3 to 1 s each), 0.2–0.7 s
+  on krun. After a fill, the first sleep ships what the fill wrote
+  faster than R2 took it: 9.3–11.1 s on Cloudflare. The fill itself ran
+  at 48–51 MB/s on Cloudflare and 84 MB/s on krun, bounded by shipping
+  (below, the tools).
+
+#### Acceptance 4: nothing flushed is lost (`crash.json`)
+
+| Place | Rounds | Failed | Opened after a crash, p50 (range) | Mounted, p50 (range) |
+| -- | -- | -- | -- | -- |
+| krun | 50 (and 50 at `ac0a939`, 50 at `795074e`) | **0** | 28 ms (15–53) | 565 ms (215–1,334) |
+| Cloudflare | 10 (and 10 at `795074e`) | **0** | 874 ms (264–1,402) | 7.8 s (2.5–11.8) |
+
+Each round: a writer commits SQLite rows (acknowledged only after a
+sync), git commits and files; the container is killed at a random
+moment; the next wake runs `e2fsck -f -n`, SQLite's `integrity_check`,
+`git fsck`, and checks every acknowledged row is present. A wake after a
+crash replays 8 to 39 segments on Cloudflare (9 to 88 on krun), and ext4
+replays its journal; on
+Cloudflare that recovery's reads are misses (a crash leaves no pack of
+them), hence the seconds. Ten rounds on Cloudflare, not fifty: each costs
+a container start and about 25 s.
+
+#### Acceptance 5: the agent (`hermes.json`)
+
+The real Hermes image (fragment's at `bc00639ba`) in krun microVMs, its
+fake fragment API and instant scripted model behind the engine's
+intercepts (stand-ins), `/data` mounted by `fpac` before the image's own
+entrypoint, the folder stand-in behind it. Ten wakes each; numbers after
+the first wake. FPAC on the final daemon (`079dfc2`); the container's
+own disk from the earlier run (`2baa60d`), whose FPAC side measured a
+first reply of 4,441 ms (3,413–5,472).
+
+| | FPAC | The container's own disk |
+| -- | -- | -- |
+| First reply, median (range), n = 9 | **2,866 ms** (2,543–5,220) | 5,662 ms (2,930–7,455) |
+| A warm turn | 97 ms (95–98) | 869 ms (352–1,749) |
+| Misses before the first reply | 0 in seven wakes, 1 and 2 in two | – |
+| fsyncs per boot; per warm turn | 178 (166–185); 66 (0–80) | – |
+| `journal_mode` | WAL, all six databases | WAL |
+| The file system Hermes sees | ext4 on `/dev/loop0` | ext4 on `/dev/vdd` |
+| Sleep | 2.36–2.46 s (2 s waiting for `/data` to be let go, then a freeze) | – |
+
+The first reply is no later than on the container's own disk, and earlier
+by a median 2.8 s; part of that is FPAC's fsync returning at once (178
+syncs a boot) where the engine's disk syncs for real. "No misses from the
+second wake on" holds in seven of nine wakes. Hermes was run on krun only:
+on Cloudflare it needs the fake API behind the intercept, which the
+stand-in Worker does not carry.
+
+#### Acceptance 6: tools (`tools.json`)
+
+Both disks in one guest: FPAC's `/data` and a folder on the container's
+own disk. Times in ms; the ratio is FPAC's over the own disk's, and the
+pass line is section 10's (design.md).
+
+| Row | Cloudflare FPAC / own | ratio | krun FPAC / own | ratio | Line | Holds |
+| -- | -- | -- | -- | -- | -- | -- |
+| `git clone`, 7,260 files | 30,664 / 31,121 | 0.99 | 1,170 / 1,633 | 0.72 | ≤ 1.25× | yes |
+| `git status` warm | 97 / 120 | 0.81 | 29 / 37 | 0.78 | ≤ 1.25× | yes |
+| `git status` cold | 1,071 / 260 | 4.1 | 686 / 300 | 2.3 | ≤ 3 s | yes |
+| `git checkout`, 7,260 files change | 28,530 / 28,928 | 0.99 | 160 / 181 | 0.88 | ≤ 1.25× | yes |
+| `rm -rf` the checkout | 163 / 414 | 0.39 | 60 / 68 | 0.88 | ≤ 1.25× | yes |
+| SQLite, 10k transactions, `FULL` | 4,118 / 15,584 | 0.26 | 1,416 / 23,974 | 0.06 | ≤ 1.25× | yes (fsync returns at once) |
+| SQLite, the same, `NORMAL` | 265 / 373 | 0.71 | 48 / 86 | 0.56 | ≤ 1.25× | yes |
+| SQLite, 1 M rows, one transaction | 1,439 / 1,546 | 0.93 | 594 / 1,534 | 0.39 | ≤ 1.25× | yes |
+| SQLite, 100k point reads, warm | 27 / 30 | 0.90 | 12 / 13 | 0.92 | ≤ 1.25× | yes |
+| `grep -rl`, cold; warm | 1,486 / 406; 63 / 61 | 3.7; 1.03 | 701 / 304; 15 / 14 | 2.3; 1.07 | ≤ 20 s; ≤ 1.25× | yes |
+| `find`, cold | 82 / 46 | 1.8 | 33 / 10 | 3.3 | ≤ 22 s | yes |
+| A 30,000-entry directory, cold; warm | 13 / 53; 11.5 / 12.8 | 0.24; 0.90 | 4.3 / 19.8; 3.7 / 4.1 | 0.22; 0.90 | ≤ 2 s; ≤ 1.25× | yes |
+| Small files: create, write, close (each) | 0.032 / 0.113 | 0.28 | 0.010 / 0.039 | 0.26 | ≤ 1.25× | yes |
+| `stat` warm (each) | 0.003 / 0.003 | 1.0 | 0.000 / 0.001 | – | ≤ 1.25× | yes |
+| A scratch file, p50 | 0.094 / 0.112 | 0.84 | 0.028 / 0.056 | 0.50 | ≤ 1.25× | yes |
+| 4 KiB `O_SYNC` write, p50 | 0.26 / 1.21 | 0.21 | 0.08 / 3.99 | 0.02 | ≤ 1.5× | yes |
+| An office save (temp file, fsync, rename), p50 | **10.4 / 1.2** | **8.4** | 0.31 / 1.13 | 0.28 | ≤ 1.5× | **no on Cloudflare** |
+| Random 4 KiB writes, 10 s (IOPS) | 40,437 / 15,968 | 2.5× | 807,210 / 1,112,361 | 0.73× | ≥ 0.7× | yes |
+| Sequential write of 1 GiB and an fsync (MB/s) | **46.9 / 464.4** | **0.10×** | **67.9 / 162.0** | **0.42×** | ≥ 0.7×, shipped ≥ 50 MB/s | **no** |
+| Sequential read, cold (MB/s; the cache file, not R2) | 855 / 1,799 | 0.48× | 1,113 / 7,776 | 0.14× | ≥ 80 MB/s | yes |
+| `npm ci` | not run: the guests have no internet | | | | | – |
+
+**What fails, and why: writes wait for the store behind a burst.** A cut
+takes every dirty extent, and past `DIRTY_BYTES_MAX` (256 MiB) a write
+waits for the next cut (`full_waits`: 423 on Cloudflare, 259 on krun in
+this run). So a write larger than 256 MiB goes at the shipping rate, 47
+to 51 MB/s to R2, and small syncs behind it wait too: the office save's
+10.4 ms p50 and a 4 KiB `O_SYNC` write's worst case of 5.4 s (1.4 s on
+krun) are those waits. The fix is a dirty limit set by the cache file
+rather than by memory (the cut copies dirty extents under the store's
+lock today), with shipping behind it.
+
+#### Acceptance 7: conformance (`path.json`)
+
+17 of 17 cases pass against the stand-in Worker from inside a Cloudflare
+container (`cloudflare-p5`), against the folder remote from inside a
+krun guest, and in this workspace's tests. On the same run the path
+measured a 64 KiB ranged get at 86 ms p50 (187 p99) to first byte, an
+8 MiB put at 557 ms p50, and 50 MiB as four parallel ranged gets in
+0.27–0.30 s (176–194 MB/s; P2 measured 55).
+
+#### Acceptance 8: the build is clean
+
+`cargo clippy --workspace --all-targets -- -D warnings` clean and `cargo
+test --workspace` passing at `079dfc2`: on Linux (41 tests; Rust 1.99)
+and on macOS (arm64, 40 tests: one is Linux-only; Rust 1.98). The
+simulator's release run: 11 passed, 1 ignored (a debugging aid that
+replays one seed).
+
+#### What P5 changes in the design (proposals; the owner decides)
+
+1. **Lazy map pages.** The open loads the checkpoint alone; a map page
+   is fetched on the first read of one of its extents; the pack's header
+   (sealed by the checkpoint) stands for its own extents, and replayed
+   segments override both. Then the open no longer grows with the data
+   (51 pages at 10 GB, about 400 at 100 GB), and the round drops from 39
+   to 67 calls to about 17.
+2. **The platform hands the guest its checkpoint and the pack's head at
+   `/open`.** The route reads them while the container boots (a start
+   takes 0.2–0.5 s), so the mount waits for no round trip to R2 after
+   `/open`. The plan's 150 ms mount needs this: two R2 round trips are
+   already 0.2 s at best, and their tail on Cloudflare is 0.4–0.9 s.
+3. **A clean sleep says so in its head,** so the next open asks for no
+   segment headers (16 of the round's calls today, all absent after a
+   clean sleep).
+4. **The dirty limit backed by the cache file, not memory.** A cut
+   copies dirty extents under the store's lock, so the limit is 256 MiB
+   and a larger write goes at R2's shipping rate (47–51 MB/s), with
+   small syncs waiting behind it. Cutting by reference to the cache file
+   (copy-on-write of an extent written again while it ships) lets writes
+   go at the local disk's speed with shipping behind them.
+5. **A pack at each checkpoint, not only at a sleep,** holding the
+   journal's region: a wake after a crash spends 2.5–11.8 s on
+   Cloudflare reading ext4's journal recovery as misses.
+6. **A new disk's first life records its mount's reads** (extents it
+   wrote and then read), so its first wake has a pack of the boot's
+   path rather than of the newest writes.
