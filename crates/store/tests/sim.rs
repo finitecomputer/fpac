@@ -17,8 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX};
+use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX, PACK_EXTENTS_MAX};
 use fpac_format::{self as format};
+use fpac_remote::limits::OBJECT_BYTES_MAX;
 use fpac_remote::{Put, RemoteError};
 use fpac_store::head::{decide, Decision};
 use fpac_store::{ship, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
@@ -118,6 +119,10 @@ impl RemoteGate for SimRemote {
     }
 
     fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError> {
+        // The route's own limit (docs/contract.md): refused, never retried.
+        if body.len() as u64 > OBJECT_BYTES_MAX {
+            return Err(RemoteError::Refused { status: 413, detail: format!("sim: {} bytes", body.len()) });
+        }
         if self.rng.chance(self.faults.unavailable) {
             return Err(RemoteError::Unavailable("sim: down".into()));
         }
@@ -733,6 +738,30 @@ fn a_stale_pack_entry_is_ignored() {
     let mut buf = vec![0u8; EXT];
     life.store.read(life.remote, &mut life.cache, 5, &mut buf).unwrap();
     assert_eq!(buf, new);
+}
+
+// Goal: a pack at its fullest is one object the route takes, its header
+// and all (a 1 GB fill on krun was refused 413 at 96 MiB and 24,632
+// bytes). Method: write more extents than a pack holds, sleep, and wake
+// from the pack.
+#[test]
+fn a_full_pack_fits_one_object() {
+    let mut remote = SimRemote::new(11, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in 0..PACK_EXTENTS_MAX as u64 + 64 {
+        let b = content(100 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.sleep(&mut Rng(3)).unwrap();
+    let packs: Vec<u64> = life.remote.objects.iter().filter(|(n, _)| n.starts_with("e1/p")).map(|(_, b)| b.len() as u64).collect();
+    assert_eq!(packs.len(), 1, "one pack");
+    assert!(packs[0] <= OBJECT_BYTES_MAX, "{} bytes", packs[0]);
+    let exp = life.model.after_crash(life.remote);
+    let life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    assert!(life.store.pack_to_fetch().is_some(), "the next life wakes from it");
 }
 
 // Goal: a put that meets another writer's bytes fences the life: it

@@ -44,9 +44,17 @@ pub const LIVE_SEGMENTS_MAX: u32 = 16_384;
 pub const CHECKPOINT_SEGMENTS: u32 = 256;
 pub const REPLAY_SEGMENTS_MAX: u32 = CHECKPOINT_SEGMENTS;
 
-/// A wake's one boot pack, at most.
-pub const PACK_BYTES_MAX: u64 = 96 << 20;
-pub const PACK_EXTENTS_MAX: u32 = (PACK_BYTES_MAX / EXTENT_BYTES as u64) as u32;
+/// A wake's one boot pack, at most: one extent short of 96 MiB, so the
+/// whole object, its header too, is within the route's object limit
+/// (the store asserts it against the contract's `OBJECT_BYTES_MAX`).
+pub const PACK_EXTENTS_MAX: u32 = (96 << 20) / EXTENT_BYTES - 1;
+pub const PACK_BYTES_MAX: u64 = PACK_EXTENTS_MAX as u64 * EXTENT_BYTES as u64;
+/// A pack's header at most: the fixed part, an entry per extent, its seal.
+pub const PACK_HEADER_BYTES_MAX: u64 = PACK_FIXED_BYTES + PACK_EXTENTS_MAX as u64 * PACK_ENTRY_BYTES + 32;
+pub const PACK_FIXED_BYTES: u64 = 24;
+pub const PACK_ENTRY_BYTES: u64 = 16;
+/// A pack's whole object at most.
+pub const PACK_OBJECT_BYTES_MAX: u64 = PACK_HEADER_BYTES_MAX + PACK_BYTES_MAX;
 
 /// A miss fetches this much of its segment around the extent asked for:
 /// a 1 MiB range costs about what 64 KiB does (docs/spike.md, P2).
@@ -72,6 +80,6 @@ const _: () = assert!(SEGMENT_EXTENTS_TARGET <= SEGMENT_EXTENTS_MAX);
 const _: () = assert!(CUT_SEGMENTS_MAX * SEGMENT_EXTENTS_TARGET >= DIRTY_EXTENTS_MAX);
 const _: () = assert!((SEGMENT_HEADER_BYTES_MAX as u64) + SEGMENT_EXTENTS_MAX as u64 * EXTENT_BYTES as u64 <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_BYTES_MAX < 100 << 20, "the intercept's body limit");
-const _: () = assert!(PACK_BYTES_MAX < 100 << 20, "the intercept's body limit");
+const _: () = assert!(PACK_OBJECT_BYTES_MAX < 100 << 20, "the intercept's body limit");
 const _: () = assert!(READ_AHEAD_EXTENTS >= 1 && READ_AHEAD_EXTENTS <= SEGMENT_EXTENTS_MAX);
 const _: () = assert!(CHECKPOINT_BYTES_MAX < 100 << 20);

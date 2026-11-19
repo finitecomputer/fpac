@@ -850,7 +850,14 @@ fn header(remote: &mut dyn RemoteGate, name: &str, buf: &mut [u8]) -> Result<Opt
 }
 
 /// Bytes of a pack's object a wake fetches first, to read its header.
-pub const PACK_HEADER_FETCH_BYTES: usize = 16 + 4 + 4 + PACK_EXTENTS_MAX as usize * 16 + 32;
+pub const PACK_HEADER_FETCH_BYTES: usize = format::limits::PACK_HEADER_BYTES_MAX as usize;
+
+// Every object the store writes is one the route takes (docs/contract.md,
+// Limits): a pack over it was refused 413 on krun before this was asserted.
+const _: () = assert!(format::limits::SEGMENT_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
+const _: () = assert!(format::limits::PACK_OBJECT_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
+const _: () = assert!(format::limits::CHECKPOINT_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
+const _: () = assert!(format::limits::PAGE_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
 
 fn remote_err_on(name: &str) -> impl Fn(RemoteError) -> StoreError + '_ {
     move |e| match from_remote(e) {

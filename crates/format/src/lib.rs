@@ -538,7 +538,7 @@ impl PackHeader {
 }
 
 pub fn pack_header_len(count: usize) -> usize {
-    16 + 4 + 4 + count * 16 + 32
+    PACK_FIXED_BYTES as usize + count * PACK_ENTRY_BYTES as usize + 32
 }
 
 /// A pack's object: its header, then each extent's bytes in order.

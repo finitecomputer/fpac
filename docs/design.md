@@ -164,7 +164,7 @@ them together. Those already in code are marked with their file.
 | `SEGMENT_BYTES_TARGET`, `SEGMENT_BYTES_MAX` | 8 MiB, 64 MiB | A put costs about the same to 8 MiB; a bigger cut is a group of segments |
 | `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut. A cut takes all of it at one instant (a subset would reorder ext4's writes), copied under the store's lock; past it writes wait for the next cut |
 | `CUT_SEGMENTS_MAX` | 32 | The segments one cut may need |
-| `PACK_BYTES_MAX` | 96 MiB | A wake's pack; past it, the extents written longest ago are left out |
+| `PACK_EXTENTS_MAX` | 1,535 (96 MiB less one extent) | A wake's pack; past it, the extents written longest ago are left out. With its header the object stays within `OBJECT_BYTES_MAX`, asserted for every kind of object |
 | `READ_AHEAD_BYTES` | 1 MiB | A miss fetches this much of its segment (P2: it costs about what 64 KiB does) |
 | `FETCH_TRIES_MAX` | 3 | A fetch whose bytes fail their checksum, tried again |
 | `CHECKPOINT_SEGMENTS`, `REPLAY_SEGMENTS_MAX` | 256 | An open never replays more; the daemon checkpoints at half |
