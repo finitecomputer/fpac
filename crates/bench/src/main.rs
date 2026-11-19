@@ -9,6 +9,7 @@
 //! fpac-bench ranges --place cloudflare [--count n] [--diagnose] [--write] [--label <l>]
 //! fpac-bench rangecheck --place cloudflare|outside --mode stream|tee|buffer --pattern aligned|unaligned
 //!            --count n --threads t --size-max bytes [--write] [--label <l>]
+//! fpac-bench exec <argv…> | destroy               the running Cloudflare container, for debugging
 //! fpac-bench deploy                                the stand-in Worker, its bucket, its image
 //! fpac-bench inventory <label>                     the account's Workers, buckets, container apps
 //! fpac-bench reset                                 the one cleanup (docs/spike.md, Musts)
@@ -208,7 +209,8 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
     match place {
         "cloudflare" => {
             let started = cf_start(&c, &key, "spike-rc")?;
-            let job = format!("setsid nohup {PROBE_IN_GUEST} rangecheck --mode {mode} --pattern {pattern} --count {count} --threads {threads} --size-max {size_max} --tag {tag} --out /tmp/rc.json > /dev/null 2> /tmp/rc.err < /dev/null & echo started");
+            // The job writes its exit code when it ends, however it ends.
+            let job = format!("rm -f /tmp/rc.json /tmp/rc.exit; setsid nohup sh -c '{PROBE_IN_GUEST} rangecheck --mode {mode} --pattern {pattern} --count {count} --threads {threads} --size-max {size_max} --tag {tag} --out /tmp/rc.json 2> /tmp/rc.err; echo $? > /tmp/rc.exit' > /dev/null 2>&1 < /dev/null & echo started");
             let (code, out) = cf_exec_raw(&c, &key, &["sh", "-c", &job], 60_000)?;
             if code != 0 || !out.contains("started") {
                 return Err(format!("the job did not start: {code} {out}"));
@@ -217,8 +219,8 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
             let mut finished = false;
             for _ in 0..540 {
                 std::thread::sleep(Duration::from_secs(20));
-                if let Ok((0, _)) = cf_exec_raw(&c, &key, &["cat", "/tmp/rc.json.done"], 30_000) {
-                    finished = true;
+                if let Ok((0, code)) = cf_exec_raw(&c, &key, &["cat", "/tmp/rc.exit"], 30_000) {
+                    finished = code.trim() == "0";
                     break;
                 }
                 if let Ok((_, p)) = cf_exec_raw(&c, &key, &["tail", "-n", "1", "/tmp/rc.err"], 30_000) {
@@ -226,10 +228,11 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
                 }
             }
             let (_, text) = cf_exec_raw(&c, &key, &["cat", "/tmp/rc.json"], 60_000)?;
+            let (_, err) = cf_exec_raw(&c, &key, &["tail", "-c", "2000", "/tmp/rc.err"], 30_000).unwrap_or_default();
             let records = net::worker(c.host(), &key, "GET", "/records", &json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
             let _ = net::worker(c.host(), &key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
             let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "disks/spike-rc/" }), Duration::from_secs(300));
-            let check = guest_json(&text).map_err(|e| format!("{e} (finished: {finished})"))?;
+            let check = guest_json(&text).map_err(|e| format!("{e} (finished: {finished}); the job's stderr: {err}"))?;
             Ok(json!({ "place": { "name": "cloudflare", "what": "the guest -> its intercept -> the stand-in's handler -> R2", "start": started }, "check": joined(check, &records), "bulk_data_deleted": deleted.ok() }))
         }
         "outside" => {
@@ -524,6 +527,13 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
+        // A command in the running Cloudflare container, for debugging a run.
+        (Some("exec"), _) => Config::load().and_then(|c| {
+            let key = net::Key::load_or_make(&c.driver_key_file);
+            let argv: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            net::worker(c.host(), &key, "POST", "/exec", &json!({ "argv": argv, "ms": 60_000 }), Duration::from_secs(120))
+        }),
+        (Some("destroy"), _) => Config::load().and_then(|c| net::worker(c.host(), &net::Key::load_or_make(&c.driver_key_file), "POST", "/destroy", &json!({}), Duration::from_secs(60))),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),

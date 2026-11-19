@@ -210,7 +210,7 @@ pub fn run(check: &Check<'_>, dial: &dyn Dial, progress: &(dyn Fn(u64, u64, u64)
         for t in 0..check.threads {
             let (done, right, wrong, failed, bytes, bad, failures, sample) = (&done, &right, &wrong, &failed, &bytes, &bad, &failures, &sample);
             s.spawn(move || {
-                let mut x = check.seed ^ ((t as u64 + 1) * 0x9E37_79B9_7F4A_7C15) | 1;
+                let mut x = (check.seed ^ (t as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
                 let mut conn: Option<Conn<Box<dyn ReadWrite>>> = None;
                 let mut buf = vec![0u8; check.size_max];
                 // Bounded by `reads`: each pass takes one.
