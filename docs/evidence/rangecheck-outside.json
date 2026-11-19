@@ -1,0 +1,157 @@
+{
+  "evidence": "rangecheck-outside",
+  "places": {
+    "outside-stream-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 2559008768,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 110.1,
+          "p99": 212.5
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 729881,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 65536,
+        "threads": 16,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": true,
+        "fpac": "cd99c1e27b57"
+      },
+      "measured_at_ms": 1795115853802,
+      "place": {
+        "name": "outside",
+        "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept"
+      }
+    },
+    "outside-stream-unaligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 3272530198,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 115.3,
+          "p99": 217.2
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 769798,
+        "object_bytes": 52428800,
+        "pattern": "unaligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 65536,
+        "threads": 16,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": true,
+        "fpac": "cd99c1e27b57"
+      },
+      "measured_at_ms": 1795116631387,
+      "place": {
+        "name": "outside",
+        "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept"
+      }
+    },
+    "outside-tee-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 2558996480,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 107.8,
+          "p99": 200.7
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "tee",
+        "ms": 715073,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 65536,
+        "threads": 16,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "340ac363a76e"
+      },
+      "measured_at_ms": 1795117353897,
+      "place": {
+        "name": "outside",
+        "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept"
+      }
+    },
+    "outside-fresh-stream-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 2558722048,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 50.6,
+          "p99": 145.3
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 361638,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 65536,
+        "threads": 16,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "d4278fbf2f12"
+      },
+      "measured_at_ms": 1795120345422,
+      "place": {
+        "name": "outside",
+        "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept"
+      }
+    }
+  }
+}

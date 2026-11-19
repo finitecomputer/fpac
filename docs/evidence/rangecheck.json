@@ -1,0 +1,411 @@
+{
+  "evidence": "rangecheck",
+  "places": {
+    "cloudflare-buffer-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 23256088576,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 87.6,
+          "p99": 173.6
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "buffer",
+        "ms": 579285,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 1048576,
+        "threads": 16,
+        "whole_get_after": true,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": true,
+        "fpac": "cd99c1e27b57"
+      },
+      "measured_at_ms": 1795117052607,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795116463000,
+          "image": "tiny",
+          "image_digest": "sha256:62513a21013118d193137fa32f9d7e049b2668173b17763777ca558248538a07",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 267,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "dd5bc6e8-6fbb-4735-a177-5f3ac2dc3b12"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-stream-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 23253450752,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 97.3,
+          "p99": 194.8
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 677409,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 1048576,
+        "threads": 16,
+        "whole_get_after": true,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": true,
+        "fpac": "cd99c1e27b57"
+      },
+      "measured_at_ms": 1795115808866,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795115116170,
+          "image": "tiny",
+          "image_digest": "sha256:62513a21013118d193137fa32f9d7e049b2668173b17763777ca558248538a07",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 336,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "dd5bc6e8-6fbb-4735-a177-5f3ac2dc3b12"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-stream-unaligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 52413154364,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 80.4,
+          "p99": 145.4
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 563286,
+        "object_bytes": 52428800,
+        "pattern": "unaligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 1048576,
+        "threads": 16,
+        "whole_get_after": true,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "d4278fbf2f12"
+      },
+      "measured_at_ms": 1795117622247,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795117052849,
+          "image": "tiny",
+          "image_digest": "sha256:62513a21013118d193137fa32f9d7e049b2668173b17763777ca558248538a07",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 148,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 0,
+          "version": "dd5bc6e8-6fbb-4735-a177-5f3ac2dc3b12"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-tee-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 23254089728,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 93.5,
+          "p99": 178.6
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "tee",
+        "ms": 646098,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 1048576,
+        "threads": 16,
+        "whole_get_after": true,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": true,
+        "fpac": "cd99c1e27b57"
+      },
+      "measured_at_ms": 1795116462888,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795115809027,
+          "image": "tiny",
+          "image_digest": "sha256:62513a21013118d193137fa32f9d7e049b2668173b17763777ca558248538a07",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 2877,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "dd5bc6e8-6fbb-4735-a177-5f3ac2dc3b12"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-fresh-remote": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "client": "fpac_remote::Remote, one per thread, kept-alive",
+        "evidence": "remotecheck",
+        "failed": 0,
+        "failures": [],
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "ms": 177598,
+        "reads": 50000,
+        "right": 50000,
+        "threads": 16,
+        "whole_every": 100,
+        "whole_gets": 506,
+        "whole_gets_bad": 0,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "d4278fbf2f12"
+      },
+      "measured_at_ms": 1795120529794,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795120346026,
+          "image": "tiny",
+          "image_digest": "sha256:9dda0b80aed74e750246fa0239f6f64518e651605062c6cd0be79d314b9460ec",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 198,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "55302cca-0da8-447e-a646-035bcef8ba47"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-fresh-stream-aligned": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "bytes": 23265095680,
+        "evidence": "rangecheck",
+        "failed": 0,
+        "failures": [],
+        "first_byte_ms": {
+          "n": 6250,
+          "p50": 32.4,
+          "p99": 107.0
+        },
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "mode": "stream",
+        "ms": 260964,
+        "object_bytes": 52428800,
+        "pattern": "aligned",
+        "reads": 100000,
+        "right": 100000,
+        "size_max": 1048576,
+        "threads": 16,
+        "whole_get_after": true,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "d4278fbf2f12"
+      },
+      "measured_at_ms": 1795120260925,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795119975317,
+          "image": "tiny",
+          "image_digest": "sha256:9dda0b80aed74e750246fa0239f6f64518e651605062c6cd0be79d314b9460ec",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 237,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "55302cca-0da8-447e-a646-035bcef8ba47"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    },
+    "cloudflare-remote-whole200": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "check": {
+        "bad": [],
+        "client": "fpac_remote::Remote, one per thread, kept-alive",
+        "evidence": "remotecheck",
+        "failed": 0,
+        "failures": [],
+        "handler_records": 0,
+        "handler_records_sample": [],
+        "ms": 606513,
+        "reads": 100000,
+        "right": 100000,
+        "threads": 16,
+        "whole_every": 200,
+        "whole_gets": 512,
+        "whole_gets_bad": 0,
+        "wrong": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "d4278fbf2f12"
+      },
+      "measured_at_ms": 1795118291130,
+      "place": {
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-rc",
+          "driver_colo": "DFW",
+          "epoch": 1795117660214,
+          "image": "tiny",
+          "image_digest": "sha256:9dda0b80aed74e750246fa0239f6f64518e651605062c6cd0be79d314b9460ec",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 2439,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "09a3530c-eae9-436a-a9d4-26c9a027b116"
+        },
+        "what": "the guest -> its intercept -> the stand-in's handler -> R2"
+      }
+    }
+  }
+}

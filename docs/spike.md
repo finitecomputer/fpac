@@ -376,3 +376,57 @@ mismatch as a hard requirement, tested in the simulator.
   `end`. A chain link is the SHA-256 of a segment's header (which seals
   its extents' sums), so a replay checks the chain from headers alone.
   The cleaner's compaction of live segments is left to P5.
+
+### P3: hunting the wrong bytes (`rangecheck.json`, `rangecheck-outside.json`)
+
+The owner asked for the two wrong reads of P2 to be pinned down: hashes
+at each hop, our own reader checked first, and each variant run at
+100,000 reads or more.
+
+- **Our reader first.** A test (`bodies_survive_any_read_sizes`, in
+  `crates/remote/src/http.rs`) serves 6,000 answers of up to 1.5 MiB, by
+  length or chunked, on kept-alive connections, and delivers them in
+  pieces of random size (1 byte, 7 bytes, 8 KiB, 300 KiB at most); every
+  body arrives exactly. Bytes left after an answer were already refused
+  (an assertion); they are now a typed error that drops the connection.
+  Nothing in the reader explains a read right for 8 KiB and shifted after.
+- **Hashes at each hop.** The stand-in's handler has three modes: `stream`
+  passes R2's body through; `tee` hashes the bytes as R2 yields them and
+  as it sends them; `buffer` reads the range whole, hashes it, then sends
+  it. The guest checks every read against the object's known pattern. A
+  wrong read records its key, range, `content-range`, length, the first
+  offset that differs, where the wrong bytes came from in the object, and
+  the handler's own record (colo, `cf-ray`, version, time). None was
+  recorded: no read was wrong.
+- **Outside, with no container:** this machine signs each call to the
+  Worker's fetch handler, which reads R2 the same way.
+
+| Variant (16 threads, one 50 MiB object, DFW) | Reads | Wrong | First byte p50 / p99 |
+| -- | -- | -- | -- |
+| Through the intercept, `stream`, aligned ranges to 1 MiB | 100,000 | **0** | 97 / 195 ms |
+| The same, `tee` | 100,000 | **0** | 94 / 179 ms |
+| The same, `buffer` (`arrayBuffer`) | 100,000 | **0** | 88 / 174 ms |
+| The same, `stream`, unaligned offsets and sizes | 100,000 | **0** | 80 / 145 ms |
+| Outside, `stream`, aligned to 64 KiB | 100,000 | **0** | 110 / 213 ms |
+| Outside, `tee` | 100,000 | **0** | 108 / 201 ms |
+| Outside, `stream`, unaligned | 100,000 | **0** | 115 / 217 ms |
+| The product's client (`fpac_remote::Remote`, kept-alive, a thread each), 1 MiB reads at 64 KiB offsets, a whole checked get every 200 | 100,000 (512 whole) | **0** | – |
+| A bucket made minutes before (the two wrong reads came within half an hour of their buckets' making): through the intercept, `stream` | 100,000 | **0** | 32 / 107 ms |
+| The same bucket, outside | 100,000 | **0** | 51 / 145 ms |
+| The same bucket, the product's client, a whole get every 100 | 50,000 (506 whole) | **0** | – |
+
+**1,050,000 byte-checked ranged reads and 1,018 whole gets, none wrong.**
+At P2's rate (2 in about 13,600) this many would have shown about 150.
+So the wrong reads are **not reproduced**, and there is no repro and no
+report for Cloudflare. What changed between them and now: the stand-in
+(its diagnostic modes) and the driver; the guest's reader only in the
+way above. A platform condition that has since passed is as likely as
+anything of ours, and the evidence can't tell them apart. The store keeps
+the checksum on every extent and fetches a wrong one again (P3's
+simulator), so either way a wrong read never reaches ext4.
+
+A run of the product's client with 4 threads and a whole get every 20
+reads stopped at 15,000 reads (none wrong) when its container went away
+mid-run; the driver's poll then hung on the dead container and was
+stopped by hand, so that run wrote no file. The new bucket's first byte
+(32 ms p50 against 97) is one sample of one bucket.
