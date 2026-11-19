@@ -131,7 +131,12 @@ impl<S: Read + Write> Conn<S> {
     /// answer's status (so a sink can keep an error's text apart from an
     /// object's bytes). `body_max` bounds the body's bytes.
     pub fn exchange(&mut self, req: &Request<'_>, body_max: u64, sink: &mut BodySink<'_>) -> Result<(Head, Timing), HttpError> {
-        assert!(self.start == self.end, "nothing left of an earlier answer");
+        // Bytes still here belong to no request: the peer sent more than
+        // its last answer said. The stream can't be trusted, so the call
+        // fails and the caller drops the connection.
+        if self.start != self.end {
+            return Err(HttpError::Malformed("bytes past the last answer"));
+        }
         let t0 = Instant::now();
         let mut head = format!("{} {} HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\n", req.method, req.path, req.host, req.body.len());
         for (n, v) in req.headers {
@@ -260,6 +265,121 @@ mod tests {
         assert_eq!((h.status, b.as_slice(), h.header("x-a")), (206, &b"hello"[..], Some("b")));
         let (h, b) = run(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nhel\r\n2;x=y\r\nlo\r\n0\r\n\r\n", 100).unwrap();
         assert_eq!((h.status, b.as_slice(), h.close), (200, &b"hello"[..], true));
+    }
+
+    /// A server's side of one connection: each request written releases
+    /// the next answer, which is then read in pieces of random sizes (1 to
+    /// `max` bytes, from a seeded generator), as TCP may deliver them.
+    struct Jagged {
+        answers: std::collections::VecDeque<Vec<u8>>,
+        ready: Vec<u8>,
+        at: usize,
+        x: u64,
+        max: usize,
+    }
+
+    impl Read for Jagged {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.x ^= self.x << 13;
+            self.x ^= self.x >> 7;
+            self.x ^= self.x << 17;
+            let n = (1 + (self.x as usize % self.max)).min(b.len()).min(self.ready.len() - self.at);
+            b[..n].copy_from_slice(&self.ready[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    impl Write for Jagged {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if b.ends_with(b"\r\n\r\n") {
+                let next = self.answers.pop_front().expect("an answer per request");
+                self.ready.extend_from_slice(&next);
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Goal: whatever sizes the reads come in, every body arrives exactly,
+    // answer after answer on one kept-alive connection (the wrong reads
+    // seen on Cloudflare were right for 8 KiB, then shifted: a reader's
+    // partial-read bug would look so). Method: 300 connections, each 20
+    // answers of random lengths up to 1.5 MiB (past the reader's 256 KiB
+    // buffer), by length or chunked in random chunk sizes, read in random
+    // pieces of up to 1 byte, 7 bytes, 8 KiB, or 300 KiB; every body
+    // compared with what was sent.
+    #[test]
+    fn bodies_survive_any_read_sizes() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut rnd = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        // a full sweep in release; a quicker one in a debug build
+        let conns = if cfg!(debug_assertions) { 30 } else { 300 };
+        for conn_no in 0..conns {
+            let mut answers = std::collections::VecDeque::new();
+            let mut bodies = Vec::new();
+            for _ in 0..20 {
+                let mut wire = Vec::new();
+                let len = rnd(1_500_000) as usize;
+                let body: Vec<u8> = (0..len).map(|i| (i as u64).wrapping_mul(2_654_435_761).wrapping_add(conn_no) as u8 ^ (i >> 13) as u8).collect();
+                if rnd(2) == 0 {
+                    wire.extend_from_slice(format!("HTTP/1.1 206 P\r\nContent-Length: {len}\r\n\r\n").as_bytes());
+                    wire.extend_from_slice(&body);
+                } else {
+                    wire.extend_from_slice(b"HTTP/1.1 206 P\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    let mut at = 0;
+                    while at < len {
+                        let n = (1 + rnd(70_000) as usize).min(len - at);
+                        wire.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                        wire.extend_from_slice(&body[at..at + n]);
+                        wire.extend_from_slice(b"\r\n");
+                        at += n;
+                    }
+                    wire.extend_from_slice(b"0\r\n\r\n");
+                }
+                answers.push_back(wire);
+                bodies.push(body);
+            }
+            let max = [1usize, 7, 8192, 300 << 10][rnd(4) as usize];
+            let mut c = Conn::new(Jagged { answers, ready: Vec::new(), at: 0, x: conn_no * 31 + 7, max });
+            for (i, want) in bodies.iter().enumerate() {
+                let mut got = Vec::new();
+                let req = Request { method: "GET", path: "/o/e1/x", host: "h", headers: &[], body: &[] };
+                let (h, _) = c.exchange(&req, 2 << 20, &mut |_, b| {
+                    got.extend_from_slice(b);
+                    Ok(())
+                }).unwrap();
+                assert_eq!(h.status, 206);
+                assert!(got == *want, "connection {conn_no}, answer {i}: {} bytes, wanted {} (reads of up to {max})", got.len(), want.len());
+            }
+        }
+    }
+
+    // Goal: an answer that carries more bytes than it said never passes
+    // as the next answer. Method: a 5-byte body followed by 3 stray bytes,
+    // then a second request on the same connection.
+    #[test]
+    fn stray_bytes_fail_the_next_call() {
+        let mut answers = std::collections::VecDeque::new();
+        answers.push_back(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloXYZ".to_vec());
+        answers.push_back(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+        let mut c = Conn::new(Jagged { answers, ready: Vec::new(), at: 0, x: 3, max: 64 });
+        let req = Request { method: "GET", path: "/o/e1/x", host: "h", headers: &[], body: &[] };
+        let mut got = Vec::new();
+        c.exchange(&req, 100, &mut |_, b| {
+            got.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, b"hello");
+        assert!(matches!(c.exchange(&req, 100, &mut |_, _| Ok(())), Err(HttpError::Malformed(_))));
     }
 
     // Goal: an answer past a limit, cut short, or malformed is refused.

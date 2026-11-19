@@ -32,6 +32,17 @@ fn tls() -> Arc<rustls::ClientConfig> {
     Arc::new(rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().expect("TLS versions").with_root_certificates(roots).with_no_client_auth())
 }
 
+/// A TLS stream to `host:443`, its reads bounded by `timeout`.
+pub fn tls_stream(host: &str, timeout: Duration) -> std::io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    let tcp = TcpStream::connect((host, 443))?;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    tcp.set_nodelay(true)?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(std::io::Error::other)?;
+    let client = rustls::ClientConnection::new(tls(), name).map_err(std::io::Error::other)?;
+    Ok(rustls::StreamOwned::new(client, tcp))
+}
+
 pub fn https(host: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8], timeout: Duration) -> Result<Answer, String> {
     let tcp = TcpStream::connect((host, 443)).map_err(|e| format!("connect {host}: {e}"))?;
     tcp.set_read_timeout(Some(timeout)).and_then(|_| tcp.set_write_timeout(Some(timeout))).map_err(|e| e.to_string())?;

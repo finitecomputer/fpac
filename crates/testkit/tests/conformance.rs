@@ -56,3 +56,19 @@ fn unavailable_is_retryable() {
     assert!(matches!(remote.put("e7/s1", b"x"), Err(fpac_remote::RemoteError::Unavailable(_))));
     assert_eq!(remote.put("e7/s1", b"x").unwrap(), Put::Created);
 }
+
+// Goal: an answer cut short mid-body is an error, never bytes: neither a
+// short read nor the rest filled from anything else. Method: the remote
+// sends half of a ranged get's body and closes; the call must fail, and
+// the next one must answer right on a new connection.
+#[test]
+fn a_cut_body_is_an_error_not_bytes() {
+    let (r, mut remote) = start("cut");
+    let body = noise(200_000, 4);
+    assert_eq!(remote.put("e7/s1", &body).unwrap(), Put::Created);
+    r.folder.faults.cut_get_body.store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut buf = vec![0u8; 65536];
+    assert!(matches!(remote.get_range("e7/s1", 4096, &mut buf), Err(fpac_remote::RemoteError::Unavailable(_))));
+    assert_eq!(remote.get_range("e7/s1", 4096, &mut buf).unwrap(), Some(65536));
+    assert_eq!(buf[..], body[4096..4096 + 65536]);
+}

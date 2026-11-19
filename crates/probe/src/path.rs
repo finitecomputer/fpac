@@ -304,3 +304,56 @@ pub fn ranges(host: &str, port: u16, tag: &str, count: usize, diagnose: bool) ->
         "first_byte_ms": stats(first), "connections_opened": r.connects,
     })
 }
+
+/// The volume range check (docs/spike.md, Results: wrong reads), from the
+/// guest through the intercept: see `fpac_testkit::rangecheck`. Puts one
+/// 50 MiB object of known bytes, reads it `--count` times on `--threads`
+/// connections, and writes one JSON document to `--out` (or stdout), with
+/// progress on stderr.
+pub fn rangecheck(host: &str, port: u16, tag: &str, args: &[String]) -> Value {
+    use fpac_testkit::rangecheck::{self, Check, Dial, Mode, Pattern, ReadWrite};
+    struct Tcp<'a>(&'a str, u16);
+    impl Dial for Tcp<'_> {
+        fn dial(&self) -> std::io::Result<Box<dyn ReadWrite>> {
+            let s = TcpStream::connect((self.0, self.1))?;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+            s.set_nodelay(true)?;
+            Ok(Box::new(s))
+        }
+        fn host(&self) -> &str {
+            self.0
+        }
+        fn headers(&self, _: &str, _: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+    }
+    let get = |n: &str| crate::arg(args, n);
+    let (Some(mode), Some(pattern)) = (get("--mode").as_deref().and_then(Mode::parse), get("--pattern").as_deref().and_then(Pattern::parse)) else {
+        return json!({ "evidence": "rangecheck", "error": "--mode stream|tee|buffer and --pattern aligned|unaligned" });
+    };
+    let reads: usize = get("--count").and_then(|c| c.parse().ok()).unwrap_or(10_000).min(rangecheck::READS_MAX);
+    let threads: usize = get("--threads").and_then(|c| c.parse().ok()).unwrap_or(16).clamp(1, rangecheck::THREADS_MAX);
+    let size_max: usize = get("--size-max").and_then(|c| c.parse().ok()).unwrap_or(1 << 20).clamp(4096, 1 << 20);
+    let mut r = Remote::new(host, port);
+    let e = match r.open() {
+        Ok(o) => o.epoch,
+        Err(err) => return json!({ "evidence": "rangecheck", "error": format!("open: {err}") }),
+    };
+    let object = noise(STREAM_BYTES, 500);
+    let name = format!("e{e}/{tag}-rc");
+    if !matches!(r.put(&name, &object), Ok(Put::Created)) {
+        return json!({ "evidence": "rangecheck", "error": "the object's put" });
+    }
+    let path = format!("/o/{name}");
+    let check = Check { path: &path, object: &object, reads, threads, mode, pattern, size_max, seed: 0x5eed_0001 };
+    let outcome = rangecheck::run(&check, &Tcp(host, port), &|n, wrong, failed| eprintln!("{n} reads, {wrong} wrong, {failed} failed"));
+    let whole_after = matches!(r.get(&name, &mut |_| {}), Ok(Some(n)) if n == STREAM_BYTES as u64);
+    let mut out = rangecheck::evidence(&outcome, &check, &name);
+    out["whole_get_after"] = json!(whole_after);
+    if let Some(file) = get("--out") {
+        let _ = std::fs::write(&file, out.to_string());
+        let _ = std::fs::write(format!("{file}.done"), "done");
+    }
+    out
+}
+

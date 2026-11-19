@@ -5,3 +5,4 @@
 
 pub mod conformance;
 pub mod folder;
+pub mod rangecheck;

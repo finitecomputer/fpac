@@ -7,6 +7,8 @@
 //! fpac-bench probe --place krun|docker|cloudflare [--write]
 //! fpac-bench path --place krun|cloudflare [--write] [--label <l>]
 //! fpac-bench ranges --place cloudflare [--count n] [--diagnose] [--write] [--label <l>]
+//! fpac-bench rangecheck --place cloudflare|outside --mode stream|tee|buffer --pattern aligned|unaligned
+//!            --count n --threads t --size-max bytes [--write] [--label <l>]
 //! fpac-bench deploy                                the stand-in Worker, its bucket, its image
 //! fpac-bench inventory <label>                     the account's Workers, buckets, container apps
 //! fpac-bench reset                                 the one cleanup (docs/spike.md, Musts)
@@ -164,6 +166,106 @@ fn cf_exec(c: &Config, key: &net::Key, argv: &[&str]) -> Result<Value, String> {
     let mut v = guest_json(stdout).map_err(|e| format!("{e}\nstderr: {}", r["stderr"]))?;
     v["exec_ms"] = r["ms"].clone();
     Ok(v)
+}
+
+/// An exec whose stdout is wanted as text: (exit code, stdout).
+fn cf_exec_raw(c: &Config, key: &net::Key, argv: &[&str], ms: u64) -> Result<(i64, String), String> {
+    let r = net::worker(c.host(), key, "POST", "/exec", &json!({ "argv": argv, "ms": ms }), Duration::from_millis(ms + 60_000))?;
+    Ok((r["exitCode"].as_i64().unwrap_or(-1), r["stdout"].as_str().unwrap_or("").to_string()))
+}
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Bad reads joined with what the handler recorded under their request id
+/// (a record means R2's bytes were already wrong at the handler).
+fn joined(mut check: Value, records: &Value) -> Value {
+    let recs = records.as_array().cloned().unwrap_or_default();
+    if let Some(bad) = check["bad"].as_array_mut() {
+        for b in bad {
+            let id = b["ids"]["x-fpac-request"].as_str().unwrap_or("").to_string();
+            let seen = recs.iter().find(|r| r["id"] == json!(id)).cloned();
+            b["handler_saw_r2_wrong"] = seen.unwrap_or(Value::Null);
+        }
+    }
+    check["handler_records"] = json!(recs.len());
+    check["handler_records_sample"] = json!(recs.into_iter().take(20).collect::<Vec<_>>());
+    check
+}
+
+/// The volume range check (docs/spike.md, Results: wrong reads):
+/// `cloudflare` runs the guest's check through the intercept, in the
+/// background, polled; `outside` runs it from this machine against the
+/// Worker's outside route, no container and no intercept.
+fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
+    let c = Config::load()?;
+    let key = net::Key::load_or_make(&c.driver_key_file);
+    let (mode, pattern) = (flag(args, "--mode").unwrap_or("stream".into()), flag(args, "--pattern").unwrap_or("aligned".into()));
+    let (count, threads, size_max) = (flag(args, "--count").unwrap_or("10000".into()), flag(args, "--threads").unwrap_or("16".into()), flag(args, "--size-max").unwrap_or((1u32 << 20).to_string()));
+    let tag = format!("r{}", now_ms());
+    let _ = net::worker(c.host(), &key, "POST", "/records/clear", &json!({}), Duration::from_secs(60))?;
+    match place {
+        "cloudflare" => {
+            let started = cf_start(&c, &key, "spike-rc")?;
+            let job = format!("setsid nohup {PROBE_IN_GUEST} rangecheck --mode {mode} --pattern {pattern} --count {count} --threads {threads} --size-max {size_max} --tag {tag} --out /tmp/rc.json > /dev/null 2> /tmp/rc.err < /dev/null & echo started");
+            let (code, out) = cf_exec_raw(&c, &key, &["sh", "-c", &job], 60_000)?;
+            if code != 0 || !out.contains("started") {
+                return Err(format!("the job did not start: {code} {out}"));
+            }
+            // Bounded: three hours of polls every 20 s.
+            let mut finished = false;
+            for _ in 0..540 {
+                std::thread::sleep(Duration::from_secs(20));
+                if let Ok((0, _)) = cf_exec_raw(&c, &key, &["cat", "/tmp/rc.json.done"], 30_000) {
+                    finished = true;
+                    break;
+                }
+                if let Ok((_, p)) = cf_exec_raw(&c, &key, &["tail", "-n", "1", "/tmp/rc.err"], 30_000) {
+                    eprintln!("cloudflare {mode} {pattern}: {}", p.trim());
+                }
+            }
+            let (_, text) = cf_exec_raw(&c, &key, &["cat", "/tmp/rc.json"], 60_000)?;
+            let records = net::worker(c.host(), &key, "GET", "/records", &json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
+            let _ = net::worker(c.host(), &key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
+            let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "disks/spike-rc/" }), Duration::from_secs(300));
+            let check = guest_json(&text).map_err(|e| format!("{e} (finished: {finished})"))?;
+            Ok(json!({ "place": { "name": "cloudflare", "what": "the guest -> its intercept -> the stand-in's handler -> R2", "start": started }, "check": joined(check, &records), "bulk_data_deleted": deleted.ok() }))
+        }
+        "outside" => {
+            use fpac_testkit::rangecheck::{self, Check, Dial, Mode, Pattern, ReadWrite};
+            struct Outside<'a> {
+                host: &'a str,
+                key: &'a net::Key,
+            }
+            impl Dial for Outside<'_> {
+                fn dial(&self) -> std::io::Result<Box<dyn ReadWrite>> {
+                    Ok(Box::new(net::tls_stream(self.host, Duration::from_secs(60))?))
+                }
+                fn host(&self) -> &str {
+                    self.host
+                }
+                fn headers(&self, method: &str, path: &str) -> Vec<(String, String)> {
+                    vec![("authorization".into(), self.key.authorization(method, path, b""))]
+                }
+            }
+            let object = fpac_testkit::conformance::noise(50 << 20, 500);
+            let path = format!("/r2/repro/{tag}-rc");
+            let sum = fpac_remote::hex(&fpac_remote::sha256(&object));
+            let auth = key.authorization("PUT", &path, &object);
+            let put = net::https(c.host(), "PUT", &path, &[("authorization", &auth), ("x-fpac-sha256", &sum)], &object, Duration::from_secs(600))?;
+            if put.status != 201 {
+                return Err(format!("the object's put: {} {}", put.status, put.json()));
+            }
+            let (Some(m), Some(p)) = (Mode::parse(&mode), Pattern::parse(&pattern)) else { return Err("--mode stream|tee|buffer, --pattern aligned|unaligned".into()) };
+            let check = Check { path: &path, object: &object, reads: count.parse().map_err(|_| "--count")?, threads: threads.parse().map_err(|_| "--threads")?, mode: m, pattern: p, size_max: size_max.parse().map_err(|_| "--size-max")?, seed: 0x5eed_0002 };
+            let outcome = rangecheck::run(&check, &Outside { host: c.host(), key: &key }, &|n, w, f| eprintln!("outside {mode} {pattern}: {n} reads, {w} wrong, {f} failed"));
+            let records = net::worker(c.host(), &key, "GET", "/records", &json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
+            let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "repro/" }), Duration::from_secs(300));
+            Ok(json!({ "place": { "name": "outside", "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept" }, "check": joined(rangecheck::evidence(&outcome, &check, &path), &records), "bulk_data_deleted": deleted.ok() }))
+        }
+        _ => Err("--place cloudflare|outside".into()),
+    }
 }
 
 fn cf_probe() -> Result<Value, String> {
@@ -421,6 +523,7 @@ fn main() {
         (Some("probe"), "cloudflare") => cf_probe(),
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
+        (Some("rangecheck"), p) => rangecheck(p, &args),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),
@@ -430,7 +533,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 write(&args[1], &key, &v);

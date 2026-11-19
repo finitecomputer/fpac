@@ -29,6 +29,9 @@ pub struct Faults {
     pub lose_put_answer: AtomicU32,
     /// Answer the next N calls 503 without doing them.
     pub unavailable: AtomicU32,
+    /// Send the next N ranged gets' heads and half their bodies, then
+    /// close: an answer cut short.
+    pub cut_get_body: AtomicU32,
 }
 
 fn take(c: &AtomicU32) -> bool {
@@ -155,6 +158,13 @@ impl Folder {
                     let mut part = vec![0u8; (end - a + 1) as usize];
                     std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(a))?;
                     f.read_exact(&mut part)?;
+                    if take(&self.faults.cut_get_body) {
+                        let h = format!("HTTP/1.1 206 X\r\ncontent-length: {}\r\ncontent-range: bytes {a}-{end}/{len}\r\n\r\n", part.len());
+                        s.write_all(h.as_bytes())?;
+                        s.write_all(&part[..part.len() / 2])?;
+                        s.flush()?;
+                        return Err(std::io::Error::other("cut on purpose"));
+                    }
                     answer(s, 206, &[("content-range", format!("bytes {a}-{end}/{len}"))], &part)
                 }
                 None => answer(s, 400, &[], b"a range we do not serve"),

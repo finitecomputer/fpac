@@ -34,6 +34,10 @@ const READY_MS_MAX = 120 * 1000;
 const LIST_PAGES_MAX = 200;
 const INSTANCE = { vcpu: 2, memoryMib: 6144, diskMb: 20000 };
 const NULL_BYTES_MAX = 1024 * 1024;
+const REPRO_KEY = /^repro\/[a-z0-9.-]{1,64}$/;
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+// Records of mismatches the handler saw, kept and listed at most.
+const RECORDS_MAX = 1000;
 // `server-timing: r2;dur=<ms>`: what the R2 call itself took, so the
 // driver can put a slow call on the intercept or on the store.
 const timing = (t0) => `r2;dur=${Date.now() - t0}`;
@@ -57,14 +61,28 @@ const text = (status, body, headers = {}) => new Response(body, { status, header
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") return text(200, ABOUT);
+    // The outside route (docs/spike.md, Results: wrong reads): the same
+    // ranged get as the container's, from a client outside Cloudflare,
+    // with no container and no intercept between R2 and the client. Its
+    // objects live under `repro/`. A put is signed over the SHA-256 it
+    // names, which R2 checks against the body.
+    if (url.pathname.startsWith("/r2/")) {
+      const key = url.pathname.slice(4);
+      if (!REPRO_KEY.test(key)) return text(400, "a key under repro/\n");
+      const digest = request.method === "PUT" ? request.headers.get("x-fpac-sha256") || "" : EMPTY_SHA256;
+      if (!(await signed(request, url, digest, env))) return text(401, "this route answers the spike's driver only\n");
+      if (request.method === "GET") return get(env, ctx, key, request, "outside");
+      if (request.method === "PUT") return put(env.DISKS, key, request);
+      return text(405, "GET or PUT\n");
+    }
     const length = Number(request.headers.get("content-length") || "0");
     if (!(length <= DRIVER_BODY_BYTES_MAX)) return text(413, "too large\n");
     const body = new Uint8Array(await request.arrayBuffer());
     if (body.length > DRIVER_BODY_BYTES_MAX) return text(413, "too large\n");
-    if (!(await signed(request, url, body, env))) return text(401, "this route answers the spike's driver only\n");
+    if (!(await signed(request, url, hex(await crypto.subtle.digest("SHA-256", body)), env))) return text(401, "this route answers the spike's driver only\n");
     const stub = env.SPIKE.get(env.SPIKE.idFromName("spike"));
     const headers = { "x-driver-colo": String((request.cf && request.cf.colo) || "unknown") };
     return stub.fetch(new Request(url, { method: request.method, headers, body: request.method === "GET" ? undefined : body }));
@@ -73,11 +91,10 @@ export default {
 
 // `authorization: FpacSpike <unix ms>.<r||s hex>` over
 // "fpac-spike\n<method>\n<path and query>\n<unix ms>\n<sha256 hex of the body>".
-async function signed(request, url, body, env) {
+async function signed(request, url, digest, env) {
   const m = /^FpacSpike (\d{13})\.([0-9a-f]{128})$/.exec(request.headers.get("authorization") || "");
-  if (!m || !/^04[0-9a-f]{128}$/.test(env.DRIVER_PUBLIC_KEY || "")) return false;
+  if (!m || !/^04[0-9a-f]{128}$/.test(env.DRIVER_PUBLIC_KEY || "") || !SHA256_HEX.test(digest)) return false;
   if (Math.abs(Date.now() - Number(m[1])) > SIGNED_SKEW_MS_MAX) return false;
-  const digest = hex(await crypto.subtle.digest("SHA-256", body));
   const message = new TextEncoder().encode(`fpac-spike\n${request.method}\n${url.pathname}${url.search}\n${m[1]}\n${digest}`);
   const key = await crypto.subtle.importKey("raw", unhex(env.DRIVER_PUBLIC_KEY), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
   return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, unhex(m[2]), message);
@@ -103,7 +120,7 @@ export class FpacRemote extends WorkerEntrypoint {
     const named = NAME.exec(name);
     if (!named) return text(400, "a name outside the grammar\n");
     const key = `disks/${disk}/${name}`;
-    if (request.method === "GET") return get(this.env.DISKS, key, request.headers.get("range"), request.headers.get("x-fpac-diagnose") === "sha256");
+    if (request.method === "GET") return get(this.env, this.ctx, key, request, "intercept");
     if (request.method === "PUT") {
       if (named[1] !== String(epoch)) return text(403, "a put names another life's epoch\n");
       return put(this.env.DISKS, key, request);
@@ -112,12 +129,22 @@ export class FpacRemote extends WorkerEntrypoint {
   }
 }
 
-// `diagnose`: the stand-in's own diagnostic, outside the contract. The
-// range is read whole here and sent with the SHA-256 of what was sent
-// (`x-fpac-sent-sha256`), so a wrong read can be put on R2's side of the
-// handler or on the path from the handler to the guest.
-async function get(bucket, key, range, diagnose) {
+// A ranged get, as the contract serves it: R2's body streamed on. The
+// stand-in's own diagnostics, outside the contract (docs/spike.md,
+// Results: wrong reads), are asked for by `x-fpac-mode`:
+// - `tee`: streamed on while a copy is hashed and compared with
+//   `x-fpac-expect-sha256`;
+// - `buffer`: read whole, hashed and compared, then sent;
+// - `x-fpac-diagnose: sha256` (an earlier run's): `buffer`, naming what it
+//   sent in `x-fpac-sent-sha256`.
+// A mismatch is recorded in the Durable Object under the answer's
+// `x-fpac-request`, so a wrong read the client sees can be put on R2's
+// side of the handler (recorded) or after it (not recorded). Every ranged
+// answer names its request, the Worker's version and any cf-ray.
+async function get(env, ctx, key, request, path) {
   const t0 = Date.now();
+  const range = request.headers.get("range");
+  const bucket = env.DISKS;
   if (range === null) {
     const o = await bucket.get(key);
     if (o === null) return text(404, "absent\n");
@@ -138,12 +165,46 @@ async function get(bucket, key, range, diagnose) {
   if (o === null) return text(404, "absent\n");
   if (offset >= o.size && o.size > 0) return text(416, "the range starts past the end\n");
   const length = Math.max(0, Math.min(Number(r[2]), o.size - 1) - offset + 1);
-  if (diagnose) {
+  const id = crypto.randomUUID();
+  const headers = {
+    "content-length": String(length),
+    "content-range": `bytes ${offset}-${offset + length - 1}/${o.size}`,
+    "server-timing": timing(t0),
+    "x-fpac-request": id,
+    "x-fpac-version": env.VERSION.id,
+    "x-fpac-ray": request.headers.get("cf-ray") || "none",
+  };
+  const legacy = request.headers.get("x-fpac-diagnose") === "sha256";
+  const mode = legacy ? "buffer" : request.headers.get("x-fpac-mode") || "stream";
+  const expect = request.headers.get("x-fpac-expect-sha256") || "";
+  const note = (got, bytes) => ({ id, path, mode, key, range, offset, length, size: o.size, r2_range: o.range || null, got_sha256: got, got_bytes: bytes, expect_sha256: expect, version: env.VERSION.id, ray: headers["x-fpac-ray"], colo: (request.cf && request.cf.colo) || "none", at_ms: Date.now() });
+  if (mode === "buffer") {
     const bytes = await o.arrayBuffer();
-    const sent = hex(await crypto.subtle.digest("SHA-256", bytes));
-    return new Response(bytes, { status: 206, headers: { "content-length": String(bytes.byteLength), "content-range": `bytes ${offset}-${offset + length - 1}/${o.size}`, "server-timing": timing(t0), "x-fpac-sent-sha256": sent } });
+    const got = hex(await crypto.subtle.digest("SHA-256", bytes));
+    if (expect && got !== expect) ctx.waitUntil(record(env, note(got, bytes.byteLength)));
+    return new Response(bytes, { status: 206, headers: { ...headers, "content-length": String(bytes.byteLength), "x-fpac-sent-sha256": got } });
   }
-  return new Response(o.body, { status: 206, headers: { "content-length": String(length), "content-range": `bytes ${offset}-${offset + length - 1}/${o.size}`, "server-timing": timing(t0) } });
+  if (mode === "tee") {
+    const [out, copy] = o.body.tee();
+    ctx.waitUntil(
+      (async () => {
+        const digest = new crypto.DigestStream("SHA-256");
+        let n = 0;
+        const counted = copy.pipeThrough(new TransformStream({ transform(chunk, c) { n += chunk.byteLength; c.enqueue(chunk); } }));
+        await counted.pipeTo(digest);
+        const got = hex(await digest.digest);
+        if (expect && got !== expect) await record(env, note(got, n));
+      })().catch((e) => record(env, { id, path, mode, key, range, error: String(e), at_ms: Date.now() })),
+    );
+    return new Response(out, { status: 206, headers });
+  }
+  return new Response(o.body, { status: 206, headers });
+}
+
+// A mismatch seen on R2's side of the handler, kept by the Durable Object.
+function record(env, rec) {
+  const stub = env.SPIKE.get(env.SPIKE.idFromName("spike"));
+  return stub.fetch("https://spike/records", { method: "POST", body: JSON.stringify(rec) }).catch(() => {});
 }
 
 // Put-if-absent. R2 checks the body against the SHA-256 we pass, and
@@ -185,6 +246,9 @@ export class FpacSpike extends DurableObject {
       if (route === "GET /state") return json({ version: this.env.VERSION.id, running: this.ctx.container.running, images: Object.keys(this.ctx.container.images || {}) });
       if (route === "POST /objects/delete") return json(await this.deleteObjects(await request.json()));
       if (route === "POST /objects/usage") return json(await this.usage(await request.json()));
+      if (route === "POST /records") return json(await this.keep(await request.json()));
+      if (route === "GET /records") return json([...(await this.ctx.storage.list({ prefix: "rec:", limit: RECORDS_MAX })).values()]);
+      if (route === "POST /records/clear") return json(await this.clear());
       return text(404, "no such route\n");
     } catch (e) {
       return json({ error: String((e && e.stack) || e) }, 500);
@@ -267,10 +331,24 @@ export class FpacSpike extends DurableObject {
     return { running: c.running, ms: Date.now() - t0 };
   }
 
+  async keep(rec) {
+    const n = (await this.ctx.storage.get("rec-count")) || 0;
+    if (n >= RECORDS_MAX) return { kept: false };
+    await this.ctx.storage.put({ [`rec:${String(Date.now()).padStart(15, "0")}:${rec.id || crypto.randomUUID()}`]: rec, "rec-count": n + 1 });
+    return { kept: true };
+  }
+
+  async clear() {
+    const keys = [...(await this.ctx.storage.list({ prefix: "rec:", limit: RECORDS_MAX })).keys()];
+    if (keys.length) await this.ctx.storage.delete(keys);
+    await this.ctx.storage.delete("rec-count");
+    return { cleared: keys.length };
+  }
+
   // Deletes every object under `prefix` (which must be under `disks/`):
   // the driver's cleanup of bulk test data, never the guest's.
   async deleteObjects({ prefix }) {
-    if (typeof prefix !== "string" || !/^disks\/([a-z0-9-]+\/)?$/.test(prefix)) throw new Error("a prefix is disks/ or disks/<disk>/");
+    if (typeof prefix !== "string" || !/^(disks\/([a-z0-9-]+\/)?|repro\/)$/.test(prefix)) throw new Error("a prefix is disks/, disks/<disk>/ or repro/");
     let deleted = 0;
     for (let page = 0; page < LIST_PAGES_MAX; page++) {
       const l = await this.env.DISKS.list({ prefix, limit: 1000 });
