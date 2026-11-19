@@ -331,3 +331,48 @@ the previous code.
 - **`mlockall` on Cloudflare** needs the daemon to raise its own
   `RLIMIT_MEMLOCK` first (it holds `CAP_SYS_RESOURCE`, not
   `CAP_IPC_LOCK`).
+
+### P3: the store (2026-11-19, commit `340ac36`)
+
+The owner's word after P2: go on, with the three changes proposed above
+(the pack as parallel ranged gets, read-ahead of 1 MiB, several segments
+shipped at once), and a checksum on every extent with a fetch again on a
+mismatch as a hard requirement, tested in the simulator.
+
+- **`fpac-format`**: segments, map pages, checkpoints and packs; every
+  object sealed with the SHA-256 of its header; every extent with its
+  sum64. Six tests, among them every cut length and every flipped byte of
+  each header refused as a value.
+- **`fpac-store`**: open and replay, reads with read-ahead and checks,
+  writes, the cut, landing in any order, checkpoints of changed pages,
+  the pack, fencing, the head's rules (design.md). Behind two gates and
+  a clock passed in.
+- **The simulator** (`crates/store/tests/sim.rs`), release build:
+
+  | Scenario | What it showed |
+  | -- | -- |
+  | A calm remote, 60 seeds × 12 lives × 150 operations, crashing anywhere | every reopen is the last fully landed flush; no acknowledged flush lost |
+  | A stormy remote: down 3%, put answers lost 3%, **one ranged get in ten the right length with the wrong bytes** | 17,269 reads, **none wrong**, 0 failed after their tries; 25,641 wrong answers served; 467 crashes recovered |
+  | A crash at every step of one run, with multi-segment flushes in flight and landing in any order | **2,751 of 2,751** crash points recovered |
+  | A remote that always lies about one segment | the read fails after 3 tries; never bytes |
+  | A cache that lies | caught by the extent's checksum, fetched again |
+  | The pack | after a sleep, the next wake's 20 boot reads make no remote call; a stale pack entry is ignored |
+  | Another writer's bytes at a name | the life is fenced |
+  | The head's rules | each case: new disk, new life, later checkpoint, the same again, older, conflicting, not running |
+
+- **A bug the simulator found** while it was being hardened (it first
+  passed too easily: three of five planted bugs went unnoticed, so it
+  grew pipelined flushes, multi-segment cuts and random landing order):
+  a flush of several segments moved the map a segment at a time, so a
+  checkpoint taken between them held half a flush. The test failed
+  (seed 13, life 7: wrong bytes at reopen) before the fix and passes
+  after it: the map now moves a whole cut at a time.
+- **Planted bugs, each caught:** no extent checksum (3 tests fail);
+  cuts ignored on replay (3); landing a segment at a time (3); no
+  fetch again on a wrong extent (1); an unchecked cache (1).
+- **Deviations:** checkpoints and packs are numbered within their life
+  (`c<n>`, `p<n>`), not by the segment they cover, so two checkpoints of
+  one life can never share a name; what a checkpoint covers is its
+  `end`. A chain link is the SHA-256 of a segment's header (which seals
+  its extents' sums), so a replay checks the chain from headers alone.
+  The cleaner's compaction of live segments is left to P5.
