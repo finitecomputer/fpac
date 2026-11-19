@@ -422,7 +422,10 @@ echo "boot_read_ms: $(( (t1 - t0) / 1000000 ))""#;
 
 /// Disks of each size: written once (the boot's files, then `gb` of
 /// others), put to sleep, then woken `wakes` times on fresh guests.
-pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32) -> Result<Value, String> {
+/// `asleep_s`: how long the disk sleeps, its guest gone, before the first
+/// wake (the later wakes come at once), so the store's caches have time
+/// to forget it.
+pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64) -> Result<Value, String> {
     let st = p.start()?;
     let m = mount(p)?;
     let (code, out) = p.sh(BOOT_SET)?;
@@ -438,6 +441,8 @@ pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32) -> Result<Value, String> {
     let fill_ms = t.elapsed().as_millis() as u64;
     let s = sleep(p)?;
     p.kill()?;
+    // Bounded by the caller's flag.
+    std::thread::sleep(Duration::from_secs(asleep_s));
     let mut lives = Vec::new();
     for _ in 0..wakes {
         let t0 = Instant::now();
@@ -458,7 +463,7 @@ pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32) -> Result<Value, String> {
             "wake_to_boot_read_ms": wake_ms, "far_1mib_read_ms": far, "sleep_ms": sl["sleep_ms"],
         }));
     }
-    Ok(json!({ "what": p.what(), "gb": gb, "first": { "start": st, "mount": m, "fill_ms": fill_ms, "fill_df": out.trim(), "sleep": s }, "wakes": lives }))
+    Ok(json!({ "what": p.what(), "gb": gb, "asleep_s_before_the_first_wake": asleep_s, "first": { "start": st, "mount": m, "fill_ms": fill_ms, "fill_df": out.trim(), "sleep": s }, "wakes": lives }))
 }
 
 /// The git source the clone reads: 7,260 files in 121 directories (react's
