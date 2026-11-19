@@ -261,6 +261,9 @@ quote them as they are.
 - The Worker reads `x-fpac-sha256` for a whole get from R2's stored
   checksum, which exists only for objects put with one; every put here
   names one.
+- The stand-in Worker carries two diagnostics outside the contract
+  (`GET /null`, and `x-fpac-diagnose: sha256` on a ranged get). The
+  platform's route has neither; they go when the stand-in does.
 
 ## Risks
 

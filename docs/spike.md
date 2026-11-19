@@ -170,4 +170,164 @@ a commit pushed.
 
 ## Results
 
-*Filled as each phase exits.*
+Measured 2026-11-19. The driver's machine: a 32-thread AMD workstation,
+Linux 7.2, Docker 29.9, sandcastle's engine with libkrun's kernel 6.12.115.
+Every number below is quoted from `docs/evidence/` at commit `8f27c5c`
+unless it says otherwise; the probe's timings are one sample per place
+(acceptance 3 times the mount ten times, in P5).
+
+### Deviations from the plan, and why
+
+1. **The face's FUSE half and the remote's client came forward into P2.**
+   The probe needs a FUSE file to put a loop device on, and the path is
+   measured through the product's own client, not a harness.
+2. **A fifth crate, `fpac-probe`,** the guest's half of the driver, apart
+   from `fpac-bench`, so the guest's binary is static, small (about 1 MB)
+   and carries no TLS or signing code.
+3. **The device is exercised only in krun microVMs and Cloudflare
+   containers,** never in a privileged container on the driver's machine
+   (the plan said "a privileged container"): nothing attaches a loop
+   device or mounts ext4 on a kernel the driver's machine runs itself.
+4. **The driver's calls to the Worker are signed** by a local ECDSA P-256
+   key whose public half is a plain var: no secret is set on the account.
+5. **`ranges.json`, a byte-checked ranged-read scenario,** added after a
+   wrong read was seen (below), with a diagnostic mode in the stand-in.
+6. **Two buckets:** one where R2 placed it (WNAM) and one with an eastern
+   hint (ENAM), to see how far the path travels.
+7. **The Worker updates its Durable Object at once
+   (`code_update_strategy: immediate`), and the driver waits for the
+   deployed version before it measures:** one run measured the previous
+   version for a few minutes after a deploy.
+8. **The stream is 50 MiB** (52.4 MB), not 50 MB.
+9. **The stand-in's `/null` route** answers 64 KiB from memory, outside
+   the contract, to time the intercept with no store behind it.
+
+### P2, acceptance 1: the probe (`probe.json`)
+
+| | Cloudflare container | krun microVM | Docker, as local workerd starts it |
+| -- | -- | -- | -- |
+| Kernel | **6.18.64-cloudflare-microvm-2026.11.44** | 6.12.115 (libkrunfw) | the host's, 7.2.15 |
+| CPUs, memory | 2, 6.25 GiB | 2, 5.8 GiB | the host's |
+| The root filesystem | btrfs, 20 GB | overlay | overlay |
+| `CAP_SYS_ADMIN`, `CAP_MKNOD`, `CAP_SYS_RESOURCE` | held | held | `CAP_MKNOD` only |
+| `CAP_IPC_LOCK` | not held (`mlockall` of a small process works within the 8 MiB `RLIMIT_MEMLOCK`) | held | not held |
+| `/dev/fuse` | present, opens | present, opens | **absent** |
+| `/dev/loop-control`, loop in `/proc/devices` | present | present | **absent** |
+| ublk (`/dev/ublk-control`), NBD | absent | absent | absent |
+| `PR_SET_IO_FLUSHER` | allowed | allowed | refused |
+| One file over `/dev/fuse` (4 threads) | **works**: mounted in 2.0 ms | works: 0.3 ms | not tried (check-only) |
+| A loop device over it, direct I/O, 4 KiB blocks | **works, direct I/O taken**: 8.1 ms | works, direct I/O taken: 0.1 ms | – |
+| `mke2fs` (2 GiB, nothing zeroed) | 183 ms | 1,610 ms (an earlier run: 45 ms; the machine was loaded) | – |
+| ext4 mount | **16.9 ms** | 7.7 ms | – |
+| statfs reads ext4; a file survives unmount and mount; `e2fsck -f -n` clean | yes | yes | – |
+| 256 MiB written and synced, then read cold: the container's own disk | 160 / 437 MB/s | 88 / 1,965 MB/s | – |
+| The same through ext4 on the loop device on the FUSE file (a local file behind it, a stand-in for the store) | **119 / 411 MB/s (74% / 94%)** | 340 / 2,956 MB/s | – |
+
+An earlier run on Cloudflare, same code path: own disk 173 / 668 MB/s,
+through the face 144 / 541 MB/s (83% / 81%); mounts 2.0, 3.5, 92 and
+16.4 ms.
+
+**The face chosen: a loop device over one FUSE file with direct I/O,**
+on both Cloudflare and krun. Neither kernel has ublk or NBD. Local
+workerd's Docker container offers no face: it has no `/dev/fuse`, no
+loop device and no `CAP_SYS_ADMIN`, and workerd adds nothing to a
+computer's container (read from a live one: not privileged, no added
+capability or device; only its network sidecar has `NET_ADMIN`). So the
+disk's end-to-end lanes run on krun and on Cloudflare, never on local
+workerd: the blocker named, as the style asks.
+
+### P2, acceptance 2: the path (`path.json`)
+
+The guest in a Cloudflare container, plain HTTP to the intercepted host,
+the stand-in Worker's handler (on the container's machine), an R2
+binding. The intercept registered before the container's start, which
+Cloudflare allowed. The Durable Object and its container ran in DFW.
+
+| | Pass line | WNAM bucket | ENAM bucket |
+| -- | -- | -- | -- |
+| A 64 KiB ranged get, first byte, p50 / p99 (n = 200) | ≤ 30 / ≤ 150 ms | **111 / 202 ms** | **106 / 172 ms** |
+| of which R2's own call (`server-timing`) | – | 98 / 188 ms | 96 / 163 ms |
+| The intercept alone (64 KiB from the handler's memory), p50 / p99 | – | **7.4 / 20 ms** | 6.6 / 10 ms |
+| A 1 MiB ranged get, whole, p50 / p99 (n = 100) | – | 151 / 420 ms | 140 / 344 ms |
+| A 50 MiB stream, one connection (5 runs) | ≥ 80 MB/s | **25–50 MB/s** (1.0–2.1 s) | 21–49 MB/s |
+| The same as 4 ranged gets in parallel (3 runs) | – | 55–57 MB/s (0.9–1.0 s) | 33–110 MB/s (0.5–1.6 s) |
+| A 64 KiB put, p50 / p99 (n = 30) | – | 330 / 438 ms | 579 / 1,006 ms |
+| An 8 MiB put, p50 / p99 (n = 10) | ≤ 500 ms | **709 / 825 ms** (12 MB/s) | 931 / 1,960 ms |
+| A 50 MiB put | – | 2.75 s | 2.97 s |
+| Put-if-absent: new, the same again, other bytes | 201, 200, 409 | Created, Same, Conflict | Created, Same, Conflict |
+
+Earlier runs of the same path (WNAM, before the commit) varied: four
+parallel ranged gets reached 113–150 MB/s in one run, a single stream
+81 MB/s at best.
+
+**Every network pass line is missed, and R2 is the cause:** the
+intercept costs about 5–7 ms; R2's own calls cost about 100 ms for a
+ranged get and 300–900 ms for a put, wherever the bucket was placed.
+The plan's escalation ("the path can't carry a 50 MB pack in about a
+second, or a put takes seconds") is at its edge: a 50 MiB pack takes 0.9
+to 2.1 s on one stream and 0.5 to 1.6 s on four.
+
+The krun place's path (`path.json`, `krun`) runs against the folder
+remote on a unix socket: a stand-in for the route and for R2, never the
+product's number. Through the engine's intercept it measured a 64 KiB put
+in 6.5 ms and a 50 MiB stream at about 1.16 GB/s.
+
+### P2, acceptance 7: conformance (`path.json`)
+
+12 of 12 cases pass against the stand-in Worker (both buckets), against
+the folder remote from inside a krun guest, and in this workspace's
+tests.
+
+### Wrong bytes from a ranged read (`ranges.json`)
+
+**A ranged read on Cloudflare can come back the right length with the
+wrong bytes.** Seen twice in about 13,600 byte-checked ranged reads
+through the stand-in's streamed path:
+
+- `ranges.json`, `cloudflare-wnam` (commit `8f27c5c`): 1 wrong in 2,000.
+  A 64 KiB read at offset 13,463,552 was right for its first 8 KiB; from
+  there on it held the same object's bytes from 28 KiB further on (offset
+  13,500,416). It was read 1,421st, on one kept-alive connection, mid-run.
+- A path run before the commit (its file replaced by a later run, so its
+  detail was not kept): a 1 MiB read at offset 30,408,704, the right
+  length, wrong bytes.
+- No wrong read in 3,000 more streamed reads (`cloudflare-wnam-streamed`),
+  nor in the 600 of the final path runs, nor in 4,500 reads where the
+  handler read each range whole before sending it
+  (`cloudflare-wnam-diagnose`, `-diagnose-2`). At the rate seen, 4,500
+  reads would show none about half the time, so where the bytes go wrong
+  (R2's body stream, the handler's response, or the intercept) is **not
+  yet known**.
+- Every whole-object get (checked by its stored SHA-256) was right.
+
+The store checks every extent against its checksum after every read and
+fetches a wrong one again (design.md); this finding makes that a
+requirement with evidence behind it, and it goes to Cloudflare.
+
+**A second finding, not about bytes: right after a deploy, the egress
+handler ran the previous version.** In `cloudflare-wnam-diagnose`, the
+first 25 reads (of 3,000) were answered without the diagnostic header the
+new version adds, though the driver had waited until the Durable Object
+itself answered with the new version (the 20 the file records are
+indices 0 to 19 of the run's fixed sequence of reads). A platform that changes the route's
+contract must expect a container's first calls after a deploy to reach
+the previous code.
+
+### What P2 changes in the design (proposals; the owner decides)
+
+- **A miss costs about 100 ms, not 30–50.** The boot pack and the
+  background fill carry more weight, and read-ahead on a miss should be
+  wider: a 1 MiB range costs little more than 64 KiB (first byte 118 ms
+  against 111).
+- **Puts cost 300–900 ms each, nearly flat to 8 MiB.** The flush ships
+  segments several at a time, and a segment should be as large as the
+  second's writes allow; a one-second cadence holds for an agent's turn
+  (a few MB), and a burst like `npm ci` ships behind the work in
+  parallel.
+- **The pack is fetched as parallel ranged gets,** not one stream.
+- **Every extent is checked against its checksum after every read**
+  (already the design), and a wrong one is fetched again: a wrong read
+  was seen.
+- **`mlockall` on Cloudflare** needs the daemon to raise its own
+  `RLIMIT_MEMLOCK` first (it holds `CAP_SYS_RESOURCE`, not
+  `CAP_IPC_LOCK`).

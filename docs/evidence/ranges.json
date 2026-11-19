@@ -1,0 +1,279 @@
+{
+  "evidence": "ranges",
+  "places": {
+    "cloudflare-wnam": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "8f27c5c101d4"
+      },
+      "measured_at_ms": 1795108520462,
+      "place": {
+        "bucket_location": "WNAM",
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-ranges",
+          "driver_colo": "DFW",
+          "epoch": 1795108261669,
+          "image": "tiny",
+          "image_digest": "sha256:b7d048cc5b3b0281957f0d579d543bbb035ff789110ecb1198a471cc46ed9b16",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 347,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "94cc9347-39fc-4b45-ad64-b4b4664f45ce"
+        }
+      },
+      "ranges": {
+        "bytes_read": 1045991424,
+        "connections_opened": 1,
+        "evidence": "ranges",
+        "exec_ms": 257002,
+        "failed": 0,
+        "failed_detail": [],
+        "first_byte_ms": {
+          "max": 1423.749,
+          "mean": 114.068,
+          "min": 79.371,
+          "n": 1999,
+          "p50": 108.632,
+          "p99": 223.687
+        },
+        "object_bytes": 52428800,
+        "reads": 2000,
+        "remote": "fpac.fragment.internal:80",
+        "right": 1999,
+        "whole_get_checked": {
+          "after": true,
+          "before": true
+        },
+        "wrong": 1,
+        "wrong_detail": [
+          "ranged 13463552: 65536 bytes, wrong bytes from 8192 on (57122 differ); the first wrong 64 are the object's at Some(13500416); all zeros after: false"
+        ]
+      }
+    },
+    "cloudflare-wnam-diagnose": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "590081b61f11"
+      },
+      "measured_at_ms": 1795109233983,
+      "place": {
+        "bucket_location": "WNAM",
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-ranges",
+          "driver_colo": "DFW",
+          "epoch": 1795108831156,
+          "image": "tiny",
+          "image_digest": "sha256:b9886d5f473e463b4c8fd63e3dbbfc20e3f922385897bdd414dd411de0d62fe9",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 3120,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "277daa1f-f030-4834-97b0-ba964afb1147"
+        }
+      },
+      "ranges": {
+        "bytes_read": 1576890368,
+        "connections_opened": 1,
+        "evidence": "ranges",
+        "exec_ms": 398495,
+        "failed": 25,
+        "failed_detail": [
+          "9654272+368640: arrived right, but the handler named another checksum",
+          "35995648+413696: arrived right, but the handler named another checksum",
+          "50286592+409600: arrived right, but the handler named another checksum",
+          "26578944+872448: arrived right, but the handler named another checksum",
+          "51134464+270336: arrived right, but the handler named another checksum",
+          "18722816+622592: arrived right, but the handler named another checksum",
+          "2473984+4096: arrived right, but the handler named another checksum",
+          "38166528+307200: arrived right, but the handler named another checksum",
+          "17608704+536576: arrived right, but the handler named another checksum",
+          "18034688+667648: arrived right, but the handler named another checksum",
+          "48283648+897024: arrived right, but the handler named another checksum",
+          "20258816+282624: arrived right, but the handler named another checksum",
+          "42475520+217088: arrived right, but the handler named another checksum",
+          "20353024+966656: arrived right, but the handler named another checksum",
+          "41537536+966656: arrived right, but the handler named another checksum",
+          "41959424+815104: arrived right, but the handler named another checksum",
+          "19103744+815104: arrived right, but the handler named another checksum",
+          "6254592+581632: arrived right, but the handler named another checksum",
+          "9711616+757760: arrived right, but the handler named another checksum",
+          "47374336+512000: arrived right, but the handler named another checksum"
+        ],
+        "first_byte_ms": {
+          "max": 686.469,
+          "mean": 128.433,
+          "min": 81.917,
+          "n": 3000,
+          "p50": 120.841,
+          "p99": 261.176
+        },
+        "mode": "diagnose: each range read whole by the handler and sent with its SHA-256",
+        "object_bytes": 52428800,
+        "reads": 3000,
+        "remote": "fpac.fragment.internal:80",
+        "right": 3000,
+        "whole_get_checked": {
+          "after": true,
+          "before": true
+        },
+        "wrong": 0,
+        "wrong_detail": []
+      }
+    },
+    "cloudflare-wnam-diagnose-2": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "4952938e6d36"
+      },
+      "measured_at_ms": 1795109838634,
+      "place": {
+        "bucket_location": "WNAM",
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-ranges",
+          "driver_colo": "DFW",
+          "epoch": 1795109662491,
+          "image": "tiny",
+          "image_digest": "sha256:8528ddb876a6c83c52bda3c27aecf64713c5f186739d693e942752195df7003e",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 2659,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "15b61097-40d9-464e-b566-b90d94d2d148"
+        }
+      },
+      "ranges": {
+        "bytes_read": 799744000,
+        "connections_opened": 1,
+        "evidence": "ranges",
+        "exec_ms": 172236,
+        "failed": 0,
+        "failed_detail": [],
+        "first_byte_ms": {
+          "max": 341.562,
+          "mean": 110.328,
+          "min": 74.491,
+          "n": 1500,
+          "p50": 104.677,
+          "p99": 220.064
+        },
+        "mode": "diagnose: each range read whole by the handler and sent with its SHA-256",
+        "object_bytes": 52428800,
+        "reads": 1500,
+        "remote": "fpac.fragment.internal:80",
+        "right": 1500,
+        "whole_get_checked": {
+          "after": true,
+          "before": true
+        },
+        "wrong": 0,
+        "wrong_detail": []
+      }
+    },
+    "cloudflare-wnam-streamed": {
+      "bulk_data_deleted": {
+        "deleted": 1,
+        "pages": 1
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "590081b61f11"
+      },
+      "measured_at_ms": 1795109610517,
+      "place": {
+        "bucket_location": "WNAM",
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-ranges",
+          "driver_colo": "DFW",
+          "epoch": 1795109234103,
+          "image": "tiny",
+          "image_digest": "sha256:b9886d5f473e463b4c8fd63e3dbbfc20e3f922385897bdd414dd411de0d62fe9",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 136,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "277daa1f-f030-4834-97b0-ba964afb1147"
+        }
+      },
+      "ranges": {
+        "bytes_read": 1554837504,
+        "connections_opened": 1,
+        "evidence": "ranges",
+        "exec_ms": 374935,
+        "failed": 0,
+        "failed_detail": [],
+        "first_byte_ms": {
+          "max": 365.674,
+          "mean": 114.429,
+          "min": 79.438,
+          "n": 3000,
+          "p50": 110.597,
+          "p99": 194.355
+        },
+        "mode": "streamed: R2's body streamed through the handler, as the contract serves it",
+        "object_bytes": 52428800,
+        "reads": 3000,
+        "remote": "fpac.fragment.internal:80",
+        "right": 3000,
+        "whole_get_checked": {
+          "after": true,
+          "before": true
+        },
+        "wrong": 0,
+        "wrong_detail": []
+      }
+    }
+  }
+}

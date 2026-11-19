@@ -1,0 +1,708 @@
+{
+  "evidence": "probe",
+  "places": {
+    "cloudflare": {
+      "caps": {
+        "bounding": "00000000abac35fb",
+        "effective": "00000000abac35fb",
+        "held": [
+          "CAP_SYS_ADMIN",
+          "CAP_MKNOD",
+          "CAP_SYS_RESOURCE"
+        ],
+        "missing": [
+          "CAP_IPC_LOCK",
+          "CAP_SYS_RAWIO"
+        ],
+        "no_new_privs": "0",
+        "seccomp": "0",
+        "uid": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "8f27c5c101d4"
+      },
+      "cpus": 2,
+      "devices": {
+        "block": [
+          {
+            "major": "7",
+            "name": "loop"
+          },
+          {
+            "major": "252",
+            "name": "device-mapper"
+          },
+          {
+            "major": "253",
+            "name": "virtblk"
+          }
+        ],
+        "char": [
+          {
+            "major": "10",
+            "name": "misc"
+          }
+        ]
+      },
+      "dirty_expire_centisecs": "3000",
+      "evidence": "probe",
+      "exec_ms": 6114,
+      "faces": {
+        "all_steps_ok": true,
+        "ext4_on_loop": true,
+        "fuse_file": true,
+        "loop_direct_io": true,
+        "loop_over_fuse": true,
+        "nbd": false,
+        "ublk_control": false
+      },
+      "filesystems": [
+        "nodev\ttmpfs",
+        "nodev\tdevtmpfs",
+        "ext4",
+        "fuseblk",
+        "nodev\tfuse",
+        "nodev\tfusectl",
+        "nodev\tvirtiofs",
+        "nodev\toverlay"
+      ],
+      "io_flusher": {
+        "error": null,
+        "ok": true
+      },
+      "kernel": {
+        "machine": "x86_64",
+        "release": "6.18.64-cloudflare-microvm-2026.11.44",
+        "version": "#1 SMP PREEMPT_DYNAMIC Mon Sep 27 00:00:00 UTC 2010"
+      },
+      "measured_at_ms": 1795108180688,
+      "mem_total": "MemTotal:        6556224 kB",
+      "mlockall": {
+        "error": null,
+        "ok": true,
+        "rlimit_memlock": "8388608 8388608"
+      },
+      "mode": "full",
+      "modules": {
+        "fuse": true,
+        "loop": true,
+        "nbd": false,
+        "ublk_drv": false
+      },
+      "nodes": {
+        "/dev/fuse": {
+          "exists": true,
+          "kind": "char",
+          "major": 10,
+          "minor": 229,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/loop-control": {
+          "exists": true,
+          "kind": "char",
+          "major": 10,
+          "minor": 237,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/loop0": {
+          "exists": true,
+          "kind": "block",
+          "major": 7,
+          "minor": 0,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/nbd0": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/ublk-control": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        }
+      },
+      "place": {
+        "destroyed": true,
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-probe",
+          "driver_colo": "DFW",
+          "epoch": 1795108173534,
+          "image": "tiny",
+          "image_digest": "sha256:b7d048cc5b3b0281957f0d579d543bbb035ff789110ecb1198a471cc46ed9b16",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 350,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "94cc9347-39fc-4b45-ad64-b4b4664f45ce"
+        },
+        "what": "a Cloudflare container (a Durable Object's, the durable_object policy), 2 vCPU, 6 GiB, 20 GB, started by the stand-in Worker"
+      },
+      "root_fs": {
+        "bytes": 20000002048,
+        "free_bytes": 19755651072,
+        "type": "0x9123683e"
+      },
+      "scratch_fs": {
+        "bytes": 20000002048,
+        "free_bytes": 19755651072,
+        "type": "0x9123683e"
+      },
+      "steps": [
+        {
+          "detail": {
+            "made": false
+          },
+          "ms": 0.01142,
+          "ok": true,
+          "step": "node /dev/fuse (char 10:229)"
+        },
+        {
+          "detail": {
+            "made": false
+          },
+          "ms": 0.00521,
+          "ok": true,
+          "step": "node /dev/loop-control (char 10:237)"
+        },
+        {
+          "detail": {
+            "bytes": 268435456,
+            "page_cache_dropped": true,
+            "read_mbs": 436.8,
+            "write_mbs": 160.4
+          },
+          "ms": 2505.8222849999997,
+          "ok": true,
+          "step": "sniff: the container's own disk"
+        },
+        {
+          "detail": {
+            "bytes": 2147483648
+          },
+          "ms": 0.09048,
+          "ok": true,
+          "step": "backing: a sparse local file (the stand-in for the store)"
+        },
+        {
+          "detail": {
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "threads": 4
+          },
+          "ms": 1.956811,
+          "ok": true,
+          "step": "fuse: mount one file over /dev/fuse"
+        },
+        {
+          "detail": {
+            "size": 2147483648
+          },
+          "ms": 0.11363,
+          "ok": true,
+          "step": "fuse: the file is there"
+        },
+        {
+          "detail": {
+            "device": "/dev/loop0",
+            "direct_io": true
+          },
+          "ms": 8.096924,
+          "ok": true,
+          "step": "loop: attach over the FUSE file, direct I/O, 4 KiB blocks"
+        },
+        {
+          "detail": {},
+          "ms": 183.412787,
+          "ok": true,
+          "step": "ext4: mke2fs"
+        },
+        {
+          "detail": {},
+          "ms": 16.922648,
+          "ok": true,
+          "step": "ext4: mount (noatime, commit=1, discard)"
+        },
+        {
+          "detail": {
+            "type": "0xef53"
+          },
+          "ms": 0.02539,
+          "ok": true,
+          "step": "ext4: statfs reads ext4"
+        },
+        {
+          "detail": {
+            "bytes": 268435456,
+            "page_cache_dropped": true,
+            "read_mbs": 410.9,
+            "write_mbs": 118.9
+          },
+          "ms": 3059.4100489999996,
+          "ok": true,
+          "step": "sniff: ext4 on the loop device on the FUSE file"
+        },
+        {
+          "detail": {},
+          "ms": 162.388777,
+          "ok": true,
+          "step": "ext4: a file survives an unmount and a mount"
+        },
+        {
+          "error": null,
+          "ms": 30.856265,
+          "ok": true,
+          "step": "ext4: unmount"
+        },
+        {
+          "error": null,
+          "ms": 84.939481,
+          "ok": true,
+          "step": "ext4: e2fsck -f -n through the loop device"
+        },
+        {
+          "error": null,
+          "ms": 0.64582,
+          "ok": true,
+          "step": "loop: detach"
+        },
+        {
+          "error": null,
+          "ms": 3.462312,
+          "ok": true,
+          "step": "fuse: unmount"
+        }
+      ]
+    },
+    "docker": {
+      "caps": {
+        "bounding": "00000000a80425fb",
+        "effective": "00000000a80425fb",
+        "held": [
+          "CAP_MKNOD"
+        ],
+        "missing": [
+          "CAP_SYS_ADMIN",
+          "CAP_SYS_RESOURCE",
+          "CAP_IPC_LOCK",
+          "CAP_SYS_RAWIO"
+        ],
+        "no_new_privs": "0",
+        "seccomp": "2",
+        "uid": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "8f27c5c101d4"
+      },
+      "cpus": 32,
+      "devices": {
+        "block": [
+          {
+            "major": "253",
+            "name": "device-mapper"
+          },
+          {
+            "major": "254",
+            "name": "virtblk"
+          }
+        ],
+        "char": [
+          {
+            "major": "10",
+            "name": "misc"
+          }
+        ]
+      },
+      "dirty_expire_centisecs": "3000",
+      "evidence": "probe",
+      "filesystems": [
+        "nodev\ttmpfs",
+        "nodev\tdevtmpfs",
+        "ext4",
+        "fuseblk",
+        "nodev\tfuse",
+        "nodev\tfusectl",
+        "nodev\tvirtiofs",
+        "nodev\toverlay"
+      ],
+      "io_flusher": {
+        "error": "Operation not permitted (os error 1)",
+        "ok": false
+      },
+      "kernel": {
+        "machine": "x86_64",
+        "release": "7.2.15-1-omarchy",
+        "version": "#1 SMP PREEMPT_DYNAMIC Mon, 02 Nov 2026 10:32:17 +0000"
+      },
+      "measured_at_ms": 1795108173357,
+      "mem_total": "MemTotal:       63147616 kB",
+      "mlockall": {
+        "error": null,
+        "ok": true,
+        "rlimit_memlock": "8388608 8388608"
+      },
+      "mode": "check-only",
+      "modules": {
+        "fuse": true,
+        "loop": false,
+        "nbd": false,
+        "ublk_drv": false
+      },
+      "nodes": {
+        "/dev/fuse": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/loop-control": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/loop0": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/nbd0": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/ublk-control": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        }
+      },
+      "place": {
+        "docker": "29.9.2",
+        "image": "fpac-spike-tiny:7360c51d2043",
+        "name": "docker",
+        "what": "docker run with no privilege, capability or device added, as local workerd starts a computer's container; check-only, since it shares this box's kernel",
+        "workerd_sets": {
+          "app container (the computer)": {
+            "cap_add": null,
+            "cap_drop": null,
+            "devices": null,
+            "privileged": false,
+            "runtime": "runc",
+            "security_opt": null
+          },
+          "network sidecar": {
+            "cap_add": [
+              "NET_ADMIN"
+            ],
+            "cap_drop": null,
+            "devices": null,
+            "privileged": false,
+            "runtime": "runc",
+            "security_opt": null
+          }
+        }
+      },
+      "root_fs": {
+        "bytes": 1998232485888,
+        "free_bytes": 306697904128,
+        "type": "0x794c7630"
+      }
+    },
+    "krun": {
+      "caps": {
+        "bounding": "000001ffffffffff",
+        "effective": "000001ffffffffff",
+        "held": [
+          "CAP_SYS_ADMIN",
+          "CAP_MKNOD",
+          "CAP_SYS_RESOURCE",
+          "CAP_IPC_LOCK",
+          "CAP_SYS_RAWIO"
+        ],
+        "missing": [],
+        "no_new_privs": "0",
+        "seccomp": "0",
+        "uid": 0
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "8f27c5c101d4"
+      },
+      "cpus": 2,
+      "devices": {
+        "block": [
+          {
+            "major": "7",
+            "name": "loop"
+          },
+          {
+            "major": "252",
+            "name": "device-mapper"
+          },
+          {
+            "major": "254",
+            "name": "virtblk"
+          }
+        ],
+        "char": [
+          {
+            "major": "10",
+            "name": "misc"
+          }
+        ]
+      },
+      "dirty_expire_centisecs": "3000",
+      "evidence": "probe",
+      "exit_code": 0,
+      "faces": {
+        "all_steps_ok": true,
+        "ext4_on_loop": true,
+        "fuse_file": true,
+        "loop_direct_io": true,
+        "loop_over_fuse": true,
+        "nbd": false,
+        "ublk_control": false
+      },
+      "filesystems": [
+        "nodev\ttmpfs",
+        "nodev\tdevtmpfs",
+        "ext4",
+        "fuseblk",
+        "nodev\tfuse",
+        "nodev\tfusectl",
+        "nodev\tvirtiofs",
+        "nodev\toverlay"
+      ],
+      "io_flusher": {
+        "error": null,
+        "ok": true
+      },
+      "kernel": {
+        "machine": "x86_64",
+        "release": "6.12.115",
+        "version": "#1 SMP PREEMPT_DYNAMIC Wed Nov  4 09:38:44 AM CET 2026"
+      },
+      "measured_at_ms": 1795108171329,
+      "mem_total": "MemTotal:        6091012 kB",
+      "mlockall": {
+        "error": null,
+        "ok": true,
+        "rlimit_memlock": "8388608 8388608"
+      },
+      "mode": "full",
+      "modules": {
+        "fuse": true,
+        "loop": true,
+        "nbd": false,
+        "ublk_drv": false
+      },
+      "nodes": {
+        "/dev/fuse": {
+          "exists": true,
+          "kind": "char",
+          "major": 10,
+          "minor": 229,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/loop-control": {
+          "exists": true,
+          "kind": "char",
+          "major": 10,
+          "minor": 237,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/loop0": {
+          "exists": true,
+          "kind": "block",
+          "major": 7,
+          "minor": 0,
+          "open_error": null,
+          "opens": true
+        },
+        "/dev/nbd0": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        },
+        "/dev/ublk-control": {
+          "error": "No such file or directory (os error 2)",
+          "exists": false
+        }
+      },
+      "place": {
+        "engine_timings_us": {
+          "guestHelloUs": 196285,
+          "guestUptimeUs": 76000,
+          "jailNetUs": 1126,
+          "jailNftUs": 21755,
+          "jailedUs": 29135,
+          "jailerSpawnedUs": 4003,
+          "preparedUs": 3579,
+          "readyUs": 230809,
+          "vmmBuiltUs": 43149
+        },
+        "image": "fpac-spike-tiny:7360c51d2043",
+        "image_digest": "sha256:9a04739019831f07bc2c526e23992bf54374f83585b2665dfb24cf6a0c8a3ff9",
+        "name": "krun",
+        "resources": {
+          "cpuMilli": 2000,
+          "diskMb": 20000,
+          "memoryMib": 6144,
+          "vcpus": 2
+        },
+        "what": "this box's sandcastle engine: a libkrun microVM per container, 2 vCPU, 6 GiB, 20 GB"
+      },
+      "root_fs": {
+        "bytes": 19637817344,
+        "free_bytes": 19620978688,
+        "type": "0x794c7630"
+      },
+      "scratch_fs": {
+        "bytes": 19637817344,
+        "free_bytes": 19620966400,
+        "type": "0x794c7630"
+      },
+      "steps": [
+        {
+          "detail": {
+            "made": false
+          },
+          "ms": 0.0027099999999999997,
+          "ok": true,
+          "step": "node /dev/fuse (char 10:229)"
+        },
+        {
+          "detail": {
+            "made": false
+          },
+          "ms": 0.00116,
+          "ok": true,
+          "step": "node /dev/loop-control (char 10:237)"
+        },
+        {
+          "detail": {
+            "bytes": 268435456,
+            "page_cache_dropped": true,
+            "read_mbs": 1964.7,
+            "write_mbs": 87.7
+          },
+          "ms": 3245.062259,
+          "ok": true,
+          "step": "sniff: the container's own disk"
+        },
+        {
+          "detail": {
+            "bytes": 2147483648
+          },
+          "ms": 0.02708,
+          "ok": true,
+          "step": "backing: a sparse local file (the stand-in for the store)"
+        },
+        {
+          "detail": {
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "threads": 4
+          },
+          "ms": 0.25565,
+          "ok": true,
+          "step": "fuse: mount one file over /dev/fuse"
+        },
+        {
+          "detail": {
+            "size": 2147483648
+          },
+          "ms": 0.02206,
+          "ok": true,
+          "step": "fuse: the file is there"
+        },
+        {
+          "detail": {
+            "device": "/dev/loop0",
+            "direct_io": true
+          },
+          "ms": 0.10179,
+          "ok": true,
+          "step": "loop: attach over the FUSE file, direct I/O, 4 KiB blocks"
+        },
+        {
+          "detail": {},
+          "ms": 1610.310154,
+          "ok": true,
+          "step": "ext4: mke2fs"
+        },
+        {
+          "detail": {},
+          "ms": 7.731204,
+          "ok": true,
+          "step": "ext4: mount (noatime, commit=1, discard)"
+        },
+        {
+          "detail": {
+            "type": "0xef53"
+          },
+          "ms": 0.026930000000000003,
+          "ok": true,
+          "step": "ext4: statfs reads ext4"
+        },
+        {
+          "detail": {
+            "bytes": 268435456,
+            "page_cache_dropped": true,
+            "read_mbs": 2956.1,
+            "write_mbs": 339.7
+          },
+          "ms": 924.561376,
+          "ok": true,
+          "step": "sniff: ext4 on the loop device on the FUSE file"
+        },
+        {
+          "detail": {},
+          "ms": 69.427614,
+          "ok": true,
+          "step": "ext4: a file survives an unmount and a mount"
+        },
+        {
+          "error": null,
+          "ms": 100.161109,
+          "ok": true,
+          "step": "ext4: unmount"
+        },
+        {
+          "error": null,
+          "ms": 16.383577,
+          "ok": true,
+          "step": "ext4: e2fsck -f -n through the loop device"
+        },
+        {
+          "error": null,
+          "ms": 0.16254,
+          "ok": true,
+          "step": "loop: detach"
+        },
+        {
+          "error": null,
+          "ms": 0.50871,
+          "ok": true,
+          "step": "fuse: unmount"
+        }
+      ]
+    }
+  }
+}
