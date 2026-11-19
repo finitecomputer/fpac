@@ -546,7 +546,15 @@ internet (several per step).
   made those files rather than read them, so its pack holds the fill's
   newest extents. From the second wake on the pack holds what the boot
   read.
-- **After an hour asleep:** below (the run follows the others).
+- **After an hour asleep** (`cloudflare-10gb-after-an-hour`, 3,600 s
+  with no container): the 10 GB disk's wake took what it took right away.
+  The run sleeps before the disk's first wake, so the like-for-like
+  compare is with the first wake of `cloudflare-10gb`: opened 941 ms
+  against 1,006, mounted 2,064 ms against 2,182, 75 misses on the boot's
+  path against 70 (the first-wake effect below), the driver's wake to
+  files read 12.7 s against 13.4 s. The two wakes right after it: mounted
+  in 855–985 ms, no miss. Today's restore takes 138–145 s after an hour
+  at 5–10 GB. An hour asleep before a disk's *second* wake was not run.
 - **Sleeps** after a wake: 2.1–3.0 s on Cloudflare (the pack, the
   checkpoint and the head are three puts of 0.3 to 1 s each), 0.2–0.7 s
   on krun. After a fill, the first sleep ships what the fill wrote
@@ -683,3 +691,22 @@ replays one seed).
 6. **A new disk's first life records its mount's reads** (extents it
    wrote and then read), so its first wake has a pack of the boot's
    path rather than of the newest writes.
+
+#### Acceptance 9: nothing else moved
+
+The account's Workers, R2 buckets and container applications were
+listed before the spike's first deploy, after P5, after `reset`, and
+after the last deploy (`fpac-bench inventory`; the lists stay on the
+driver's machine, outside this repository, since they name the
+account's other resources).
+
+| | Workers | Buckets | Container applications |
+| -- | -- | -- | -- |
+| Before the first deploy | 3, none the spike's | 3, none the spike's | 2, none the spike's |
+| After P5 | the same 3, and the spike's 1 | the same 3, and the spike's 3 (two of them a second location and a fresh bucket for the wrong-bytes hunt) | the same 2, and the spike's 1 |
+| After `reset` | **identical to before** | **identical to before** | **identical to before** |
+
+`reset` deleted the spike's objects (916 left by stopped runs; every
+finished run had deleted its own), its Worker, its container
+application, its 15 registry images and its three buckets. The Worker
+was then deployed again, to stay (the brief's ask), with an empty bucket.
