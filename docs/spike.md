@@ -709,4 +709,17 @@ account's other resources).
 `reset` deleted the spike's objects (916 left by stopped runs; every
 finished run had deleted its own), its Worker, its container
 application, its 15 registry images and its three buckets. The Worker
-was then deployed again, to stay (the brief's ask), with an empty bucket.
+was then deployed again, to stay (the brief's ask), with an empty bucket:
+after it the lists are the ones before and the spike's Worker, bucket
+and container application, and a probe ran in a fresh container.
+
+**Deploying again right after `reset` failed twice,** each time leaving
+the Worker deployed without its container application: the registry
+took the image's push and then answered "no such manifest" for that
+digest, and the API answered 404 for the version just uploaded.
+Thirteen minutes after the first try the same `wrangler deploy` went
+through. Each deploy's
+image now carries its own label, so it is never a manifest `reset` just
+deleted (`8ae951a`); whether that alone avoids the lag is not shown. A
+platform that deletes and makes a Worker's container image in quick
+succession should expect the same.
