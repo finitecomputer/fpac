@@ -4,7 +4,7 @@
 //! deployed stand-in Worker from inside a guest (`fpac-probe
 //! conformance`), so both are held to one list.
 
-use fpac_remote::{sha256, Put, Remote, RemoteError};
+use fpac_remote::{sha256, CheckpointRef, Head, HeadAnswer, Put, Remote, RemoteError};
 
 pub struct Case {
     pub name: &'static str,
@@ -38,7 +38,7 @@ pub fn run(remote: &mut Remote, tag: &str) -> Vec<Case> {
         Ok(o) => o.epoch,
         Err(_) => 0,
     };
-    out.push(case("open names the disk and this life's epoch", open.as_ref().is_ok_and(|o| !o.disk.is_empty() && o.epoch > 0), format!("{open:?}")));
+    out.push(case("open names the disk, this life's epoch, the volume and the head", open.as_ref().is_ok_and(|o| !o.disk.is_empty() && o.epoch > 0 && o.volume_bytes > 0), format!("{open:?}")));
     if epoch == 0 {
         return out;
     }
@@ -72,5 +72,22 @@ pub fn run(remote: &mut Remote, tag: &str) -> Vec<Case> {
     let mut empty = Vec::new();
     let g = remote.get(&format!("e{epoch}/{tag}-empty"), &mut |b| empty.extend_from_slice(b));
     out.push(case("an empty object round-trips", matches!(r, Ok(Put::Created)) && matches!(g, Ok(Some(0))), format!("{r:?} {g:?}")));
+    // The head's rules, on a disk this suite owns (a new one, or one whose
+    // head is older than this life).
+    let base = open.as_ref().ok().and_then(|o| o.head);
+    let mine = Head { epoch, checkpoint: base.and_then(|h| h.checkpoint) };
+    let r = remote.post_head(&mine);
+    out.push(case("this life's head is taken", matches!(r, Ok(HeadAnswer::Taken)), format!("{r:?}")));
+    let r = remote.post_head(&mine);
+    out.push(case("the same head again is the same (a lost answer, replayed)", matches!(r, Ok(HeadAnswer::Same)), format!("{r:?}")));
+    let later = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(tag.as_bytes()) }) };
+    let r = remote.post_head(&later);
+    out.push(case("a later checkpoint of this life is taken", matches!(r, Ok(HeadAnswer::Taken)), format!("{r:?}")));
+    let conflicting = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(b"another body") }) };
+    let r = remote.post_head(&conflicting);
+    out.push(case("the same checkpoint with another body is refused", matches!(r, Err(RemoteError::Refused { status: 409, .. })), format!("{r:?}")));
+    let other = Head { epoch: epoch + 1, checkpoint: None };
+    let r = remote.post_head(&other);
+    out.push(case("a head from a life that isn't running is refused", matches!(r, Err(RemoteError::Refused { status: 409, .. })), format!("{r:?}")));
     out
 }

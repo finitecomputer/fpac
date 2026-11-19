@@ -7,12 +7,15 @@
 //! fpac-probe ranges [--count <n>] [--diagnose]
 //! fpac-probe remotecheck --count <n> --threads <t> --whole-every <k> [--out <file>]
 //! fpac-probe rangecheck --mode stream|tee|buffer --pattern aligned|unaligned --count <n> --threads <t> --size-max <bytes> [--out <file>] [--host <h>] [--port <p>] [--tag <t>]
+//! fpac-probe fsbench --dir <dir>
 //! fpac-probe idle
 //!
 //! `--check-only` reads what the place offers and changes nothing: no
 //! node made, nothing mounted, no loop device attached. It is the only
 //! mode run in a container that shares this box's kernel.
 
+#[cfg(target_os = "linux")]
+mod fsbench;
 mod path;
 #[cfg(target_os = "linux")]
 mod probe;
@@ -53,6 +56,8 @@ fn main() {
         Some("probe") => probe::run(args.iter().any(|a| a == "--check-only"), &arg(&args, "--dir").unwrap_or_else(|| "/var/tmp/fpac-probe".into())),
         Some("path") => path::run(&host, port, &tag),
         Some("rangecheck") => path::rangecheck(&host, port, &tag, &args),
+        #[cfg(target_os = "linux")]
+        Some("fsbench") => fsbench::run(&arg(&args, "--dir").unwrap_or_else(|| "/data".into())),
         Some("remotecheck") => path::remotecheck(&host, port, &tag, &args),
         Some("ranges") => path::ranges(&host, port, &tag, arg(&args, "--count").and_then(|c| c.parse().ok()).unwrap_or(1000).min(100_000), args.iter().any(|a| a == "--diagnose")),
         Some("conformance") => {

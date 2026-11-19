@@ -52,6 +52,10 @@ pub enum StoreError {
     Corrupt(String),
     #[error("the cache file: {0}")]
     Cache(#[from] std::io::Error),
+    /// DIRTY_EXTENTS_MAX are written and not yet cut: the write waits for
+    /// the next cut (an operating error, retried).
+    #[error("{0} extents wait to be cut: the write waits")]
+    Full(u32),
     /// The remote refused a call it should take (a bug or a fence).
     #[error("refused: {0}")]
     Refused(String),
@@ -88,6 +92,32 @@ pub enum Kind {
     Page,
     Checkpoint(CheckpointRef),
     Pack(PackRef),
+}
+
+/// What a read needs: nothing more, or a fetch the caller makes.
+#[derive(Debug)]
+pub enum Read {
+    Done,
+    Fetch(Fetch),
+}
+
+/// One ranged get of a segment: the extent asked for and the read-ahead
+/// after it.
+#[derive(Debug, Clone)]
+pub struct Fetch {
+    pub name: String,
+    pub offset: u64,
+    pub len: usize,
+    extent: u64,
+    run: Vec<(u64, Loc)>,
+}
+
+impl Fetch {
+    /// The same fetch for the extent asked for alone.
+    pub fn single(&self) -> Fetch {
+        let first = self.run[0];
+        Fetch { name: self.name.clone(), offset: self.offset, len: EXTENT_BYTES as usize, extent: self.extent, run: vec![first] }
+    }
 }
 
 /// An extent's state in the cache file.
@@ -127,6 +157,8 @@ pub struct Store {
     /// Every segment the map may name, with its header's seal.
     segments: BTreeMap<SegId, Sum>,
     local: BTreeMap<u64, Local>,
+    /// How many of `local` are Dirty (kept with every change of state).
+    dirty: u32,
     /// What this life's next segment follows.
     chain_end: Link,
     /// What the map reflects: the last segment applied.
@@ -153,8 +185,6 @@ fn page_of(extent: u64) -> u32 {
     u32::try_from(extent / PAGE_EXTENTS as u64).expect("bounded by the volume")
 }
 
-/// How many extents a segment of a cut takes at most: the target size.
-const SEGMENT_EXTENTS_TARGET: usize = (SEGMENT_BYTES_TARGET / EXTENT_BYTES as u64) as usize;
 
 impl Store {
     /// Opens a life (docs/design.md, The wake): the head's checkpoint, then
@@ -170,6 +200,7 @@ impl Store {
             map: BTreeMap::new(),
             segments: BTreeMap::new(),
             local: BTreeMap::new(),
+            dirty: 0,
             chain_end: GENESIS,
             applied_end: GENESIS,
             next_seq: 1,
@@ -310,7 +341,23 @@ impl Store {
     }
 
     pub fn dirty_extents(&self) -> usize {
-        self.local.values().filter(|l| **l == Local::Dirty).count()
+        debug_assert_eq!(self.dirty as usize, self.local.values().filter(|l| **l == Local::Dirty).count());
+        self.dirty as usize
+    }
+
+    /// Changes an extent's local state, keeping the dirty count.
+    fn set_local(&mut self, extent: u64, to: Option<Local>) {
+        let was = match to {
+            Some(l) => self.local.insert(extent, l),
+            None => self.local.remove(&extent),
+        };
+        if was == Some(Local::Dirty) {
+            self.dirty -= 1;
+        }
+        if to == Some(Local::Dirty) {
+            self.dirty += 1;
+        }
+        assert!(self.dirty <= DIRTY_EXTENTS_MAX, "a write past the dirty limit was let in");
     }
 
     pub fn shipping(&self) -> usize {
@@ -354,50 +401,80 @@ impl Store {
         }
     }
 
-    /// Reads extent `extent` into `buf` (one extent long). From the cache
-    /// when it holds it, else from the store, with read-ahead.
+    /// Reads extent `extent` into `buf` (one extent long): from the cache
+    /// when it holds it, else from the store, with read-ahead, each extent
+    /// checked, a wrong one fetched again (FETCH_TRIES_MAX tries in all).
+    /// This composes `read_local`, the remote's ranged get and `install`,
+    /// which a caller that must not hold its lock across the network calls
+    /// apart.
     pub fn read(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, extent: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        match self.read_local(cache, extent, buf)? {
+            Read::Done => Ok(()),
+            Read::Fetch(f) => self.fetch(remote, cache, f, buf),
+        }
+    }
+
+    fn fetch(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, f: Fetch, buf: &mut [u8]) -> Result<(), StoreError> {
+        let mut f = f;
+        let mut window = vec![0u8; f.len];
+        let mut last = String::new();
+        for _try in 0..FETCH_TRIES_MAX {
+            window.resize(f.len, 0);
+            match remote.get_range(&f.name, f.offset, &mut window) {
+                Ok(Some(n)) => {
+                    if self.install(cache, &f, &window[..n], buf)? {
+                        return Ok(());
+                    }
+                    last = format!("{} at {}: {n} bytes, the extent's checksum does not match", f.name, f.offset);
+                }
+                Ok(None) => return Err(StoreError::Corrupt(format!("{} is gone, and the map names it", f.name))),
+                Err(RemoteError::Unavailable(s)) => last = s,
+                Err(e) => return Err(from_remote(e)),
+            }
+            // the next try fetches only the extent asked for
+            f = f.single();
+        }
+        Err(StoreError::Corrupt(format!("extent {}, after {FETCH_TRIES_MAX} tries: {last}", f.extent)))
+    }
+
+    /// The local half of a read: answered from the cache (or as zeros),
+    /// or a fetch for the caller to make.
+    pub fn read_local(&mut self, cache: &mut dyn CacheGate, extent: u64, buf: &mut [u8]) -> Result<Read, StoreError> {
         assert_eq!(buf.len(), EXTENT_BYTES as usize);
         assert!(extent < self.extents());
         self.note(extent);
         match self.local.get(&extent).copied() {
             Some(Local::Dirty) | Some(Local::Shipping(_)) => {
                 cache.read(extent, buf)?;
-                return Ok(());
+                return Ok(Read::Done);
             }
             Some(Local::Clean) => {
                 cache.read(extent, buf)?;
-                let loc = self.map.get(&extent).copied();
-                let right = match loc {
+                let right = match self.map.get(&extent) {
                     Some(l) if !l.is_zero() => format::sum64(buf) == l.sum,
                     _ => buf.iter().all(|&b| b == 0),
                 };
                 if right {
-                    return Ok(());
+                    return Ok(Read::Done);
                 }
                 // A cache that lies: dropped, and fetched again.
-                self.local.remove(&extent);
+                self.set_local(extent, None);
             }
             None => {}
         }
         match self.map.get(&extent).copied() {
-            None => {
+            Some(l) if !l.is_zero() => Ok(Read::Fetch(self.plan(extent, l))),
+            _ => {
                 buf.fill(0);
-                Ok(())
+                Ok(Read::Done)
             }
-            Some(l) if l.is_zero() => {
-                buf.fill(0);
-                Ok(())
-            }
-            Some(l) => self.fetch(remote, cache, extent, l, buf),
         }
     }
 
-    /// Fetches `extent` and the extents after it in the same segment, up
-    /// to READ_AHEAD_EXTENTS, that the cache does not hold: one ranged get.
-    /// Each image is checked against its sum64; the one asked for is
-    /// fetched again on a mismatch, FETCH_TRIES_MAX times in all.
-    fn fetch(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, extent: u64, loc: Loc, buf: &mut [u8]) -> Result<(), StoreError> {
+    /// A fetch of `extent` and the extents after it in the same segment,
+    /// up to READ_AHEAD_EXTENTS, that the cache does not hold: one ranged
+    /// get.
+    fn plan(&self, extent: u64, loc: Loc) -> Fetch {
         let mut run = vec![(extent, loc)];
         // Bounded: READ_AHEAD_EXTENTS.
         while run.len() < READ_AHEAD_EXTENTS as usize {
@@ -411,64 +488,87 @@ impl Store {
                 _ => break,
             }
         }
-        let name = format::segment_name(loc.seg);
+        Fetch { name: format::segment_name(loc.seg), offset: u64::from(loc.offset), len: run.len() * EXTENT_BYTES as usize, extent, run }
+    }
+
+    /// Installs what a fetch brought (`window`, possibly short): each
+    /// extent whose bytes match its sum64, and that the map still places
+    /// there and the cache does not hold by now, goes to the cache as
+    /// clean. Answers whether the extent asked for is in `buf`; false when
+    /// its bytes were wrong (the caller fetches it again).
+    pub fn install(&mut self, cache: &mut dyn CacheGate, f: &Fetch, window: &[u8], buf: &mut [u8]) -> Result<bool, StoreError> {
         let ext = EXTENT_BYTES as usize;
-        let mut window = vec![0u8; run.len() * ext];
-        let mut last_error = String::new();
-        for _try in 0..FETCH_TRIES_MAX {
-            let got = match remote.get_range(&name, u64::from(loc.offset), &mut window) {
-                Ok(Some(n)) => n,
-                Ok(None) => return Err(StoreError::Corrupt(format!("{name} is gone, and the map names it"))),
-                Err(RemoteError::Unavailable(s)) => {
-                    last_error = s;
-                    continue;
-                }
-                Err(e) => return Err(from_remote(e)),
-            };
-            let whole_extents = got / ext;
-            let first = &window[..ext.min(got)];
-            if whole_extents >= 1 && format::sum64(first) == loc.sum {
-                buf.copy_from_slice(first);
-                cache.write(extent, first)?;
-                self.local.insert(extent, Local::Clean);
-                // the read-ahead's extents that check out; any other is
-                // simply not installed, and is a miss of its own later
-                for (i, (e, l)) in run.iter().enumerate().skip(1).take(whole_extents.saturating_sub(1)) {
-                    let image = &window[i * ext..(i + 1) * ext];
-                    if format::sum64(image) == l.sum {
-                        cache.write(*e, image)?;
-                        self.local.insert(*e, Local::Clean);
-                    }
-                }
-                return Ok(());
+        let mut asked = false;
+        for (i, (e, l)) in f.run.iter().enumerate() {
+            let Some(image) = window.get(i * ext..(i + 1) * ext) else { break };
+            let placed = self.map.get(e) == Some(l);
+            let held = self.local.contains_key(e);
+            if *e == f.extent && held {
+                // written or fetched meanwhile: the cache is its truth now
+                cache.read(*e, buf)?;
+                asked = true;
+                continue;
             }
-            last_error = format!("{name} at {}: {got} bytes, the extent's checksum does not match", loc.offset);
-            // fetch only the extent asked for on the next try
-            run.truncate(1);
-            window.truncate(ext);
+            if placed && !held && format::sum64(image) == l.sum {
+                cache.write(*e, image)?;
+                self.set_local(*e, Some(Local::Clean));
+                if *e == f.extent {
+                    buf.copy_from_slice(image);
+                    asked = true;
+                }
+            }
         }
-        Err(StoreError::Corrupt(format!("extent {extent}, after {FETCH_TRIES_MAX} tries: {last_error}")))
+        if !asked && self.map.get(&f.extent) != f.run.first().map(|(_, l)| l) {
+            // the map moved meanwhile (a landed cut): read it anew
+            return Err(StoreError::Unavailable("the extent moved while it was fetched; read again".into()));
+        }
+        Ok(asked)
     }
 
     /// Writes `data` at `offset` within extent `extent`. A partial write
     /// to an extent the cache does not hold reads it first.
     pub fn write(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
+        // Bounded: a write needs at most one fetch, then lands.
+        for _ in 0..2 {
+            match self.write_local(cache, extent, offset, data)? {
+                None => return Ok(()),
+                Some(f) => {
+                    let mut buf = vec![0u8; EXTENT_BYTES as usize];
+                    self.fetch(remote, cache, f, &mut buf)?;
+                }
+            }
+        }
+        unreachable!("a fetched extent is held by the cache")
+    }
+
+    /// The local half of a write: done, or the fetch it needs first (a
+    /// partial write to an extent the cache does not hold); after that
+    /// fetch is installed, call it again.
+    pub fn write_local(&mut self, cache: &mut dyn CacheGate, extent: u64, offset: u32, data: &[u8]) -> Result<Option<Fetch>, StoreError> {
         assert!(extent < self.extents());
         assert!(offset as usize + data.len() <= EXTENT_BYTES as usize && !data.is_empty());
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
+        }
+        let was = self.local.get(&extent).copied();
+        if was != Some(Local::Dirty) && self.dirty >= DIRTY_EXTENTS_MAX {
+            return Err(StoreError::Full(self.dirty));
         }
         let whole_extent = offset == 0 && data.len() == EXTENT_BYTES as usize;
         if whole_extent {
             cache.write(extent, data)?;
         } else {
             let mut buf = vec![0u8; EXTENT_BYTES as usize];
-            self.read(remote, cache, extent, &mut buf)?;
+            match (was, self.map.get(&extent).copied()) {
+                (Some(_), _) => cache.read(extent, &mut buf)?,
+                (None, Some(l)) if !l.is_zero() => return Ok(Some(self.plan(extent, l))),
+                (None, _) => {}
+            }
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
             cache.write(extent, &buf)?;
         }
-        self.local.insert(extent, Local::Dirty);
-        Ok(())
+        self.set_local(extent, Some(Local::Dirty));
+        Ok(None)
     }
 
     /// The extent reads as zeros from now on (a discard).
@@ -477,30 +577,34 @@ impl Store {
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
         }
+        if self.local.get(&extent) != Some(&Local::Dirty) && self.dirty >= DIRTY_EXTENTS_MAX {
+            return Err(StoreError::Full(self.dirty));
+        }
         cache.punch(extent)?;
-        self.local.insert(extent, Local::Dirty);
+        self.set_local(extent, Some(Local::Dirty));
         Ok(())
     }
 
-    /// Cuts what changed into segments at this instant (docs/design.md,
-    /// The cut): one cut, as many segments as it needs (at most
-    /// CUT_SEGMENTS_MAX; the rest waits for the next cut), the last one
-    /// marked. Answers them in order, for the caller to put, several at
-    /// once.
+    /// Cuts everything written since the last cut into segments at this
+    /// instant (docs/design.md, The cut): one cut, as many segments as it
+    /// needs (at most CUT_SEGMENTS_MAX), the last one marked. Answers them
+    /// in order, for the caller to put, several at once.
     pub fn cut(&mut self, cache: &mut dyn CacheGate) -> Result<Vec<Outgoing>, StoreError> {
         assert!(self.head_posted, "a life ships only after its head is posted");
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
         }
-        let dirty: Vec<u64> = self.local.iter().filter(|(_, l)| **l == Local::Dirty).map(|(e, _)| *e).take(SEGMENT_EXTENTS_TARGET * CUT_SEGMENTS_MAX as usize).collect();
+        let dirty: Vec<u64> = self.local.iter().filter(|(_, l)| **l == Local::Dirty).map(|(e, _)| *e).collect();
+        assert!(dirty.len() <= DIRTY_EXTENTS_MAX as usize && dirty.len() == self.dirty as usize);
         if dirty.is_empty() {
             return Ok(Vec::new());
         }
         let cut = self.next_cut;
         self.next_cut += 1;
-        let groups: Vec<&[u64]> = dirty.chunks(SEGMENT_EXTENTS_TARGET).collect();
+        let groups: Vec<&[u64]> = dirty.chunks(SEGMENT_EXTENTS_TARGET as usize).collect();
+        assert!(groups.len() <= CUT_SEGMENTS_MAX as usize);
         let mut out = Vec::with_capacity(groups.len());
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(SEGMENT_EXTENTS_TARGET);
+        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(SEGMENT_EXTENTS_TARGET as usize);
         for (gi, g) in groups.iter().enumerate() {
             bytes.clear();
             for e in g.iter() {
@@ -516,7 +620,7 @@ impl Store {
             let link = h.link();
             let entries = h.entries.iter().map(|en| (en.extent, Loc { seg: id, offset: en.offset, len: en.len, sum: en.sum })).collect();
             for e in g.iter() {
-                self.local.insert(*e, Local::Shipping(id.seq));
+                self.set_local(*e, Some(Local::Shipping(id.seq)));
             }
             self.shipping.insert(id.seq, Shipment { base: self.chain_end, link, last_of_cut: gi + 1 == groups.len(), entries, landed: false });
             self.chain_end = link;
@@ -558,7 +662,7 @@ impl Store {
                     self.map.insert(*e, *loc);
                     self.pages_dirty.insert(page_of(*e));
                     if self.local.get(e) == Some(&Local::Shipping(q)) {
-                        self.local.insert(*e, Local::Clean);
+                        self.set_local(*e, Some(Local::Clean));
                     }
                 }
                 self.segments.insert(SegId { epoch: self.epoch, seq: q }, s.link.sum);
@@ -694,7 +798,7 @@ impl Store {
             let wanted = self.map.get(&e).is_some_and(|l| !l.is_zero() && l.sum == sum) && !self.local.contains_key(&e);
             if wanted && format::sum64(image) == sum {
                 cache.write(e, image)?;
-                self.local.insert(e, Local::Clean);
+                self.set_local(e, Some(Local::Clean));
                 installed += 1;
             }
         }

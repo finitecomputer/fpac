@@ -33,6 +33,8 @@ const READY_MS_MAX = 120 * 1000;
 // A delete pass lists at most this many pages of 1,000 keys.
 const LIST_PAGES_MAX = 200;
 const INSTANCE = { vcpu: 2, memoryMib: 6144, diskMb: 20000 };
+// A disk's size when the driver names none: 20 GB, as a computer's.
+const VOLUME_BYTES_DEFAULT = 20000 * 1024 * 1024 - ((20000 * 1024 * 1024) % 65536);
 const NULL_BYTES_MAX = 1024 * 1024;
 const REPRO_KEY = /^repro\/[a-z0-9.-]{1,64}$/;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -104,10 +106,21 @@ async function signed(request, url, digest, env) {
 // epoch in props. Objects live at `disks/<disk>/<name>`.
 export class FpacRemote extends WorkerEntrypoint {
   async fetch(request) {
-    const { disk, epoch } = this.ctx.props;
+    const { disk, epoch, volume, head } = this.ctx.props;
     const url = new URL(request.url);
+    // The head the Durable Object read at the start: no storage read here.
     if (request.method === "GET" && url.pathname === "/open") {
-      return text(200, "", { "x-fpac-disk": disk, "x-fpac-epoch": String(epoch) });
+      return text(200, "", { "x-fpac-disk": disk, "x-fpac-epoch": String(epoch), "x-fpac-volume-bytes": String(volume), "x-fpac-head": head || "none" });
+    }
+    // A head is the one call that reaches the Durable Object, which moves
+    // it only by the head's rules (crates/store/src/head.rs).
+    if (request.method === "POST" && url.pathname === "/head") {
+      const line = (await request.text()).slice(0, 200);
+      const stub = this.env.SPIKE.get(this.env.SPIKE.idFromName("spike"));
+      const r = await stub.fetch("https://spike/head", { method: "POST", body: JSON.stringify({ disk, epoch, line }) });
+      const a = await r.json();
+      if (a.answer) return text(200, "", { "x-fpac-head-answer": a.answer });
+      return text(a.status || 409, `${a.refused || a.error}\n`);
     }
     // The stand-in's own diagnostic, outside the contract: the intercept's
     // round trip with no store behind it, and where the handler ran.
@@ -241,6 +254,7 @@ export class FpacSpike extends DurableObject {
     try {
       const route = `${request.method} ${url.pathname}`;
       if (route === "POST /start") return json({ ...(await this.start(await request.json())), driver_colo: request.headers.get("x-driver-colo") });
+      if (route === "POST /head") return json(await this.head(await request.json()));
       if (route === "POST /exec") return json(await this.exec(await request.json()));
       if (route === "POST /destroy") return json(await this.destroy());
       if (route === "GET /state") return json({ version: this.env.VERSION.id, running: this.ctx.container.running, images: Object.keys(this.ctx.container.images || {}) });
@@ -258,14 +272,37 @@ export class FpacSpike extends DurableObject {
   // Starts the container from the named image, its intercept registered
   // first where the runtime allows it (so the guest's first call never
   // races it), and waits until it takes an exec.
-  async start({ disk, image, epoch }) {
+  // The head's rules (crates/store/src/head.rs, `decide`), for the disk
+  // whose container is running: only the running life moves it, and
+  // within a life only forward.
+  async head({ disk, epoch, line }) {
+    const running = await this.ctx.storage.get("running");
+    if (!running || running.disk !== disk || running.epoch !== epoch) return { refused: "only the running life posts a head", status: 409 };
+    const p = parseHead(line);
+    if (!p) return { refused: "a malformed head", status: 400 };
+    const curLine = await this.ctx.storage.get(`head:${disk}`);
+    const cur = curLine ? parseHead(curLine) : null;
+    const d = decide(cur, epoch, p);
+    if (d === "take") {
+      await this.ctx.storage.put(`head:${disk}`, line);
+      return { answer: "taken" };
+    }
+    if (d === "same") return { answer: "same" };
+    return { refused: d, status: 409 };
+  }
+
+  async start({ disk, image, epoch, volume }) {
     const c = this.ctx.container;
     if (c.running) throw new Error("a container is running: one at a time");
     if (!/^[a-z0-9-]{1,40}$/.test(disk)) throw new Error("a disk's name: a-z, 0-9 and -");
     if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error("an epoch is a positive integer");
     const ref = c.images && c.images[image];
     if (!ref) throw new Error(`no image named ${image}`);
-    const egress = this.ctx.exports.FpacRemote({ props: { disk, epoch } });
+    const volumeBytes = volume || VOLUME_BYTES_DEFAULT;
+    const head = (await this.ctx.storage.get(`head:${disk}`)) || null;
+    if (head && parseHead(head).epoch >= epoch) throw new Error("a life's epoch is later than its disk's head");
+    await this.ctx.storage.put("running", { disk, epoch });
+    const egress = this.ctx.exports.FpacRemote({ props: { disk, epoch, volume: volumeBytes, head } });
     const t0 = Date.now();
     let intercept = "before the start";
     try {
@@ -373,6 +410,35 @@ export class FpacSpike extends DurableObject {
     }
     throw new Error(`more than ${LIST_PAGES_MAX} pages under ${prefix}`);
   }
+}
+
+// A head's line: "<epoch> <checkpoint epoch> <checkpoint seq> <sha256>",
+// or "<epoch> - - -" (crates/remote/src/lib.rs, Head).
+function parseHead(line) {
+  const p = String(line).split(" ");
+  if (p.length !== 4 || !/^[1-9][0-9]{0,19}$/.test(p[0])) return null;
+  const epoch = Number(p[0]);
+  if (p[1] === "-" && p[2] === "-" && p[3] === "-") return { epoch, ck: null };
+  if (!/^[1-9][0-9]{0,19}$/.test(p[1]) || !/^[1-9][0-9]{0,19}$/.test(p[2]) || !SHA256_HEX.test(p[3])) return null;
+  return { epoch, ck: { epoch: Number(p[1]), seq: Number(p[2]), sum: p[3] } };
+}
+
+const sameCk = (a, b) => a.epoch === b.epoch && a.seq === b.seq && a.sum === b.sum;
+
+// crates/store/src/head.rs, `decide`, line for line.
+function decide(cur, running, p) {
+  if (p.epoch !== running) return "only the running life posts a head";
+  if (p.ck && p.ck.epoch > p.epoch) return "a checkpoint from a later life";
+  if (!cur) return "take";
+  if (cur.epoch === p.epoch && ((cur.ck === null && p.ck === null) || (cur.ck && p.ck && sameCk(cur.ck, p.ck)))) return "same";
+  if (cur.epoch > p.epoch) return "an earlier life's head";
+  if (cur.epoch < p.epoch) return "take";
+  if (!p.ck) return "a life's head loses its checkpoint";
+  if (!cur.ck) return p.ck.epoch === p.epoch ? "take" : "a life's head goes back to another life's checkpoint";
+  if (p.ck.epoch !== p.epoch && !sameCk(p.ck, cur.ck)) return "a life's head goes back to another life's checkpoint";
+  if (p.ck.epoch === cur.ck.epoch && p.ck.seq === cur.ck.seq) return "the same checkpoint with another body";
+  if (p.ck.epoch === cur.ck.epoch && p.ck.seq < cur.ck.seq) return "a checkpoint older than the head's";
+  return "take";
 }
 
 async function readAll(stream) {

@@ -3,25 +3,7 @@
 //! it, as typed columns, and moves it only by these rules, which are pure
 //! so the platform's route and this crate's tests share them.
 
-use fpac_format::Sum;
-
-/// A checkpoint by its name's parts and its object's SHA-256.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointRef {
-    pub epoch: u64,
-    pub seq: u64,
-    pub sum: Sum,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Head {
-    /// The life whose segments follow the checkpoint. A life posts its
-    /// head before it ships anything, so a life that never posted one
-    /// shipped nothing, and an open replays one life's segments only.
-    pub epoch: u64,
-    /// None: a new disk, with nothing before this life's segments.
-    pub checkpoint: Option<CheckpointRef>,
-}
+pub use fpac_remote::{CheckpointRef, Head};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {

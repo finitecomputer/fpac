@@ -17,9 +17,16 @@ pub const SEGMENT_BYTES_TARGET: u64 = 8 << 20;
 pub const SEGMENT_BYTES_MAX: u64 = 64 << 20;
 /// Extents in one segment.
 pub const SEGMENT_EXTENTS_MAX: u32 = (SEGMENT_BYTES_MAX / EXTENT_BYTES as u64) as u32 - 1;
-/// Segments one cut may need: a cut bigger than this waits for the next
-/// flush (the dirty limits slow writes first).
-pub const CUT_SEGMENTS_MAX: u32 = 16;
+/// Extents a segment of a cut takes at most: the target size.
+pub const SEGMENT_EXTENTS_TARGET: u32 = (SEGMENT_BYTES_TARGET / EXTENT_BYTES as u64) as u32;
+/// What may be written and not yet cut, at most. A cut takes every dirty
+/// extent at one instant (a subset would reorder writes across the
+/// flushes ext4 orders its journal by), copying them under the store's
+/// lock; past this, writes wait for the next cut.
+pub const DIRTY_BYTES_MAX: u64 = 256 << 20;
+pub const DIRTY_EXTENTS_MAX: u32 = (DIRTY_BYTES_MAX / EXTENT_BYTES as u64) as u32;
+/// Segments one cut may need.
+pub const CUT_SEGMENTS_MAX: u32 = DIRTY_EXTENTS_MAX.div_ceil(SEGMENT_EXTENTS_TARGET);
 
 /// A map page covers this many extents (256 MiB of the disk), so a
 /// checkpoint rewrites only the pages whose extents changed.
@@ -61,6 +68,8 @@ pub const SEGMENT_ENTRY_BYTES: u32 = 24;
 pub const CHECKPOINT_BYTES_MAX: u64 = 128 + PAGES_MAX as u64 * 56 + LIVE_SEGMENTS_MAX as u64 * 48 + 32;
 
 const _: () = assert!(SEGMENT_BYTES_TARGET <= SEGMENT_BYTES_MAX);
+const _: () = assert!(SEGMENT_EXTENTS_TARGET <= SEGMENT_EXTENTS_MAX);
+const _: () = assert!(CUT_SEGMENTS_MAX * SEGMENT_EXTENTS_TARGET >= DIRTY_EXTENTS_MAX);
 const _: () = assert!((SEGMENT_HEADER_BYTES_MAX as u64) + SEGMENT_EXTENTS_MAX as u64 * EXTENT_BYTES as u64 <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_BYTES_MAX < 100 << 20, "the intercept's body limit");
 const _: () = assert!(PACK_BYTES_MAX < 100 << 20, "the intercept's body limit");

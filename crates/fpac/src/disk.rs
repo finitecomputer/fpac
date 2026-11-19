@@ -1,0 +1,296 @@
+//! The disk as the daemon's threads share it: the store and the cache
+//! file under one lock, a pool of connections to the remote, and the
+//! FUSE file's backing. The lock is never held across the network: a read
+//! that misses plans its fetch under the lock, fetches without it, and
+//! installs under it again (docs/design.md, The face).
+
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
+
+use fpac_device::serve::{Backing, BackingError};
+use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX};
+use fpac_remote::Remote;
+use fpac_store::{CacheGate, Fetch, Read, Store, StoreError};
+
+/// Connections kept to the remote, at most: the FUSE threads' and the
+/// flusher's.
+pub const CONNECTIONS_MAX: usize = 32;
+/// How long a write waits for a cut when too much is unsent, per wait;
+/// it waits again until the flusher cuts.
+const FULL_WAIT_MS: u64 = 200;
+/// Tries of one read or write, past which it fails (EIO): a fetch that
+/// moved under it, or a remote that stays down.
+const OP_TRIES_MAX: u32 = 8;
+
+/// The cache file: one sparse file of the volume's size on the container's
+/// own disk, an extent at `extent * EXTENT_BYTES`.
+pub struct FileCache {
+    file: File,
+}
+
+impl FileCache {
+    pub fn create(path: &Path, volume_bytes: u64) -> std::io::Result<FileCache> {
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).custom_flags(libc::O_CLOEXEC).open(path)?;
+        file.set_len(volume_bytes)?;
+        Ok(FileCache { file })
+    }
+}
+
+impl CacheGate for FileCache {
+    fn read(&mut self, extent: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.file.read_exact_at(buf, extent * EXTENT_BYTES as u64)
+    }
+    fn write(&mut self, extent: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.file.write_all_at(bytes, extent * EXTENT_BYTES as u64)
+    }
+    fn punch(&mut self, extent: u64) -> std::io::Result<()> {
+        let (o, l) = (i64::try_from(extent * EXTENT_BYTES as u64).expect("bounded"), i64::from(EXTENT_BYTES));
+        // SAFETY: a plain syscall on a file we own.
+        let r = unsafe { libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, o, l) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+pub struct Inner {
+    pub store: Store,
+    pub cache: FileCache,
+}
+
+/// Counters for `fpac status`.
+#[derive(Default)]
+pub struct Stats {
+    pub misses: AtomicU64,
+    pub fetch_retries: AtomicU64,
+    pub read_errors: AtomicU64,
+    pub full_waits: AtomicU64,
+}
+
+pub struct Disk {
+    pub inner: Mutex<Inner>,
+    /// Signaled after every cut, for writes waiting on a full store.
+    pub cut: Condvar,
+    pool: Mutex<Vec<Remote>>,
+    host: String,
+    port: u16,
+    pub stats: Stats,
+    pub fenced: AtomicBool,
+}
+
+impl Disk {
+    pub fn new(store: Store, cache: FileCache, host: &str, port: u16) -> Disk {
+        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false) }
+    }
+
+    /// A connection from the pool, or a new one.
+    pub fn remote(&self) -> Remote {
+        self.pool.lock().unwrap().pop().unwrap_or_else(|| Remote::new(&self.host, self.port))
+    }
+
+    pub fn give_back(&self, r: Remote) {
+        let mut p = self.pool.lock().unwrap();
+        if p.len() < CONNECTIONS_MAX {
+            p.push(r);
+        }
+    }
+
+    /// One ranged get for a fetch, without the lock.
+    fn get(&self, f: &Fetch) -> Result<Vec<u8>, StoreError> {
+        let mut r = self.remote();
+        let mut window = vec![0u8; f.len];
+        let got = r.get_range(&f.name, f.offset, &mut window);
+        self.give_back(r);
+        match got {
+            Ok(Some(n)) => {
+                window.truncate(n);
+                Ok(window)
+            }
+            Ok(None) => Err(StoreError::Corrupt(format!("{} is gone, and the map names it", f.name))),
+            Err(e) => Err(StoreError::Unavailable(e.to_string())),
+        }
+    }
+
+    /// Fetches and installs until the extent asked for is in `buf`.
+    fn fetch(&self, f: Fetch, buf: &mut [u8]) -> Result<(), StoreError> {
+        let mut f = f;
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        let mut last = String::new();
+        for _ in 0..FETCH_TRIES_MAX {
+            match self.get(&f) {
+                Ok(window) => {
+                    let mut g = self.inner.lock().unwrap();
+                    let Inner { store, cache } = &mut *g;
+                    if store.install(cache, &f, &window, buf)? {
+                        return Ok(());
+                    }
+                    last = format!("{}: the extent's checksum does not match", f.name);
+                }
+                Err(StoreError::Unavailable(s)) => last = s,
+                Err(e) => return Err(e),
+            }
+            self.stats.fetch_retries.fetch_add(1, Ordering::Relaxed);
+            f = f.single();
+        }
+        Err(StoreError::Corrupt(format!("after {FETCH_TRIES_MAX} tries: {last}")))
+    }
+
+    /// One whole extent into `buf`.
+    pub fn read_extent(&self, extent: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        let mut last = None;
+        for _ in 0..OP_TRIES_MAX {
+            let plan = {
+                let mut g = self.inner.lock().unwrap();
+                let Inner { store, cache } = &mut *g;
+                store.read_local(cache, extent, buf)?
+            };
+            match plan {
+                Read::Done => return Ok(()),
+                Read::Fetch(f) => match self.fetch(f, buf) {
+                    Ok(()) => return Ok(()),
+                    // the extent moved while it was fetched: plan again
+                    Err(e @ StoreError::Unavailable(_)) => last = Some(e),
+                    Err(e) => return Err(e),
+                },
+            }
+        }
+        Err(last.unwrap_or(StoreError::Unavailable("a read".into())))
+    }
+
+    /// `data` at `offset` within one extent.
+    pub fn write_extent(&self, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
+        // Bounded: a few fetches, and waits for cuts while the store is
+        // full (the flusher cuts at least once a second).
+        let mut fetches = 0;
+        loop {
+            let need = {
+                let mut g = self.inner.lock().unwrap();
+                loop {
+                    let Inner { store, cache } = &mut *g;
+                    match store.write_local(cache, extent, offset, data) {
+                        Err(StoreError::Full(_)) => {
+                            self.stats.full_waits.fetch_add(1, Ordering::Relaxed);
+                            g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0;
+                        }
+                        other => break other?,
+                    }
+                }
+            };
+            match need {
+                None => return Ok(()),
+                Some(f) => {
+                    fetches += 1;
+                    if fetches > OP_TRIES_MAX {
+                        return Err(StoreError::Unavailable("a write's read".into()));
+                    }
+                    let mut buf = vec![0u8; EXTENT_BYTES as usize];
+                    match self.fetch(f, &mut buf) {
+                        Ok(()) | Err(StoreError::Unavailable(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn punch_extent(&self, extent: u64) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            let Inner { store, cache } = &mut *g;
+            match store.punch(cache, extent) {
+                Err(StoreError::Full(_)) => g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0,
+                other => return other,
+            }
+        }
+    }
+}
+
+fn eio(e: StoreError) -> BackingError {
+    BackingError(e.to_string())
+}
+
+/// The pieces of `[offset, offset + len)`, extent by extent: (extent,
+/// offset in it, length, offset in the caller's buffer).
+fn pieces(offset: u64, len: usize) -> impl Iterator<Item = (u64, u32, usize, usize)> {
+    let ext = EXTENT_BYTES as u64;
+    let end = offset + len as u64;
+    let mut at = offset;
+    std::iter::from_fn(move || {
+        if at >= end {
+            return None;
+        }
+        let e = at / ext;
+        let within = at % ext;
+        let n = (ext - within).min(end - at);
+        let piece = (e, within as u32, n as usize, (at - offset) as usize);
+        at += n;
+        Some(piece)
+    })
+}
+
+impl Backing for Disk {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
+        let mut extent = vec![0u8; EXTENT_BYTES as usize];
+        for (e, within, n, at) in pieces(offset, buf.len()) {
+            if let Err(err) = self.read_extent(e, &mut extent) {
+                self.stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(eio(err));
+            }
+            buf[at..at + n].copy_from_slice(&extent[within as usize..within as usize + n]);
+        }
+        Ok(())
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), BackingError> {
+        for (e, within, n, at) in pieces(offset, data.len()) {
+            self.write_extent(e, within, &data[at..at + n]).map_err(eio)?;
+        }
+        Ok(())
+    }
+
+    /// The kernel's fsync returns at once: the cache file dies with the
+    /// container, so syncing it protects nothing; what protects a write is
+    /// the next cut reaching the store, about a second later (the loss
+    /// window, docs/contract.md). Every cut is a whole moment of the
+    /// device, so the order ext4's journal relies on holds in the store.
+    fn sync(&self) -> Result<(), BackingError> {
+        Ok(())
+    }
+
+    fn punch(&self, offset: u64, length: u64) -> Result<(), BackingError> {
+        let zeros = vec![0u8; EXTENT_BYTES as usize];
+        for (e, within, n, _) in pieces(offset, usize::try_from(length).expect("bounded")) {
+            if within == 0 && n == EXTENT_BYTES as usize {
+                self.punch_extent(e).map_err(eio)?;
+            } else {
+                self.write_extent(e, within, &zeros[..n]).map_err(eio)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Goal: a byte range splits into the extents it covers, each piece
+    // inside its extent, the pieces covering the range exactly. Method:
+    // ranges at and across extent boundaries.
+    #[test]
+    fn pieces_cover_the_range() {
+        let ext = EXTENT_BYTES as u64;
+        assert_eq!(pieces(0, ext as usize).collect::<Vec<_>>(), vec![(0, 0, ext as usize, 0)]);
+        assert_eq!(pieces(ext - 10, 20).collect::<Vec<_>>(), vec![(0, (ext - 10) as u32, 10, 0), (1, 0, 10, 10)]);
+        let p: Vec<_> = pieces(5, 3 * ext as usize).collect();
+        assert_eq!(p.len(), 4);
+        assert_eq!(p.iter().map(|x| x.2).sum::<usize>(), 3 * ext as usize);
+    }
+}

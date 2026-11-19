@@ -5,7 +5,7 @@
 # it came in (docs/design.md, Dependencies).
 [workspace]
 resolver = "2"
-members = ["crates/device", "crates/remote", "crates/testkit", "crates/probe", "crates/bench", "crates/format", "crates/store"]
+members = ["crates/device", "crates/remote", "crates/testkit", "crates/probe", "crates/bench", "crates/format", "crates/store", "crates/fpac"]
 
 [workspace.package]
 edition = "2021"
@@ -18,6 +18,7 @@ fpac-remote = { path = "crates/remote" }
 fpac-testkit = { path = "crates/testkit" }
 fpac-format = { path = "crates/format" }
 fpac-store = { path = "crates/store" }
+fpac = { path = "crates/fpac" }
 # Syscalls: /dev/fuse, the loop device's ioctls, mount, prctl, mlockall.
 libc = "=0.2.189"
 # A put names its body's SHA-256, which the remote checks (docs/contract.md).

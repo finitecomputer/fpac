@@ -25,6 +25,10 @@ pub const SHA256_HEADER: &str = "x-fpac-sha256";
 /// `/open`'s answers.
 pub const DISK_HEADER: &str = "x-fpac-disk";
 pub const EPOCH_HEADER: &str = "x-fpac-epoch";
+pub const VOLUME_HEADER: &str = "x-fpac-volume-bytes";
+pub const HEAD_HEADER: &str = "x-fpac-head";
+/// `POST /head`'s answer: `taken` or `same`.
+pub const HEAD_ANSWER_HEADER: &str = "x-fpac-head-answer";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -67,6 +71,56 @@ pub enum Put {
 pub struct Open {
     pub disk: String,
     pub epoch: u64,
+    pub volume_bytes: u64,
+    /// None: a new disk.
+    pub head: Option<Head>,
+}
+
+/// A checkpoint by its name's parts (`e<epoch>/c<seq>`) and its object's
+/// SHA-256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointRef {
+    pub epoch: u64,
+    pub seq: u64,
+    pub sum: [u8; 32],
+}
+
+/// The head (docs/design.md, Consistency): which checkpoint a disk opens
+/// from, and which life's segments follow it. On the wire it is one line,
+/// `<epoch> <checkpoint epoch> <checkpoint seq> <sha256 hex>`, or
+/// `<epoch> - - -` for a disk with no checkpoint yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head {
+    pub epoch: u64,
+    pub checkpoint: Option<CheckpointRef>,
+}
+
+impl Head {
+    pub fn encode(&self) -> String {
+        match self.checkpoint {
+            Some(c) => format!("{} {} {} {}", self.epoch, c.epoch, c.seq, hex(&c.sum)),
+            None => format!("{} - - -", self.epoch),
+        }
+    }
+
+    pub fn decode(s: &str) -> Option<Head> {
+        let p: Vec<&str> = s.split(' ').collect();
+        let [e, ce, cs, sum] = p.as_slice() else { return None };
+        let epoch: u64 = e.parse().ok().filter(|&e| e > 0)?;
+        if *ce == "-" && *cs == "-" && *sum == "-" {
+            return Some(Head { epoch, checkpoint: None });
+        }
+        let c = CheckpointRef { epoch: ce.parse().ok().filter(|&e| e > 0)?, seq: cs.parse().ok().filter(|&s| s > 0)?, sum: unhex32(sum)? };
+        Some(Head { epoch, checkpoint: Some(c) })
+    }
+}
+
+/// A head post's answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadAnswer {
+    Taken,
+    /// The same head again: an earlier post whose answer was lost.
+    Same,
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -201,7 +255,33 @@ impl Remote {
         }
         let disk = h.header(DISK_HEADER).ok_or_else(|| RemoteError::Protocol("open names no disk".into()))?.to_string();
         let epoch = h.header(EPOCH_HEADER).and_then(|e| e.parse().ok()).filter(|&e| e > 0).ok_or_else(|| RemoteError::Protocol("open names no epoch".into()))?;
-        Ok(Open { disk, epoch })
+        let volume_bytes = h.header(VOLUME_HEADER).and_then(|v| v.parse().ok()).filter(|&v| v > 0).ok_or_else(|| RemoteError::Protocol("open names no volume".into()))?;
+        let head = match h.header(HEAD_HEADER) {
+            Some("none") => None,
+            Some(line) => Some(Head::decode(line).ok_or_else(|| RemoteError::Protocol(format!("open names a malformed head: {line}")))?),
+            None => return Err(RemoteError::Protocol("open names no head".into())),
+        };
+        if head.is_some_and(|h| h.epoch >= epoch) {
+            return Err(RemoteError::Protocol("open names a head no older than this life".into()));
+        }
+        Ok(Open { disk, epoch, volume_bytes, head })
+    }
+
+    /// Posts this life's head: taken, or the same again. A head the
+    /// platform refuses (another life's, or one going back) is `Refused`.
+    pub fn post_head(&mut self, head: &Head) -> Result<HeadAnswer, RemoteError> {
+        let line = head.encode();
+        let mut answer = Vec::new();
+        let h = self.call("POST", "/head", &[("content-type", "text/plain")], line.as_bytes(), limits::SMALL_BODY_BYTES_MAX as u64, &mut |_, b| {
+            answer.extend_from_slice(b);
+            Ok(())
+        })?;
+        match (h.status, h.header(HEAD_ANSWER_HEADER)) {
+            (200, Some("taken")) => Ok(HeadAnswer::Taken),
+            (200, Some("same")) => Ok(HeadAnswer::Same),
+            (200, other) => Err(RemoteError::Protocol(format!("a head post answered {other:?}"))),
+            (status, _) => Err(Remote::detail(status, &answer)),
+        }
     }
 
     /// Puts `body` at `name` if nothing is there.
@@ -306,6 +386,19 @@ mod tests {
             assert_eq!(name_epoch(bad), None, "{bad}");
         }
         assert_eq!(name_epoch(&format!("e1/{}", "a".repeat(100))), None);
+    }
+
+    // Goal: a head's line round-trips, with and without a checkpoint, and
+    // a malformed one is refused. Method: both, then six bad lines.
+    #[test]
+    fn head_lines() {
+        let h = Head { epoch: 7, checkpoint: Some(CheckpointRef { epoch: 6, seq: 2, sum: sha256(b"c") }) };
+        assert_eq!(Head::decode(&h.encode()), Some(h));
+        let n = Head { epoch: 1, checkpoint: None };
+        assert_eq!(Head::decode(&n.encode()), Some(n));
+        for bad in ["", "7", "0 - - -", "7 6 2", "7 6 0 aa", "7 - 2 -", "x - - -"] {
+            assert_eq!(Head::decode(bad), None, "{bad}");
+        }
     }
 
     // Goal: hex round-trips, and anything but 64 lowercase digits is

@@ -1,0 +1,18 @@
+[package]
+name = "fpac"
+description = "The disk's daemon: mounts /data as ext4 on a loop device over one FUSE file, served from the store with the remote behind it; flushes about once a second; a sleep is a final flush. One static binary (musl), run in the guest."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "fpac"
+path = "src/main.rs"
+
+[dependencies]
+fpac-device = { workspace = true }
+fpac-format = { workspace = true }
+fpac-remote = { workspace = true }
+fpac-store = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }

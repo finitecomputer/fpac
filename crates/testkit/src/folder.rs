@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use fpac_remote::{hex, limits, name_epoch, sha256, unhex32, DISK_HEADER, EPOCH_HEADER, SHA256_HEADER};
+use fpac_remote::{hex, limits, name_epoch, sha256, unhex32, Head, DISK_HEADER, EPOCH_HEADER, HEAD_ANSWER_HEADER, HEAD_HEADER, SHA256_HEADER, VOLUME_HEADER};
+use fpac_store::head::{decide, Decision};
 
 /// Connections served at once; past it a connection is closed at once.
 pub const CONNECTIONS_MAX: usize = 64;
@@ -42,6 +43,9 @@ pub struct Folder {
     pub root: PathBuf,
     pub disk: String,
     pub epoch: u64,
+    pub volume_bytes: u64,
+    /// The disk's head, as the platform keeps it, moved only by `decide`.
+    pub head: std::sync::Mutex<Option<Head>>,
     pub faults: Faults,
     live: AtomicUsize,
 }
@@ -62,7 +66,15 @@ impl Folder {
     pub fn new(root: &Path, disk: &str, epoch: u64) -> Folder {
         assert!(epoch > 0);
         assert!(!disk.is_empty() && disk.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
-        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, faults: Faults::default(), live: AtomicUsize::new(0) }
+        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, volume_bytes: 1 << 30, head: std::sync::Mutex::new(None), faults: Faults::default(), live: AtomicUsize::new(0) }
+    }
+
+    /// A later life of the same disk: the same folder and head, a new
+    /// epoch.
+    pub fn next_life(&self, epoch: u64) -> Folder {
+        assert!(epoch > self.epoch);
+        let head = *self.head.lock().unwrap();
+        Folder { root: self.root.clone(), disk: self.disk.clone(), epoch, volume_bytes: self.volume_bytes, head: std::sync::Mutex::new(head), faults: Faults::default(), live: AtomicUsize::new(0) }
     }
 
     pub fn start(self, listen: Listen) -> Running {
@@ -121,7 +133,23 @@ impl Folder {
         let route = req.path.strip_prefix("/o/");
         match (req.method.as_str(), req.path.as_str(), route) {
             ("GET", "/open", _) => {
-                answer(s, 200, &[(DISK_HEADER, self.disk.clone()), (EPOCH_HEADER, self.epoch.to_string())], b"")?;
+                let head = self.head.lock().unwrap().map(|h| h.encode()).unwrap_or_else(|| "none".into());
+                answer(s, 200, &[(DISK_HEADER, self.disk.clone()), (EPOCH_HEADER, self.epoch.to_string()), (VOLUME_HEADER, self.volume_bytes.to_string()), (HEAD_HEADER, head)], b"")?;
+            }
+            ("POST", "/head", _) => {
+                let proposed = std::str::from_utf8(&req.body).ok().and_then(Head::decode);
+                let Some(proposed) = proposed else {
+                    return answer(s, 400, &[], b"a malformed head").map(|_| true);
+                };
+                let mut head = self.head.lock().unwrap();
+                match decide(head.as_ref(), self.epoch, &proposed) {
+                    Decision::Take => {
+                        *head = Some(proposed);
+                        answer(s, 200, &[(HEAD_ANSWER_HEADER, "taken".into())], b"")?;
+                    }
+                    Decision::Same => answer(s, 200, &[(HEAD_ANSWER_HEADER, "same".into())], b"")?,
+                    Decision::Refuse(why) => answer(s, 409, &[], why.as_bytes())?,
+                }
             }
             ("GET", _, Some(name)) if name_epoch(name).is_some() => self.get(s, name, req.header("range"))?,
             ("PUT", _, Some(name)) => match name_epoch(name) {

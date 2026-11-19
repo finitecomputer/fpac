@@ -10,6 +10,9 @@
 //! fpac-bench rangecheck --place cloudflare|outside --mode stream|tee|buffer --pattern aligned|unaligned
 //!            --count n --threads t --size-max bytes [--write] [--label <l>]
 //! fpac-bench exec <argv…> | destroy               the running Cloudflare container, for debugging
+//! fpac-bench lives --place krun|cloudflare [--write]       a new disk across two lives, checked
+//! fpac-bench crash --place krun|cloudflare [--rounds n] [--write]  guests killed mid-write, each next life checked
+//! fpac-bench wake --place krun|cloudflare [--gb n] [--wakes n] [--write]  a disk of n GB woken on fresh guests
 //! fpac-bench deploy                                the stand-in Worker, its bucket, its image
 //! fpac-bench inventory <label>                     the account's Workers, buckets, container apps
 //! fpac-bench reset                                 the one cleanup (docs/spike.md, Musts)
@@ -23,6 +26,7 @@
 //! - `cloudflare`: the deployed stand-in Worker and its R2 bucket.
 
 mod config;
+mod disk;
 mod krun;
 mod net;
 
@@ -36,11 +40,11 @@ use config::{home, repo, Config};
 
 const PROBE_IN_GUEST: &str = "/usr/local/bin/fpac-probe";
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).expect("after 1970").as_millis()).expect("fits")
 }
 
-fn work_dir() -> PathBuf {
+pub fn work_dir() -> PathBuf {
     let d = std::env::var_os("FPAC_WORK_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".cache/fpac/spike/work"));
     std::fs::create_dir_all(&d).expect("the work directory");
     d
@@ -64,16 +68,20 @@ fn commit() -> Value {
 /// Builds the static probe and stages the image's context: answers the
 /// context's directory and a tag naming its contents.
 fn stage() -> Result<(PathBuf, String), String> {
-    run(Command::new("cargo").current_dir(repo()).args(["build", "--release", "--target", "x86_64-unknown-linux-musl", "-p", "fpac-probe"]))?;
+    run(Command::new("cargo").current_dir(repo()).args(["build", "--release", "--target", "x86_64-unknown-linux-musl", "-p", "fpac-probe", "-p", "fpac"]))?;
     let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| repo().join("target"));
-    let bin = target.join("x86_64-unknown-linux-musl/release/fpac-probe");
     let ctx = work_dir().join("image");
     std::fs::create_dir_all(&ctx).map_err(|e| e.to_string())?;
-    let (b, d) = (std::fs::read(&bin).map_err(|e| format!("{}: {e}", bin.display()))?, std::fs::read(repo().join("images/tiny/Dockerfile")).map_err(|e| e.to_string())?);
-    std::fs::write(ctx.join("fpac-probe"), &b).map_err(|e| e.to_string())?;
-    std::fs::write(ctx.join("Dockerfile"), &d).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(ctx.join("fpac-probe"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(|e| e.to_string())?;
-    let tag = fpac_remote::hex(&fpac_remote::sha256(&[b, d].concat()))[..12].to_string();
+    let mut all = std::fs::read(repo().join("images/tiny/Dockerfile")).map_err(|e| e.to_string())?;
+    std::fs::write(ctx.join("Dockerfile"), &all).map_err(|e| e.to_string())?;
+    for name in ["fpac-probe", "fpac"] {
+        let bin = target.join("x86_64-unknown-linux-musl/release").join(name);
+        let b = std::fs::read(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+        std::fs::write(ctx.join(name), &b).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(ctx.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(|e| e.to_string())?;
+        all.extend_from_slice(&b);
+    }
+    let tag = fpac_remote::hex(&fpac_remote::sha256(&all))[..12].to_string();
     Ok((ctx, tag))
 }
 
@@ -99,11 +107,18 @@ fn write(name: &str, place: &str, value: &Value) {
     eprintln!("wrote {} ({place})", path.display());
 }
 
-fn krun_probe() -> Result<Value, String> {
+/// The tiny image built and loaded into the krun engine: its reference
+/// and what the engine said of it.
+fn krun_image() -> Result<(String, Value), String> {
     let image = docker_image()?;
     let tar = work_dir().join("tiny.tar");
     run(Command::new("docker").args(["save", "-o"]).arg(&tar).arg(&image))?;
     let loaded = krun::load_image(&image, &tar)?;
+    Ok((image, loaded))
+}
+
+fn krun_probe() -> Result<Value, String> {
+    let (image, loaded) = krun_image()?;
     let name = "fpac-probe-krun";
     let _ = krun::destroy(name);
     // The probe needs no remote; an intercept with no handler listening
@@ -193,6 +208,29 @@ fn joined(mut check: Value, records: &Value, path: &str, since: u64) -> Value {
     check["handler_records"] = json!(recs.len());
     check["handler_records_sample"] = json!(recs.into_iter().take(20).collect::<Vec<_>>());
     check
+}
+
+/// A disk scenario (disk.rs) in a place: a new disk each run, its objects
+/// deleted after (Cloudflare's; krun's folder goes with its run).
+fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, String> {
+    let volume: u64 = 20_000 << 20;
+    let mut p: Box<dyn disk::Place> = match place {
+        "krun" => Box::new(disk::Krun::new(&krun_image()?.0, &format!("disk-{scenario}"), volume)?),
+        _ => Box::new(disk::Cloudflare::new(&format!("{scenario}-{}", now_ms()), volume)?),
+    };
+    let r = match scenario {
+        "lives" => disk::smoke(p.as_mut()),
+        "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
+        "tools" => disk::tools(p.as_mut()),
+        _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3)),
+    };
+    let objects = p.objects();
+    let cleaned = p.cleanup();
+    r.map(|mut v| {
+        v["objects_at_end"] = objects;
+        v["bulk_data_deleted"] = cleaned;
+        v
+    })
 }
 
 /// The volume range check (docs/spike.md, Results: wrong reads):
@@ -535,6 +573,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -551,7 +590,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two

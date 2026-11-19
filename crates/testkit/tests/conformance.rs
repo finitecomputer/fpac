@@ -30,7 +30,7 @@ fn folder_remote_conforms() {
     for c in &cases {
         assert!(c.pass, "{}: {}", c.name, c.detail);
     }
-    assert_eq!(cases.len(), 12);
+    assert_eq!(cases.len(), 17);
     assert_eq!(remote.connects, 1, "one kept-alive connection");
 }
 
