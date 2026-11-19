@@ -212,7 +212,13 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
         "cloudflare" => {
             let started = cf_start(&c, &key, "spike-rc")?;
             // The job writes its exit code when it ends, however it ends.
-            let job = format!("rm -f /tmp/rc.json /tmp/rc.exit; setsid nohup sh -c '{PROBE_IN_GUEST} rangecheck --mode {mode} --pattern {pattern} --count {count} --threads {threads} --size-max {size_max} --tag {tag} --out /tmp/rc.json 2> /tmp/rc.err; echo $? > /tmp/rc.exit' > /dev/null 2>&1 < /dev/null & echo started");
+            // `--client remote`: the product's own client, as the first
+            // wrong reads were seen through (fpac-probe remotecheck)
+            let command = match flag(args, "--client").as_deref() {
+                Some("remote") => format!("{PROBE_IN_GUEST} remotecheck --count {count} --threads {threads} --whole-every {} --tag {tag} --out /tmp/rc.json", flag(args, "--whole-every").unwrap_or("200".into())),
+                _ => format!("{PROBE_IN_GUEST} rangecheck --mode {mode} --pattern {pattern} --count {count} --threads {threads} --size-max {size_max} --tag {tag} --out /tmp/rc.json"),
+            };
+            let job = format!("rm -f /tmp/rc.json /tmp/rc.exit; setsid nohup sh -c '{command} 2> /tmp/rc.err; echo $? > /tmp/rc.exit' > /dev/null 2>&1 < /dev/null & echo started");
             let (code, out) = cf_exec_raw(&c, &key, &["sh", "-c", &job], 60_000)?;
             if code != 0 || !out.contains("started") {
                 return Err(format!("the job did not start: {code} {out}"));

@@ -84,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fpac-format"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "fpac-probe"
 version = "0.1.0"
 dependencies = [
@@ -99,6 +107,15 @@ name = "fpac-remote"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "fpac-store"
+version = "0.1.0"
+dependencies = [
+ "fpac-format",
+ "fpac-remote",
  "thiserror",
 ]
 

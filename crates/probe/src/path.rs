@@ -357,3 +357,97 @@ pub fn rangecheck(host: &str, port: u16, tag: &str, args: &[String]) -> Value {
     out
 }
 
+
+/// The wrong reads seen first came through the product's own client
+/// (`Remote`), on one kept-alive connection that had carried whole 50 MiB
+/// gets and puts. This check repeats that pattern at volume: `--threads`
+/// connections, each its own `Remote`, each putting nothing and reading
+/// the object whole every `--whole-every` reads, and between those, ranged
+/// reads (4 KiB-aligned, 4 KiB to 1 MiB) through `Remote::get_range`, each
+/// compared with what was put.
+pub fn remotecheck(host: &str, port: u16, tag: &str, args: &[String]) -> Value {
+    use fpac_testkit::rangecheck::{diagnose, range, Pattern};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    let get = |n: &str| crate::arg(args, n);
+    let reads: u64 = get("--count").and_then(|c| c.parse().ok()).unwrap_or(10_000).min(1_000_000);
+    let threads: u64 = get("--threads").and_then(|c| c.parse().ok()).unwrap_or(16).clamp(1, 64);
+    let whole_every: u64 = get("--whole-every").and_then(|c| c.parse().ok()).unwrap_or(200).max(1);
+    let mut r = Remote::new(host, port);
+    let e = match r.open() {
+        Ok(o) => o.epoch,
+        Err(err) => return json!({ "evidence": "remotecheck", "error": format!("open: {err}") }),
+    };
+    let object = noise(STREAM_BYTES, 600);
+    let name = format!("e{e}/{tag}-remote");
+    if !matches!(r.put(&name, &object), Ok(Put::Created)) {
+        return json!({ "evidence": "remotecheck", "error": "the object's put" });
+    }
+    let (done, right, wrong, failed, wholes, whole_bad) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let bad = Mutex::new(Vec::new());
+    let failures = Mutex::new(Vec::new());
+    let t0 = Instant::now();
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let (done, right, wrong, failed, wholes, whole_bad, bad, failures, object, name) = (&done, &right, &wrong, &failed, &wholes, &whole_bad, &bad, &failures, &object, &name);
+            s.spawn(move || {
+                let mut c = Remote::new(host, port);
+                let mut x = (0x5eed_0003u64 ^ (t + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+                let mut buf = vec![0u8; 1 << 20];
+                let mut mine = 0u64;
+                // Bounded by `reads`: each pass takes one.
+                loop {
+                    let nth = done.fetch_add(1, Ordering::SeqCst);
+                    if nth >= reads {
+                        return;
+                    }
+                    if mine.is_multiple_of(whole_every) {
+                        wholes.fetch_add(1, Ordering::SeqCst);
+                        if !matches!(c.get(name, &mut |_| {}), Ok(Some(n)) if n == STREAM_BYTES as u64) {
+                            whole_bad.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    mine += 1;
+                    let (off, len) = range(Pattern::Aligned, &mut x, STREAM_BYTES as u64, 1 << 20);
+                    let b = &mut buf[..len as usize];
+                    let want = &object[off as usize..(off + len) as usize];
+                    match c.get_range(name, off, b) {
+                        Ok(Some(n)) if n as u64 == len && b[..] == *want => {
+                            right.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(Some(n)) if n as u64 == len => {
+                            wrong.fetch_add(1, Ordering::SeqCst);
+                            let (first, differ, runs, zero) = diagnose(b, want, object);
+                            let ids: serde_json::Map<String, Value> = c.last_headers.iter().filter(|(k, _)| k.starts_with("x-fpac") || k == "content-range" || k == "content-length" || k == "transfer-encoding" || k == "cf-ray").map(|(k, v)| (k.clone(), json!(v))).collect();
+                            let mut v = bad.lock().unwrap();
+                            if v.len() < 200 {
+                                v.push(json!({ "nth": nth, "thread": t, "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64, "range": [off, off + len - 1], "length": len, "first_diff": first, "differ": differ, "all_zero_after": zero, "runs": runs.iter().map(|(a, src, l)| json!({ "at": a, "object_offset": src, "len": l })).collect::<Vec<_>>(), "headers": ids, "reads_on_this_connection": mine, "connections": c.connects }));
+                            }
+                        }
+                        other => {
+                            failed.fetch_add(1, Ordering::SeqCst);
+                            let mut f = failures.lock().unwrap();
+                            if f.len() < 20 {
+                                f.push(format!("{off}+{len}: {other:?}"));
+                            }
+                        }
+                    }
+                    let n = nth + 1;
+                    if n.is_multiple_of(5000) {
+                        eprintln!("{n} reads, {} wrong, {} failed", wrong.load(Ordering::SeqCst), failed.load(Ordering::SeqCst));
+                    }
+                }
+            });
+        }
+    });
+    let out = json!({
+        "evidence": "remotecheck", "client": "fpac_remote::Remote, one per thread, kept-alive", "threads": threads, "whole_every": whole_every,
+        "reads": reads, "right": right.into_inner(), "wrong": wrong.into_inner(), "failed": failed.into_inner(),
+        "whole_gets": wholes.into_inner(), "whole_gets_bad": whole_bad.into_inner(), "ms": t0.elapsed().as_millis() as u64,
+        "bad": bad.into_inner().unwrap(), "failures": failures.into_inner().unwrap(),
+    });
+    if let Some(file) = get("--out") {
+        let _ = std::fs::write(&file, out.to_string());
+    }
+    out
+}

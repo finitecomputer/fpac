@@ -128,13 +128,16 @@ pub struct Remote {
     conn: Option<Conn<TcpStream>>,
     /// The last call's timing.
     pub timing: Timing,
+    /// The last answer's headers (names lowercased), for a caller that
+    /// must say which answer it was (a wrong read's request id, say).
+    pub last_headers: Vec<(String, String)>,
     /// Connections opened so far (a sniff for keep-alive).
     pub connects: u64,
 }
 
 impl Remote {
     pub fn new(host: &str, port: u16) -> Remote {
-        Remote { host: host.to_string(), port, conn: None, timing: Timing::default(), connects: 0 }
+        Remote { host: host.to_string(), port, conn: None, timing: Timing::default(), last_headers: Vec::new(), connects: 0 }
     }
 
     fn connect(&mut self) -> Result<Conn<TcpStream>, RemoteError> {
@@ -171,6 +174,7 @@ impl Remote {
         };
         let (head, timing) = answer?;
         self.timing = timing;
+        self.last_headers.clone_from(&head.headers);
         if !head.close {
             self.conn = Some(conn);
         }

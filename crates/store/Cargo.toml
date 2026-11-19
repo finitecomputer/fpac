@@ -1,0 +1,11 @@
+[package]
+name = "fpac-store"
+description = "The disk's store: the map, the cut, open and replay, checkpoints, the pack, and the head's rules, behind three gates (the remote, the cache file, the clock as a number passed in). Pure: tested by a deterministic simulator that crashes at every step."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fpac-format = { workspace = true }
+fpac-remote = { workspace = true }
+thiserror = { workspace = true }
