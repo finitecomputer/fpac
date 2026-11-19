@@ -470,6 +470,12 @@ fn krun_path() -> Result<Value, String> {
 
 /// The Worker staged with its config rendered from the local one.
 fn stage_worker(c: &Config, key: &net::Key, image_ctx: &Path) -> Result<PathBuf, String> {
+    // Each deploy's image is a manifest of its own: the registry refused to
+    // take again a manifest `reset` had just deleted ("no such manifest"
+    // after a push of the same digest), so a deploy after a reset failed.
+    let mut dockerfile = std::fs::read_to_string(image_ctx.join("Dockerfile")).map_err(|e| e.to_string())?;
+    dockerfile.push_str(&format!("LABEL fpac.spike.deployed_at_ms=\"{}\"\n", now_ms()));
+    std::fs::write(image_ctx.join("Dockerfile"), dockerfile).map_err(|e| e.to_string())?;
     let dir = work_dir().join("worker");
     std::fs::create_dir_all(dir.join("src")).map_err(|e| e.to_string())?;
     let src = repo().join("worker");
