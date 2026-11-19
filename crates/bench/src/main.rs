@@ -181,8 +181,8 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 /// Bad reads joined with what the handler recorded under their request id
 /// (a record means R2's bytes were already wrong at the handler).
-fn joined(mut check: Value, records: &Value) -> Value {
-    let recs = records.as_array().cloned().unwrap_or_default();
+fn joined(mut check: Value, records: &Value, path: &str, since: u64) -> Value {
+    let recs: Vec<Value> = records.as_array().cloned().unwrap_or_default().into_iter().filter(|r| r["path"] == json!(path) && r["at_ms"].as_u64().is_some_and(|t| t >= since)).collect();
     if let Some(bad) = check["bad"].as_array_mut() {
         for b in bad {
             let id = b["ids"]["x-fpac-request"].as_str().unwrap_or("").to_string();
@@ -205,7 +205,9 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
     let (mode, pattern) = (flag(args, "--mode").unwrap_or("stream".into()), flag(args, "--pattern").unwrap_or("aligned".into()));
     let (count, threads, size_max) = (flag(args, "--count").unwrap_or("10000".into()), flag(args, "--threads").unwrap_or("16".into()), flag(args, "--size-max").unwrap_or((1u32 << 20).to_string()));
     let tag = format!("r{}", now_ms());
-    let _ = net::worker(c.host(), &key, "POST", "/records/clear", &json!({}), Duration::from_secs(60))?;
+    // The handler's records are shared by runs on both places at once:
+    // each run takes those of its own path and time.
+    let since = now_ms();
     match place {
         "cloudflare" => {
             let started = cf_start(&c, &key, "spike-rc")?;
@@ -233,7 +235,7 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
             let _ = net::worker(c.host(), &key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
             let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "disks/spike-rc/" }), Duration::from_secs(300));
             let check = guest_json(&text).map_err(|e| format!("{e} (finished: {finished}); the job's stderr: {err}"))?;
-            Ok(json!({ "place": { "name": "cloudflare", "what": "the guest -> its intercept -> the stand-in's handler -> R2", "start": started }, "check": joined(check, &records), "bulk_data_deleted": deleted.ok() }))
+            Ok(json!({ "place": { "name": "cloudflare", "what": "the guest -> its intercept -> the stand-in's handler -> R2", "start": started }, "check": joined(check, &records, "intercept", since), "bulk_data_deleted": deleted.ok() }))
         }
         "outside" => {
             use fpac_testkit::rangecheck::{self, Check, Dial, Mode, Pattern, ReadWrite};
@@ -265,7 +267,7 @@ fn rangecheck(place: &str, args: &[String]) -> Result<Value, String> {
             let outcome = rangecheck::run(&check, &Outside { host: c.host(), key: &key }, &|n, w, f| eprintln!("outside {mode} {pattern}: {n} reads, {w} wrong, {f} failed"));
             let records = net::worker(c.host(), &key, "GET", "/records", &json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
             let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "repro/" }), Duration::from_secs(300));
-            Ok(json!({ "place": { "name": "outside", "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept" }, "check": joined(rangecheck::evidence(&outcome, &check, &path), &records), "bulk_data_deleted": deleted.ok() }))
+            Ok(json!({ "place": { "name": "outside", "what": "this machine -> TLS -> the Worker's fetch handler (signed) -> R2; no container, no intercept" }, "check": joined(rangecheck::evidence(&outcome, &check, &path), &records, "outside", since), "bulk_data_deleted": deleted.ok() }))
         }
         _ => Err("--place cloudflare|outside".into()),
     }
@@ -546,7 +548,10 @@ fn main() {
             if write_it && ["probe", "path", "ranges", "rangecheck"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
-                write(&args[1], &key, &v);
+                // the outside place writes a file of its own, so the two
+                // places can run at once
+                let name = if args[1] == "rangecheck" && place == "outside" { "rangecheck-outside".to_string() } else { args[1].clone() };
+                write(&name, &key, &v);
             }
             println!("{}", serde_json::to_string_pretty(&v).expect("JSON"));
         }
