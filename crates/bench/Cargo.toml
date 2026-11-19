@@ -1,0 +1,15 @@
+[package]
+name = "fpac-bench"
+description = "The evidence driver (docs/spike.md): each scenario, its JSON under docs/evidence, and the one reset. Runs on the host; its guest half is fpac-probe."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fpac-remote = { workspace = true }
+fpac-testkit = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

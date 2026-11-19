@@ -1,0 +1,10 @@
+[package]
+name = "fpac-device"
+description = "The disk's face: one file served over /dev/fuse by hand, a loop device over it with direct I/O, and ext4 mounted on that (Linux only behind cfg; the protocol is pure and host-tested)."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }

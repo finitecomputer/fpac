@@ -1,0 +1,10 @@
+[package]
+name = "fpac-remote"
+description = "The gate to the remote (docs/contract.md): a ranged get and a put-if-absent over plain HTTP/1.1, the guest's only way to its blocks. Also the HTTP/1.1 exchange the driver speaks over TLS."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+thiserror = { workspace = true }

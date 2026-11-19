@@ -1,0 +1,5 @@
+# The guest's binaries are static (musl), as sandcastle's guest is, so one
+# file runs in any image: `cargo build --release --target
+# x86_64-unknown-linux-musl -p fpac-probe`.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

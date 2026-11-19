@@ -1,0 +1,42 @@
+# fpac: a lazy disk for long-lived computers. ext4, made by the kernel, on
+# a block device whose blocks live in an object store (README.md,
+# docs/design.md). Versions are pinned exactly; where sandcastle or
+# macrofiche pins a crate, this pins the same version. Each was vetted when
+# it came in (docs/design.md, Dependencies).
+[workspace]
+resolver = "2"
+members = ["crates/device", "crates/remote", "crates/testkit", "crates/probe", "crates/bench"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+fpac-device = { path = "crates/device" }
+fpac-remote = { path = "crates/remote" }
+fpac-testkit = { path = "crates/testkit" }
+# Syscalls: /dev/fuse, the loop device's ioctls, mount, prctl, mlockall.
+libc = "=0.2.189"
+# A put names its body's SHA-256, which the remote checks (docs/contract.md).
+# Pure Rust, so the guest links statically against musl.
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# The driver alone (never the guest): TLS to the deployed Worker and to
+# Cloudflare's API, and the ECDSA P-256 key that signs its calls.
+ring = "=0.17.14"
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "=1.0.9"
+
+# The seatbelt stays on, as sandcastle's and macrofiche's: a failed
+# assertion takes the whole process down, never one thread of it while the
+# rest carries on serving a disk it no longer trusts.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+strip = true
+overflow-checks = true
+panic = "abort"

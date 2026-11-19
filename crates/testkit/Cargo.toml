@@ -1,0 +1,10 @@
+[package]
+name = "fpac-testkit"
+description = "A remote that answers the contract from a folder and fails on request (a stand-in, named so wherever it is used), and the conformance suite every remote must pass."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fpac-remote = { workspace = true }
+libc = { workspace = true }

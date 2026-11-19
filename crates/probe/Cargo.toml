@@ -1,0 +1,13 @@
+[package]
+name = "fpac-probe"
+description = "The guest's half of the evidence driver: the probe of the block faces, the path to the remote, and the conformance suite, each printing one JSON document. One static binary (musl), run inside a krun VM, a Cloudflare container, or a plain Docker container (check-only there)."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fpac-device = { workspace = true }
+fpac-remote = { workspace = true }
+fpac-testkit = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,34 @@
+{
+  // The spike's Worker, rendered by `fpac-bench deploy` from the local
+  // config (docs/spike.md, Musts): every placeholder is filled there, so no
+  // account, name or key is in this repository.
+  "name": "${WORKER_NAME}",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-01-01",
+  // the container's entrypoint is PID 1 in a PID namespace of its own
+  "compatibility_flags": ["containers_pid_namespace"],
+  "workers_dev": true,
+  "preview_urls": false,
+  // One container per Durable Object, placed beside it; sized at its
+  // start (2 vCPU, 6 GiB, 20 GB), as a computer is.
+  "containers": [
+    {
+      "class_name": "FpacSpike",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "tiny": { "dockerfile": "${IMAGE_DOCKERFILE}", "build_context": "${IMAGE_CONTEXT}" }
+      }
+    }
+  ],
+  "durable_objects": {
+    // A redeploy reaches the object at once: Cloudflare's default keeps a
+    // busy object on the code before (and its image list) for minutes.
+    "code_update_strategy": { "mode": "immediate" },
+    "bindings": [{ "name": "SPIKE", "class_name": "FpacSpike" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FpacSpike"] }],
+  // The version id, so the driver knows which deploy answered.
+  "version_metadata": { "binding": "VERSION" },
+  "r2_buckets": [{ "binding": "DISKS", "bucket_name": "${BUCKET_NAME}" }],
+  "vars": { "DRIVER_PUBLIC_KEY": "${DRIVER_PUBLIC_KEY}" }
+}
