@@ -6,7 +6,7 @@
 //! fpac-bench stage                                 the probe built, the image staged and built
 //! fpac-bench probe --place krun|docker|cloudflare [--write]
 //! fpac-bench path --place krun|cloudflare [--write] [--label <l>]
-//! fpac-bench ranges --place cloudflare [--count n] [--write] [--label <l>]
+//! fpac-bench ranges --place cloudflare [--count n] [--diagnose] [--write] [--label <l>]
 //! fpac-bench deploy                                the stand-in Worker, its bucket, its image
 //! fpac-bench inventory <label>                     the account's Workers, buckets, container apps
 //! fpac-bench reset                                 the one cleanup (docs/spike.md, Musts)
@@ -199,13 +199,17 @@ fn cf_path() -> Result<Value, String> {
 }
 
 /// Ranged reads checked byte for byte on Cloudflare (`ranges.json`).
-fn cf_ranges(count: usize) -> Result<Value, String> {
+fn cf_ranges(count: usize, diagnose: bool) -> Result<Value, String> {
     let c = Config::load()?;
     let key = net::Key::load_or_make(&c.driver_key_file);
     let tag = format!("r{}", now_ms());
     let started = cf_start(&c, &key, "spike-ranges")?;
     let n = count.to_string();
-    let ranges = cf_exec(&c, &key, &[PROBE_IN_GUEST, "ranges", "--tag", &tag, "--count", &n]);
+    let mut argv = vec![PROBE_IN_GUEST, "ranges", "--tag", &tag, "--count", &n];
+    if diagnose {
+        argv.push("--diagnose");
+    }
+    let ranges = cf_exec(&c, &key, &argv);
     let _ = net::worker(c.host(), &key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
     let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": "disks/spike-ranges/" }), Duration::from_secs(300));
     let location = net::api(&c.token(), "GET", &format!("/accounts/{}/r2/buckets/{}", c.account_id, c.bucket_name), None).ok().map(|(_, v)| v["result"]["location"].clone());
@@ -417,7 +421,7 @@ fn main() {
         (Some("probe"), "cloudflare") => cf_probe(),
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
-        (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000)),
+        (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),
         (Some("reset"), _) => reset(),

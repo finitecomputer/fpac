@@ -199,12 +199,16 @@ pub fn run(host: &str, port: u16, tag: &str) -> Value {
     })
 }
 
-/// Ranged reads checked byte for byte (docs/spike.md, Results: the one
-/// wrong read): a 50 MiB object put once, then `count` reads of a random
-/// 4 KiB-aligned offset and a random size from 4 KiB to 1 MiB, each
-/// compared with what was put, and a whole get checked by its SHA-256 at
-/// the start and the end.
-pub fn ranges(host: &str, port: u16, tag: &str, count: usize) -> Value {
+/// Ranged reads checked byte for byte (docs/spike.md, Results: wrong
+/// reads): a 50 MiB object put once, then `count` reads of a random 4
+/// KiB-aligned offset and a random size from 4 KiB to 1 MiB, each compared
+/// with what was put, and a whole get checked by its SHA-256 at the start
+/// and the end. `diagnose`: the reads ask the stand-in Worker to read each
+/// range whole and name the SHA-256 of what it sent (outside the
+/// contract), so a wrong read says where it went wrong: R2's side of the
+/// handler (what was sent is already wrong) or the path to the guest
+/// (what was sent is right, what arrived is not).
+pub fn ranges(host: &str, port: u16, tag: &str, count: usize, diagnose: bool) -> Value {
     let mut r = Remote::new(host, port);
     let e = match r.open() {
         Ok(o) => o.epoch,
@@ -217,19 +221,69 @@ pub fn ranges(host: &str, port: u16, tag: &str, count: usize) -> Value {
     }
     let whole = |r: &mut Remote| matches!(r.get(&name, &mut |_| {}), Ok(Some(n)) if n == STREAM_BYTES as u64);
     let whole_before = whole(&mut r);
+    let mut raw = match TcpStream::connect((host, port)) {
+        Ok(s) => Conn::new(s),
+        Err(err) => return json!({ "evidence": "ranges", "error": format!("connect: {err}") }),
+    };
     let mut buf = vec![0u8; 1 << 20];
     let (mut ok, mut wrong, mut failed) = (0usize, Vec::new(), Vec::new());
     let (mut first, mut bytes_read) = (Vec::new(), 0u64);
-    let mut x = 0x0bad_5eed_u64;
+    let mut x = 0x0bad_5eed_u64 ^ u64::from(diagnose);
     for _ in 0..count {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         let size = (((x >> 20) % 256) as usize + 1) * 4096;
         let off = (x % ((STREAM_BYTES - size) as u64 / 4096)) * 4096;
+        let want = &object[off as usize..off as usize + size];
         let b = &mut buf[..size];
+        if diagnose {
+            let range = format!("bytes={off}-{}", off + size as u64 - 1);
+            let path = format!("/o/{name}");
+            let mut at = 0usize;
+            let req = Request { method: "GET", path: &path, host, headers: &[("range", &range), ("x-fpac-diagnose", "sha256")], body: &[] };
+            match raw.exchange(&req, size as u64, &mut |_, chunk| {
+                if at + chunk.len() > size {
+                    return Err("more than the range".into());
+                }
+                b[at..at + chunk.len()].copy_from_slice(chunk);
+                at += chunk.len();
+                Ok(())
+            }) {
+                Ok((h, t)) if h.status == 206 && at == size => {
+                    let sent = h.header("x-fpac-sent-sha256").unwrap_or("").to_string();
+                    let (sent_right, got_right) = (sent == fpac_remote::hex(&fpac_remote::sha256(want)), b[..] == *want);
+                    if got_right {
+                        ok += 1;
+                        bytes_read += size as u64;
+                        first.push(ms(t.first_byte));
+                    } else {
+                        let arrived_as_sent = sent == fpac_remote::hex(&fpac_remote::sha256(b));
+                        wrong.push(format!("{}; what the handler sent was {}; what arrived was {} it sent", mismatch(off, b, &object), if sent_right { "right" } else { "already wrong" }, if arrived_as_sent { "what" } else { "not what" }));
+                    }
+                    if !sent_right && got_right {
+                        failed.push(format!("{off}+{size}: arrived right, but the handler named another checksum"));
+                    }
+                    if h.close {
+                        match TcpStream::connect((host, port)) {
+                            Ok(s) => raw = Conn::new(s),
+                            Err(err) => return json!({ "evidence": "ranges", "error": format!("reconnect: {err}") }),
+                        }
+                    }
+                }
+                Ok((h, _)) => failed.push(format!("{off}+{size}: {} with {at} bytes", h.status)),
+                Err(err) => {
+                    failed.push(format!("{off}+{size}: {err}"));
+                    match TcpStream::connect((host, port)) {
+                        Ok(s) => raw = Conn::new(s),
+                        Err(err) => return json!({ "evidence": "ranges", "error": format!("reconnect: {err}") }),
+                    }
+                }
+            }
+            continue;
+        }
         match r.get_range(&name, off, b) {
-            Ok(Some(n)) if n == size && b[..] == object[off as usize..off as usize + size] => {
+            Ok(Some(n)) if n == size && b[..] == *want => {
                 ok += 1;
                 bytes_read += size as u64;
                 first.push(ms(r.timing.first_byte));
@@ -241,6 +295,7 @@ pub fn ranges(host: &str, port: u16, tag: &str, count: usize) -> Value {
     let whole_after = whole(&mut r);
     json!({
         "evidence": "ranges", "remote": format!("{host}:{port}"), "object_bytes": STREAM_BYTES,
+        "mode": if diagnose { "diagnose: each range read whole by the handler and sent with its SHA-256" } else { "streamed: R2's body streamed through the handler, as the contract serves it" },
         "reads": count, "right": ok, "wrong": wrong.len(), "failed": failed.len(), "bytes_read": bytes_read,
         "wrong_detail": wrong, "failed_detail": failed.into_iter().take(20).collect::<Vec<_>>(),
         "whole_get_checked": { "before": whole_before, "after": whole_after },

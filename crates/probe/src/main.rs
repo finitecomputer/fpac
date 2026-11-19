@@ -4,7 +4,7 @@
 //! fpac-probe probe [--check-only] [--dir <scratch>]
 //! fpac-probe path [--host <h>] [--port <p>] [--tag <t>]
 //! fpac-probe conformance [--host <h>] [--port <p>] [--tag <t>]
-//! fpac-probe ranges [--count <n>] [--host <h>] [--port <p>] [--tag <t>]
+//! fpac-probe ranges [--count <n>] [--diagnose] [--host <h>] [--port <p>] [--tag <t>]
 //! fpac-probe idle
 //!
 //! `--check-only` reads what the place offers and changes nothing: no
@@ -50,7 +50,7 @@ fn main() {
         #[cfg(target_os = "linux")]
         Some("probe") => probe::run(args.iter().any(|a| a == "--check-only"), &arg(&args, "--dir").unwrap_or_else(|| "/var/tmp/fpac-probe".into())),
         Some("path") => path::run(&host, port, &tag),
-        Some("ranges") => path::ranges(&host, port, &tag, arg(&args, "--count").and_then(|c| c.parse().ok()).unwrap_or(1000).min(100_000)),
+        Some("ranges") => path::ranges(&host, port, &tag, arg(&args, "--count").and_then(|c| c.parse().ok()).unwrap_or(1000).min(100_000), args.iter().any(|a| a == "--diagnose")),
         Some("conformance") => {
             let mut remote = fpac_remote::Remote::new(&host, port);
             let cases = fpac_testkit::conformance::run(&mut remote, &tag);

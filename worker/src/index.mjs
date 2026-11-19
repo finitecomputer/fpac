@@ -103,7 +103,7 @@ export class FpacRemote extends WorkerEntrypoint {
     const named = NAME.exec(name);
     if (!named) return text(400, "a name outside the grammar\n");
     const key = `disks/${disk}/${name}`;
-    if (request.method === "GET") return get(this.env.DISKS, key, request.headers.get("range"));
+    if (request.method === "GET") return get(this.env.DISKS, key, request.headers.get("range"), request.headers.get("x-fpac-diagnose") === "sha256");
     if (request.method === "PUT") {
       if (named[1] !== String(epoch)) return text(403, "a put names another life's epoch\n");
       return put(this.env.DISKS, key, request);
@@ -112,7 +112,11 @@ export class FpacRemote extends WorkerEntrypoint {
   }
 }
 
-async function get(bucket, key, range) {
+// `diagnose`: the stand-in's own diagnostic, outside the contract. The
+// range is read whole here and sent with the SHA-256 of what was sent
+// (`x-fpac-sent-sha256`), so a wrong read can be put on R2's side of the
+// handler or on the path from the handler to the guest.
+async function get(bucket, key, range, diagnose) {
   const t0 = Date.now();
   if (range === null) {
     const o = await bucket.get(key);
@@ -134,6 +138,11 @@ async function get(bucket, key, range) {
   if (o === null) return text(404, "absent\n");
   if (offset >= o.size && o.size > 0) return text(416, "the range starts past the end\n");
   const length = Math.max(0, Math.min(Number(r[2]), o.size - 1) - offset + 1);
+  if (diagnose) {
+    const bytes = await o.arrayBuffer();
+    const sent = hex(await crypto.subtle.digest("SHA-256", bytes));
+    return new Response(bytes, { status: 206, headers: { "content-length": String(bytes.byteLength), "content-range": `bytes ${offset}-${offset + length - 1}/${o.size}`, "server-timing": timing(t0), "x-fpac-sent-sha256": sent } });
+  }
   return new Response(o.body, { status: 206, headers: { "content-length": String(length), "content-range": `bytes ${offset}-${offset + length - 1}/${o.size}`, "server-timing": timing(t0) } });
 }
 
