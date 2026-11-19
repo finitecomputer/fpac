@@ -262,7 +262,9 @@ pub fn ranges(host: &str, port: u16, tag: &str, count: usize, diagnose: bool) ->
                         wrong.push(format!("{}; what the handler sent was {}; what arrived was {} it sent", mismatch(off, b, &object), if sent_right { "right" } else { "already wrong" }, if arrived_as_sent { "what" } else { "not what" }));
                     }
                     if !sent_right && got_right {
-                        failed.push(format!("{off}+{size}: arrived right, but the handler named another checksum"));
+                        let named = if sent.is_empty() { "none".to_string() } else { sent[..16.min(sent.len())].to_string() };
+                        let names: Vec<&str> = h.headers.iter().map(|(n, _)| n.as_str()).collect();
+                        failed.push(format!("{off}+{size}: arrived right, but the handler named checksum {named}…; the answer's headers: {names:?}"));
                     }
                     if h.close {
                         match TcpStream::connect((host, port)) {
