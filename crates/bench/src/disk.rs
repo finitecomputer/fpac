@@ -45,6 +45,8 @@ pub struct Krun {
     epoch: u64,
     life: Option<(String, Running)>,
     head: Option<fpac_remote::Head>,
+    /// Leave the folder when done (a disk another run made).
+    keep: bool,
 }
 
 impl Krun {
@@ -53,15 +55,46 @@ impl Krun {
         let _ = std::fs::remove_dir_all(&dir);
         let root = dir.join("remote");
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-        Ok(Krun { image: image.to_string(), dir, root, volume, epoch: 0, life: None, head: None })
+        Ok(Krun { image: image.to_string(), dir, root, volume, epoch: 0, life: None, head: None, keep: false })
     }
 
+}
+
+impl Krun {
+    /// A disk the folder in `root` already holds (`root/<disk>/e*/…`), its
+    /// head taken from its newest checkpoint: to look inside a disk a run
+    /// left behind. Nothing is deleted when it ends.
+    pub fn existing(image: &str, root: &Path) -> Result<Krun, String> {
+        let disk = root.join("disk");
+        let mut newest: Option<(u64, u64)> = None;
+        let mut epochs = 0;
+        for e in std::fs::read_dir(&disk).map_err(|e| format!("{}: {e}", disk.display()))?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(epoch) = name.strip_prefix('e').and_then(|x| x.parse::<u64>().ok()) else { continue };
+            epochs = epochs.max(epoch);
+            for o in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                let o = o.file_name().to_string_lossy().to_string();
+                if let Some(seq) = o.strip_prefix('c').and_then(|x| x.parse::<u64>().ok()) {
+                    if newest.is_none_or(|n| (epoch, seq) > n) {
+                        newest = Some((epoch, seq));
+                    }
+                }
+            }
+        }
+        let (ce, cs) = newest.ok_or("no checkpoint in the folder")?;
+        let body = std::fs::read(disk.join(format!("e{ce}/c{cs}"))).map_err(|e| e.to_string())?;
+        let head = fpac_remote::Head { epoch: ce, checkpoint: Some(fpac_remote::CheckpointRef { epoch: ce, seq: cs, sum: fpac_remote::sha256(&body) }) };
+        let dir = root.parent().ok_or("a root has a parent")?.to_path_buf();
+        Ok(Krun { image: image.to_string(), dir, root: root.to_path_buf(), volume: 20_000 << 20, epoch: epochs, life: None, head: Some(head), keep: true })
+    }
 }
 
 impl Drop for Krun {
     fn drop(&mut self) {
         let _ = self.kill();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 

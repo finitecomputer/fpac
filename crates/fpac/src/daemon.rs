@@ -35,8 +35,11 @@ const PACK_RANGE_BYTES: u64 = 4 << 20;
 const PACK_FETCHES: usize = 8;
 /// Opening may wait this long for an unavailable remote.
 const OPEN_MS_MAX: u64 = 60_000;
-/// How long the unmount waits for the last user of `--dir` to leave.
-const UMOUNT_MS_MAX: u64 = 10_000;
+/// How long the unmount waits for the last user of `--dir` to leave;
+/// past it the file system is frozen instead, which makes the device
+/// consistent with files still open (a sleep's caller stops its programs
+/// first; this is the guard if one is left).
+const UMOUNT_MS_MAX: u64 = 2_000;
 /// The kernel's writeback in the guest (docs/contract.md, the loss
 /// window): a page only written goes to the device within 5 s, not
 /// Linux's default 30 s, and the flusher wakes every second.
@@ -205,10 +208,12 @@ fn open_store(host: &str, port: u16) -> Result<(Store, u64, String, bool), Strin
     Err(format!("the remote is unavailable: {last}"))
 }
 
-/// Fetches the pack this life opened with, `PACK_FETCHES` ranges at once,
-/// installing each as it arrives.
-fn fetch_pack(disk: &Disk, t0: Instant) {
-    let Some((name, pr)) = disk.inner.lock().unwrap().store.pack_to_fetch() else { return };
+/// The pack this life opened with: its header, fetched before the mount
+/// (one round trip, which the mount's first read would have taken as a
+/// miss anyway), its extents marked as coming so a read of one waits for
+/// it rather than fetching it twice. None when there is no pack.
+fn pack_header(disk: &Disk, t0: Instant) -> Option<(String, fpac_format::PackHeader)> {
+    let (name, pr) = disk.inner.lock().unwrap().store.pack_to_fetch()?;
     let mut r = disk.remote();
     let mut head = vec![0u8; fpac_store::PACK_HEADER_FETCH_BYTES];
     let header = match r.get_range(&name, 0, &mut head) {
@@ -216,13 +221,23 @@ fn fetch_pack(disk: &Disk, t0: Instant) {
         other => Err(StoreError::Unavailable(format!("{other:?}"))),
     };
     disk.give_back(r);
-    let h = match header {
-        Ok(h) => h,
+    match header {
+        Ok(h) => {
+            disk.expect_pack(h.entries.iter().map(|(e, _)| *e));
+            event(t0, "pack-header", json!({ "extents": h.entries.len() }));
+            Some((name, h))
+        }
         Err(e) => {
             event(t0, "pack-skipped", json!({ "why": e.to_string() }));
-            return;
+            None
         }
-    };
+    }
+}
+
+/// Fetches the pack's extents, PACK_FETCHES ranges at once, installing
+/// each range as it arrives; whatever did not arrive stops being waited
+/// for at the end.
+fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader) {
     let ranges = Store::pack_ranges(&h, PACK_RANGE_BYTES);
     let installed = std::sync::atomic::AtomicU32::new(0);
     for chunk in ranges.chunks(PACK_FETCHES) {
@@ -241,10 +256,15 @@ fn fetch_pack(disk: &Disk, t0: Instant) {
                             installed.fetch_add(k, Ordering::Relaxed);
                         }
                     }
+                    // this range's extents are no longer coming
+                    let first = ((off - h.len() as u64) / EXTENT_BYTES as u64) as usize;
+                    let count = (len / EXTENT_BYTES as u64) as usize;
+                    disk.arrived(h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
                 });
             }
         });
     }
+    disk.arrived(h.entries.iter().map(|(e, _)| *e));
     event(t0, "pack", json!({ "extents": h.entries.len(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
 }
 
@@ -260,6 +280,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
             "misses": disk.stats.misses.load(Ordering::Relaxed), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
+            "syncs": disk.stats.syncs.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
         });
         let tmp = state.join("status.json.tmp");
@@ -289,10 +310,11 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> 
     let disk = Arc::new(Disk::new(store, cache, host, port));
     let progress = Arc::new(Progress::default());
     // the pack, beside the mount
-    let pack = {
+    // the pack's header before the mount; its extents beside it
+    if let Some((name, h)) = pack_header(&disk, t0) {
         let d = disk.clone();
-        std::thread::spawn(move || fetch_pack(&d, t0))
-    };
+        std::thread::spawn(move || fetch_pack(&d, t0, name, h));
+    }
     let flusher = {
         let (d, p, w) = (disk.clone(), progress.clone(), status_writer(state.to_path_buf(), t0));
         std::thread::spawn(move || flush::run(d, p, w))
@@ -317,21 +339,28 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> 
     }
     linux::mount_ext4(&lo.path, dir).map_err(|e| e.to_string())?;
     event(t0, "mounted", json!({ "dir": dir }));
-    let _ = pack;
     // until SIGTERM or SIGINT
     let mut sig: libc::c_int = 0;
     // SAFETY: sigwait on the set this thread blocked.
     unsafe { libc::sigwait(&signals, &mut sig) };
     event(t0, "signal", json!({ "signal": sig }));
     let unmounted = linux::umount(dir, Duration::from_millis(UMOUNT_MS_MAX));
-    event(t0, "ext4-unmounted", json!({ "ok": unmounted.is_ok(), "error": unmounted.err().map(|e| e.to_string()) }));
-    let _ = lo.detach();
+    let ok = unmounted.is_ok();
+    event(t0, "ext4-unmounted", json!({ "ok": ok, "error": unmounted.err().map(|e| e.to_string()) }));
+    if ok {
+        let _ = lo.detach();
+    } else {
+        let frozen = linux::freeze(dir);
+        event(t0, "ext4-frozen", json!({ "ok": frozen.is_ok(), "error": frozen.err().map(|e| e.to_string()) }));
+    }
     progress.stop();
     let _ = flusher.join();
     let last = flush::last(&disk, &progress).map_err(|e| e.to_string());
     status_writer(state.to_path_buf(), t0)(&disk, &progress);
     event(t0, "flushed", json!({ "last": last.as_ref().ok(), "error": last.as_ref().err() }));
-    let _ = fuse.unmount();
+    if ok {
+        let _ = fuse.unmount();
+    }
     event(t0, "exit", json!({}));
     last.map(|_| ())
 }

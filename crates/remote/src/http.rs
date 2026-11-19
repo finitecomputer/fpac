@@ -87,7 +87,15 @@ impl<S: Read + Write> Conn<S> {
             self.end -= self.start;
             self.start = 0;
         }
-        let n = self.stream.read(&mut self.buf[self.end..])?;
+        // A signal may interrupt a read; it is read again (bounded: a
+        // hundred interruptions in a row is a bug, not a signal).
+        let mut tries = 0;
+        let n = loop {
+            match self.stream.read(&mut self.buf[self.end..]) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 100 => tries += 1,
+                other => break other?,
+            }
+        };
         if n == 0 {
             return Err(HttpError::Closed);
         }

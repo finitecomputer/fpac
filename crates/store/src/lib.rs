@@ -177,6 +177,10 @@ pub struct Store {
     fenced: bool,
     boot: Vec<u64>,
     boot_seen: BTreeSet<u64>,
+    /// Extents this life's cuts carried, the most recent last (each once):
+    /// what the next boot is likely to read that this boot did not (a
+    /// database's pages, a log's tail).
+    written: std::collections::VecDeque<u64>,
     recording: bool,
     opened: Opened,
 }
@@ -216,6 +220,7 @@ impl Store {
             fenced: false,
             boot: Vec::new(),
             boot_seen: BTreeSet::new(),
+            written: std::collections::VecDeque::new(),
             recording: false,
             opened: Opened { replayed: 0, extents_mapped: 0, pack: None },
         };
@@ -664,6 +669,18 @@ impl Store {
                     if self.local.get(e) == Some(&Local::Shipping(q)) {
                         self.set_local(*e, Some(Local::Clean));
                     }
+                    if !loc.is_zero() {
+                        // the most recent PACK_EXTENTS_MAX, each once,
+                        // the newest last (bounded: one removal in a
+                        // list of at most PACK_EXTENTS_MAX)
+                        if let Some(i) = self.written.iter().position(|x| x == e) {
+                            self.written.remove(i);
+                        }
+                        if self.written.len() == PACK_EXTENTS_MAX as usize {
+                            self.written.pop_front();
+                        }
+                        self.written.push_back(*e);
+                    }
                 }
                 self.segments.insert(SegId { epoch: self.epoch, seq: q }, s.link.sum);
                 self.applied_end = s.link;
@@ -723,13 +740,21 @@ impl Store {
         self.checkpoint_ref = Some(*cr);
     }
 
-    /// A pack of the extents the boot read, in order, that are clean in
-    /// the cache (their bytes the map's): one object for the next wake to
-    /// fetch. Its name follows the last segment applied.
+    /// A pack for the next wake: the extents this boot read, in the order
+    /// it read them, then those this life wrote, newest first (the next
+    /// boot reads what this life left: its databases, its logs), each once,
+    /// each clean in
+    /// the cache (its bytes the map's), up to PACK_EXTENTS_MAX. One object
+    /// for the next wake to fetch.
     pub fn pack(&mut self, cache: &mut dyn CacheGate) -> Result<Option<Outgoing>, StoreError> {
         let seq = self.next_pack;
         let mut images: Vec<(u64, Vec<u8>)> = Vec::new();
-        for &e in &self.boot {
+        let mut taken = BTreeSet::new();
+        let order: Vec<u64> = self.boot.iter().chain(self.written.iter().rev()).copied().collect();
+        for e in order {
+            if images.len() == PACK_EXTENTS_MAX as usize || !taken.insert(e) {
+                continue;
+            }
             if self.local.get(&e) != Some(&Local::Clean) {
                 continue;
             }

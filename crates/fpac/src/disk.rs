@@ -23,6 +23,9 @@ pub const CONNECTIONS_MAX: usize = 32;
 /// How long a write waits for a cut when too much is unsent, per wait;
 /// it waits again until the flusher cuts.
 const FULL_WAIT_MS: u64 = 200;
+/// How long a read waits for the pack to bring its extent, at most; past
+/// it the read fetches the extent itself.
+const PACK_WAIT_MS: u64 = 3000;
 /// Tries of one read or write, past which it fails (EIO): a fetch that
 /// moved under it, or a remote that stays down.
 const OP_TRIES_MAX: u32 = 8;
@@ -72,6 +75,9 @@ pub struct Stats {
     pub fetch_retries: AtomicU64,
     pub read_errors: AtomicU64,
     pub full_waits: AtomicU64,
+    /// The kernel's fsyncs of the file (ext4's journal commits and the
+    /// programs' syncs above it, as they reach the device).
+    pub syncs: AtomicU64,
 }
 
 pub struct Disk {
@@ -83,11 +89,35 @@ pub struct Disk {
     port: u16,
     pub stats: Stats,
     pub fenced: AtomicBool,
+    /// Extents the pack is bringing: a read of one waits for it (at most
+    /// PACK_WAIT_MS) rather than fetching it twice.
+    coming: Mutex<std::collections::BTreeSet<u64>>,
+    came: Condvar,
 }
 
 impl Disk {
     pub fn new(store: Store, cache: FileCache, host: &str, port: u16) -> Disk {
-        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false) }
+        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new() }
+    }
+
+    pub fn expect_pack(&self, extents: impl Iterator<Item = u64>) {
+        self.coming.lock().unwrap().extend(extents);
+    }
+
+    pub fn arrived(&self, extents: impl Iterator<Item = u64>) {
+        let mut c = self.coming.lock().unwrap();
+        for e in extents {
+            c.remove(&e);
+        }
+        self.came.notify_all();
+    }
+
+    /// Waits while the pack is bringing `extent`, at most PACK_WAIT_MS.
+    fn wait_for_pack(&self, extent: u64) {
+        let c = self.coming.lock().unwrap();
+        if c.contains(&extent) {
+            let _ = self.came.wait_timeout_while(c, Duration::from_millis(PACK_WAIT_MS), |c| c.contains(&extent)).unwrap();
+        }
     }
 
     /// A connection from the pool, or a new one.
@@ -144,6 +174,7 @@ impl Disk {
 
     /// One whole extent into `buf`.
     pub fn read_extent(&self, extent: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        self.wait_for_pack(extent);
         let mut last = None;
         for _ in 0..OP_TRIES_MAX {
             let plan = {
@@ -166,6 +197,7 @@ impl Disk {
 
     /// `data` at `offset` within one extent.
     pub fn write_extent(&self, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
+        self.wait_for_pack(extent);
         // Bounded: a few fetches, and waits for cuts while the store is
         // full (the flusher cuts at least once a second).
         let mut fetches = 0;
@@ -261,6 +293,7 @@ impl Backing for Disk {
     /// window, docs/contract.md). Every cut is a whole moment of the
     /// device, so the order ext4's journal relies on holds in the store.
     fn sync(&self) -> Result<(), BackingError> {
+        self.stats.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

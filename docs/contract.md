@@ -36,12 +36,33 @@ turns out closed before any answer arrived. Every call is safe to repeat.
 
 ### `GET /open`
 
-Answers `200` with an empty body and two headers:
+Answers `200` with an empty body and four headers:
 
 - `x-fpac-disk`: the disk's name.
 - `x-fpac-epoch`: this life's epoch, a decimal integer, at least 1.
+- `x-fpac-volume-bytes`: the volume's size.
+- `x-fpac-head`: the disk's head, or `none` for a new disk: one line,
+  `<epoch> <checkpoint epoch> <checkpoint seq> <sha256 hex>`, or
+  `<epoch> - - -` for a disk with no checkpoint yet. The head's epoch is
+  older than this life's. The route answers it from what the platform
+  gave it at the start: no storage read.
 
-(Phase P3 adds the head: the checkpoint this life opens from.)
+### `POST /head`
+
+The body is a head's line (as above) for this life. The platform moves
+the disk's head only by the head's rules (`fpac_store::head::decide`):
+only the running life may post; a new life may name any checkpoint (it
+opened from the old head and is the only writer); within a life the
+checkpoint only moves forward. Answers:
+
+- `200` with `x-fpac-head-answer: taken`, or `same` (the same head again:
+  an earlier post whose answer was lost);
+- `409` with the reason: another life's head, an older checkpoint, the
+  same checkpoint with another body, a checkpoint from a later life.
+
+A life posts its head before it ships anything, so a life that never
+posted one shipped nothing, and an open replays one life's segments only:
+the head life's, after the chain's end its checkpoint covers.
 
 ### Object names
 
@@ -113,7 +134,7 @@ arrives:
 
 ### Conformance
 
-`fpac-testkit::conformance::run` is the suite. Every remote answers all
+`fpac-testkit::conformance::run` is the suite (17 cases). Every remote answers all
 of it: the folder remote in this workspace's tests, the stand-in Worker
 from inside a guest (`fpac-probe conformance`), and later the platform's
 own route in its own end-to-end tests.
@@ -130,6 +151,11 @@ own route in its own end-to-end tests.
 10. An absent name streams as absent.
 11. A put into another life's epoch is refused (`403`).
 12. An empty object round-trips.
+13. This life's head is taken.
+14. The same head again is the same.
+15. A later checkpoint of this life is taken.
+16. The same checkpoint with another body is refused (`409`).
+17. A head from a life that isn't running is refused (`409`).
 
 ## 2. The guest's promise
 
@@ -137,12 +163,17 @@ own route in its own end-to-end tests.
   loop device over one FUSE file. `statfs` says ext4; `/proc/self/mountinfo`
   shows ext4 on `/dev/loopN`. Programs that check their filesystem (SQLite
   in WAL mode, for one) see what they see on a local disk.
-- **fsync returns when the data is on the container's own disk**, as on
-  any local disk. The remote is about a second behind (`flush_ms`).
-- **What a crash may lose:** writes a program synced in the last flush
-  interval plus the put in flight (about a second); writes it never
-  synced, the kernel's writeback delay as well (set to 5 s in the guest).
-  Nothing older.
+- **fsync returns at once.** The container's own disk dies with the
+  container, so syncing the cache file would protect nothing: what
+  protects a write is the next cut reaching the store, about a second
+  later (`FLUSH_MS`). Every cut is a whole moment of the device (it takes
+  every write made before it, at one instant), so the order ext4's
+  journal relies on holds in the store.
+- **What a crash may lose:** writes made in the last flush interval plus
+  the puts in flight (about a second, more while the store is slow);
+  writes a program never synced, the kernel's writeback delay as well (the
+  daemon sets it to 5 s in the guest). Nothing older: a cut whose
+  segments have all landed is never lost.
 - **What R2 holds is always a real moment of the disk**: the disk as it
   stood at some flush, as after a power cut at that instant. ext4 replays
   its journal and SQLite its WAL, as after a power cut.
@@ -150,9 +181,9 @@ own route in its own end-to-end tests.
 ## 3. The platform's part
 
 - It mints the epoch at each start, larger than any earlier, and hands
-  the route the disk and the epoch.
-- It keeps the head (the current checkpoint) in its own state, and moves
-  it only forward (design.md, The head).
+  the route the disk, the epoch, the volume and the head.
+- It keeps the head in its own state, as typed columns, and moves it only
+  by the head's rules.
 - It deletes objects no kept checkpoint names, at its own pace, never in
   reaction to a guest's call.
 - It registers the intercept before the container starts, where the

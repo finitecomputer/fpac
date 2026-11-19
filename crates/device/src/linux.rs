@@ -398,6 +398,23 @@ pub fn mount_ext4(device: &Path, target: &Path) -> Result<(), DeviceError> {
     }
 }
 
+/// `FIFREEZE`: the file system at a mount point flushes everything and
+/// stops taking writes, so the device under it holds a consistent file
+/// system even while files there stay open.
+const FIFREEZE: libc::Ioctl = 0xC004_5877u32 as libc::Ioctl;
+
+/// Freezes the file system mounted at `dir` (see FIFREEZE).
+pub fn freeze(dir: &Path) -> Result<(), DeviceError> {
+    let d = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(dir).map_err(os(format!("open {}", dir.display())))?;
+    // SAFETY: an ioctl with an int argument on a descriptor we own.
+    let r = unsafe { libc::ioctl(d.as_raw_fd(), FIFREEZE, 0) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(last(format!("FIFREEZE {}", dir.display())))
+    }
+}
+
 /// `statfs`'s type for `path`: 0xEF53 is ext4.
 pub fn fs_type(path: &Path) -> Result<u64, DeviceError> {
     // SAFETY: statfs into a zeroed struct we own.

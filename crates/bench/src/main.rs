@@ -586,6 +586,17 @@ fn main() {
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),
         (Some("reset"), _) => reset(),
         (Some("engine"), _) => krun::list(),
+        // A disk a run left in a folder, mounted in a krun guest, and a
+        // script run against it (`--root <folder> --script <sh>`).
+        (Some("inspect"), "krun") => (|| {
+            let root = PathBuf::from(flag(&args, "--root").ok_or("--root")?);
+            let mut p = disk::Krun::existing(&krun_image()?.0, &root)?;
+            disk::Place::start(&mut p)?;
+            let m = disk::mount(&p)?;
+            let (code, out) = disk::Place::sh(&p, &flag(&args, "--script").unwrap_or_else(|| "du -sh /data".into()))?;
+            Ok(json!({ "mount": m["mounted"], "code": code, "out": out }))
+        })(),
+        (Some("engine-destroy"), _) => args.get(2).ok_or_else(|| "a name".to_string()).and_then(|n| krun::destroy(n)).map(|_| json!("gone")),
         _ => Err("usage: fpac-bench stage | probe --place krun|docker|cloudflare | path --place krun|cloudflare [--write] | deploy | inventory <label> | reset".into()),
     };
     match result {
