@@ -210,6 +210,79 @@ fn joined(mut check: Value, records: &Value, path: &str, since: u64) -> Value {
     check
 }
 
+/// Hermes' wakes on FPAC and on the engine's own disk, from the harness's
+/// JSON lines: per place, the first reply and the warm turn over the wakes
+/// after the first (median, range), the misses before the first reply,
+/// the fsyncs per boot and per turn, the journal modes, the file system.
+fn hermes_evidence(args: &[String]) -> Result<Value, String> {
+    let files: Vec<&String> = args.windows(2).filter(|w| w[0] == "--jsonl").map(|w| &w[1]).collect();
+    let mut rows: Vec<Value> = Vec::new();
+    for f in files {
+        let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+        rows.extend(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v.get("place").is_some()));
+    }
+    let stat = |mut v: Vec<f64>| -> Value {
+        v.sort_by(|a, b| a.total_cmp(b));
+        if v.is_empty() {
+            return Value::Null;
+        }
+        json!({ "n": v.len(), "median": v[v.len() / 2], "min": v[0], "max": v[v.len() - 1] })
+    };
+    let mut out = serde_json::Map::new();
+    for place in ["fpac", "local"] {
+        let mine: Vec<&Value> = rows.iter().filter(|r| r["place"] == json!(place)).collect();
+        let later: Vec<&&Value> = mine.iter().filter(|r| r["wake"].as_u64().unwrap_or(0) >= 1).collect();
+        let f = |k: &str| later.iter().filter_map(|r| r[k].as_f64()).collect::<Vec<_>>();
+        let syncs_boot: Vec<f64> = later.iter().filter_map(|r| r["status_after_first_reply"]["syncs"].as_f64()).collect();
+        let syncs_turn: Vec<f64> = later.iter().filter_map(|r| Some(r["status_after_warm_turn"]["syncs"].as_f64()? - r["status_after_first_reply"]["syncs"].as_f64()?)).collect();
+        let rows_lean: Vec<Value> = mine
+            .iter()
+            .map(|r| {
+                let mut r = (*r).clone();
+                if let Some(o) = r.as_object_mut() {
+                    o.remove("fpac_log");
+                    o.remove("epoch0_ms");
+                }
+                r
+            })
+            .collect();
+        out.insert(
+            place.into(),
+            json!({
+                "wakes": mine.len(),
+                "first_reply_ms_after_the_first_wake": stat(f("first_reply_ms")),
+                "warm_reply_ms_after_the_first_wake": stat(f("warm_reply_ms")),
+                "ready_ms_after_the_first_wake": stat(f("ready_ms")),
+                "misses_before_first_reply_after_the_first_wake": later.iter().map(|r| r["status_after_first_reply"]["misses"].clone()).collect::<Vec<_>>(),
+                "fsyncs_per_boot": stat(syncs_boot),
+                "fsyncs_per_warm_turn": stat(syncs_turn),
+                "file_system": mine.first().map(|r| r["mountinfo"].clone()),
+                "journal_modes": mine.first().map(|r| r["journal"].clone()),
+                "rows": rows_lean,
+            }),
+        );
+    }
+    // The fake API's agent name is a profile folder under /data/hermes:
+    // named as a role, never as it was minted.
+    let text = Value::Object(out).to_string();
+    let mut scrubbed = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("/profiles/") {
+        let after = &rest[i + "/profiles/".len()..];
+        let end = after.find('/').unwrap_or(0);
+        scrubbed.push_str(&rest[..i]);
+        scrubbed.push_str("/profiles/<agent>");
+        rest = &after[end..];
+    }
+    scrubbed.push_str(rest);
+    let out: Value = serde_json::from_str(&scrubbed).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "what": "the real Hermes image (fragment's at bc00639ba) in krun microVMs, 2 vCPU, 6 GiB; the Docker lane's fake fragment API and instant scripted model behind the engine's intercepts (STAND-INS); on FPAC: /data mounted by fpac before the image's own entrypoint (the binary fetched over the intercepted host), the folder remote on this machine (a STAND-IN for the route and for R2), the disk made once from the tiny image; on local: the engine's own data disk, emptied first. fsyncs are the kernel's fsyncs of the FUSE file (ext4's journal commits and the programs' syncs as they reach the device); misses are counted 1.1 s after the reply",
+        "harness": "a scratch test in a copy of fragment's images workspace, outside this repository (it needs fragment's fake API); its rows are read here as they are",
+        "places": out,
+    }))
+}
+
 /// A disk scenario (disk.rs) in a place: a new disk each run, its objects
 /// deleted after (Cloudflare's; krun's folder goes with its run).
 fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, String> {
@@ -596,12 +669,16 @@ fn main() {
             let (code, out) = disk::Place::sh(&p, &flag(&args, "--script").unwrap_or_else(|| "du -sh /data".into()))?;
             Ok(json!({ "mount": m["mounted"], "code": code, "out": out }))
         })(),
+        // The Hermes harness's rows (a scratch test in a copy of fragment's
+        // images workspace, outside this repository: --jsonl <file>,
+        // repeated), summed up as evidence.
+        (Some("hermes"), _) => hermes_evidence(&args),
         (Some("engine-destroy"), _) => args.get(2).ok_or_else(|| "a name".to_string()).and_then(|n| krun::destroy(n)).map(|_| json!("gone")),
         _ => Err("usage: fpac-bench stage | probe --place krun|docker|cloudflare | path --place krun|cloudflare [--write] | deploy | inventory <label> | reset".into()),
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "hermes"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two
