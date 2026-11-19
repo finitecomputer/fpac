@@ -78,7 +78,13 @@ pub struct Stats {
     /// The kernel's fsyncs of the file (ext4's journal commits and the
     /// programs' syncs above it, as they reach the device).
     pub syncs: AtomicU64,
+    /// Reads that waited for the pack to bring their extent.
+    pub pack_waits: AtomicU64,
 }
+
+/// The first extents a read waited for the pack to bring, kept for the
+/// pack's event (which of them a larger pack head would have held).
+const WAITED_KEPT: usize = 16;
 
 pub struct Disk {
     pub inner: Mutex<Inner>,
@@ -91,16 +97,21 @@ pub struct Disk {
     pub fenced: AtomicBool,
     /// Extents the pack is bringing: a read of one waits for it (at most
     /// PACK_WAIT_MS) rather than fetching it twice.
-    coming: Mutex<std::collections::BTreeSet<u64>>,
+    /// The pack's extents still on their way, each with its place in the
+    /// pack.
+    coming: Mutex<std::collections::BTreeMap<u64, usize>>,
     came: Condvar,
+    /// Where in the pack the first reads that waited for it found their
+    /// extents.
+    pub waited: Mutex<Vec<usize>>,
 }
 
 impl Disk {
     pub fn new(store: Store, cache: FileCache, host: &str, port: u16) -> Disk {
-        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new() }
+        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()) }
     }
 
-    pub fn expect_pack(&self, extents: impl Iterator<Item = u64>) {
+    pub fn expect_pack(&self, extents: impl Iterator<Item = (u64, usize)>) {
         self.coming.lock().unwrap().extend(extents);
     }
 
@@ -115,8 +126,14 @@ impl Disk {
     /// Waits while the pack is bringing `extent`, at most PACK_WAIT_MS.
     fn wait_for_pack(&self, extent: u64) {
         let c = self.coming.lock().unwrap();
-        if c.contains(&extent) {
-            let _ = self.came.wait_timeout_while(c, Duration::from_millis(PACK_WAIT_MS), |c| c.contains(&extent)).unwrap();
+        if let Some(&at) = c.get(&extent) {
+            self.stats.pack_waits.fetch_add(1, Ordering::Relaxed);
+            let mut w = self.waited.lock().unwrap();
+            if w.len() < WAITED_KEPT {
+                w.push(at);
+            }
+            drop(w);
+            let _ = self.came.wait_timeout_while(c, Duration::from_millis(PACK_WAIT_MS), |c| c.contains_key(&extent)).unwrap();
         }
     }
 

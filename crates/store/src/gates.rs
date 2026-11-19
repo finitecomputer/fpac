@@ -13,6 +13,22 @@ pub trait RemoteGate {
     fn get(&mut self, name: &str, sink: &mut dyn FnMut(&[u8])) -> Result<Option<u64>, RemoteError>;
     /// Put-if-absent.
     fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError>;
+    /// The open's next reads, named at once: a gate that can fetch in
+    /// parallel may, and answer the calls that follow from what it
+    /// fetched (each with the same checks as a call of its own). Every
+    /// round trip an open waits for is about 100 ms on R2 (docs/spike.md,
+    /// P5), so the open asks for its pages, its first segment headers and
+    /// its pack's head in one round. A gate that can't ignores it.
+    fn prefetch(&mut self, _asks: &[Ask]) {}
+}
+
+/// One read an open will make.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Ask {
+    /// All of an object (`get`).
+    Whole(String),
+    /// `len` bytes from `offset` (`get_range`).
+    Range { name: String, offset: u64, len: usize },
 }
 
 impl RemoteGate for fpac_remote::Remote {

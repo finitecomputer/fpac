@@ -34,7 +34,7 @@ use fpac_format::limits::*;
 use fpac_format::{self as format, Checkpoint, Image, Link, Loc, PackRef, PageRef, SegId, Sum, GENESIS};
 use fpac_remote::{Put, RemoteError};
 
-pub use gates::{CacheGate, MemCache, RemoteGate};
+pub use gates::{Ask, CacheGate, MemCache, RemoteGate};
 pub use head::{CheckpointRef, Head};
 
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +146,8 @@ struct Shipment {
 pub struct Opened {
     pub replayed: u32,
     pub extents_mapped: u64,
+    /// Map pages the checkpoint named.
+    pub pages: u32,
     pub pack: Option<PackRef>,
 }
 
@@ -222,7 +224,7 @@ impl Store {
             boot_seen: BTreeSet::new(),
             written: std::collections::VecDeque::new(),
             recording: false,
-            opened: Opened { replayed: 0, extents_mapped: 0, pack: None },
+            opened: Opened { replayed: 0, extents_mapped: 0, pages: 0, pack: None },
         };
         let Some(head) = info.head else {
             return Ok(s);
@@ -230,7 +232,7 @@ impl Store {
         assert!(head.epoch < info.epoch, "a new life is later than the head's");
         let mut first_seq = 1;
         if let Some(cr) = head.checkpoint {
-            let c = s.load_checkpoint(remote, cr)?;
+            let c = s.fetch_checkpoint(remote, cr)?;
             if c.volume_bytes > info.volume_bytes {
                 return Err(StoreError::Corrupt(format!("the disk is {} bytes; this life was given {}", c.volume_bytes, info.volume_bytes)));
             }
@@ -239,6 +241,8 @@ impl Store {
             if c.end.epoch == head.epoch {
                 first_seq = c.end.seq + 1;
             }
+            remote.prefetch(&Self::open_asks(&c, head.epoch, first_seq));
+            s.load_pages(remote, &c, cr)?;
             s.chain_end = c.end;
             s.applied_end = c.end;
             s.pack = c.pack;
@@ -246,12 +250,13 @@ impl Store {
             s.checkpoint_ref = Some(cr);
         }
         s.replay(remote, head.epoch, first_seq)?;
-        s.opened = Opened { replayed: s.opened.replayed, extents_mapped: s.map.len() as u64, pack: s.pack };
+        let pages = s.checkpoint.as_ref().map_or(0, |c| c.pages.len() as u32);
+        s.opened = Opened { replayed: s.opened.replayed, extents_mapped: s.map.len() as u64, pages, pack: s.pack };
         assert_eq!(s.chain_end, s.applied_end, "nothing of this life is shipping yet");
         Ok(s)
     }
 
-    fn load_checkpoint(&mut self, remote: &mut dyn RemoteGate, cr: CheckpointRef) -> Result<Checkpoint, StoreError> {
+    fn fetch_checkpoint(&mut self, remote: &mut dyn RemoteGate, cr: CheckpointRef) -> Result<Checkpoint, StoreError> {
         let name = format::checkpoint_name(cr.epoch, cr.seq);
         let body = whole(remote, &name, CHECKPOINT_BYTES_MAX)?;
         if format::sha256(&body) != cr.sum {
@@ -261,6 +266,24 @@ impl Store {
         if (c.epoch, c.seq) != (cr.epoch, cr.seq) {
             return Err(StoreError::Corrupt(format!("{name} names itself otherwise")));
         }
+        Ok(c)
+    }
+
+    /// What an open reads after its checkpoint, asked for at once: every
+    /// map page, the first OPEN_SEGMENT_HEADERS segment headers a replay
+    /// may read, and the pack's head (its header and first extents,
+    /// `PACK_HEAD_FETCH_BYTES`).
+    pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: u64) -> Vec<Ask> {
+        let mut asks: Vec<Ask> = c.pages.iter().map(|p| Ask::Whole(format::page_name(p.epoch, p.seq, p.page))).collect();
+        asks.extend((first_seq..first_seq + u64::from(OPEN_SEGMENT_HEADERS)).map(|seq| Ask::Range { name: format::segment_name(SegId { epoch, seq }), offset: 0, len: SEGMENT_HEADER_BYTES_MAX as usize }));
+        if let Some(pr) = c.pack {
+            asks.push(Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES });
+        }
+        asks
+    }
+
+    fn load_pages(&mut self, remote: &mut dyn RemoteGate, c: &Checkpoint, cr: CheckpointRef) -> Result<(), StoreError> {
+        let name = format::checkpoint_name(cr.epoch, cr.seq);
         let live: BTreeMap<SegId, Sum> = c.segments.iter().copied().collect();
         // Bounded: at most PAGES_MAX pages.
         for p in &c.pages {
@@ -285,7 +308,7 @@ impl Store {
             }
         }
         self.segments = live;
-        Ok(c)
+        Ok(())
     }
 
     /// Applies life `epoch`'s segments from `first`, each following the
@@ -802,12 +825,14 @@ impl Store {
         }
     }
 
-    /// The pack's data split into ranges of about `bytes` each (whole
-    /// extents), to fetch in parallel: (offset in the object, length).
-    pub fn pack_ranges(h: &format::PackHeader, bytes: u64) -> Vec<(u64, u64)> {
+    /// The pack's data from its extent `from` on, split into ranges of
+    /// about `bytes` each (whole extents), to fetch in parallel: (offset
+    /// in the object, length).
+    pub fn pack_ranges(h: &format::PackHeader, from: u64, bytes: u64) -> Vec<(u64, u64)> {
         let per = (bytes / EXTENT_BYTES as u64).max(1);
-        let n = h.entries.len() as u64;
-        (0..n.div_ceil(per)).map(|i| (h.len() as u64 + i * per * EXTENT_BYTES as u64, (per.min(n - i * per)) * EXTENT_BYTES as u64)).collect()
+        let n = (h.entries.len() as u64).saturating_sub(from);
+        let base = h.len() as u64 + from * EXTENT_BYTES as u64;
+        (0..n.div_ceil(per)).map(|i| (base + i * per * EXTENT_BYTES as u64, (per.min(n - i * per)) * EXTENT_BYTES as u64)).collect()
     }
 
     /// Installs a fetched range of the pack: each extent whose sum the map
@@ -849,8 +874,17 @@ fn header(remote: &mut dyn RemoteGate, name: &str, buf: &mut [u8]) -> Result<Opt
     Err(StoreError::Corrupt(format!("{name}, after {FETCH_TRIES_MAX} tries: {last}")))
 }
 
-/// Bytes of a pack's object a wake fetches first, to read its header.
+/// Bytes of a pack's object that hold its header, whatever its count.
 pub const PACK_HEADER_FETCH_BYTES: usize = format::limits::PACK_HEADER_BYTES_MAX as usize;
+/// The pack's head, fetched in the open's one round: its header and, after
+/// it, its first extents, so a mount waits for no other round trip. An
+/// ext4 mount of a 20 GB disk read past the first 16 and the first 32 of
+/// them on krun (docs/spike.md, P5); 64 is 4 MiB.
+pub const PACK_HEAD_FETCH_BYTES: usize = PACK_HEADER_FETCH_BYTES + PACK_HEAD_EXTENTS as usize * EXTENT_BYTES as usize;
+pub const PACK_HEAD_EXTENTS: u32 = 64;
+/// Segment headers an open asks for with its pages: a replay's first
+/// round. A replay past them fetches its headers this many at a time.
+pub const OPEN_SEGMENT_HEADERS: u32 = 16;
 
 // Every object the store writes is one the route takes (docs/contract.md,
 // Limits): a pack over it was refused 413 on krun before this was asserted.

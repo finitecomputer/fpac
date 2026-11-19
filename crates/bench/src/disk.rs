@@ -30,7 +30,7 @@ pub trait Place {
     fn sh(&self, script: &str) -> Result<(i64, String), String>;
     /// Ends the guest at once, as a crash would.
     fn kill(&mut self) -> Result<(), String>;
-    fn what(&self) -> &'static str;
+    fn what(&self) -> String;
     /// The disk's objects in the store: how many, how many bytes.
     fn objects(&self) -> Value;
     /// Deletes the disk's objects (bulk test data).
@@ -98,6 +98,12 @@ impl Drop for Krun {
     }
 }
 
+/// `FPAC_FOLDER_OBJECT_MS`: the folder remote's delay on each object call
+/// (`Folder::object_ms`), named in every result it shapes.
+fn object_ms() -> u64 {
+    std::env::var("FPAC_FOLDER_OBJECT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 impl Place for Krun {
     fn start(&mut self) -> Result<Value, String> {
         self.kill()?;
@@ -107,6 +113,7 @@ impl Place for Krun {
         let listener = std::os::unix::net::UnixListener::bind(&sock).map_err(|e| e.to_string())?;
         let mut folder = Folder::new(&self.root, "disk", self.epoch);
         folder.volume_bytes = self.volume;
+        folder.object_ms = object_ms();
         *folder.head.lock().unwrap() = self.head;
         let remote = folder.start(Listen::Unix(listener));
         let name = format!("fpac-disk-{}", self.epoch);
@@ -132,8 +139,12 @@ impl Place for Krun {
         Ok(())
     }
 
-    fn what(&self) -> &'static str {
-        "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine: a STAND-IN for the route and for R2"
+    fn what(&self) -> String {
+        let delay = match object_ms() {
+            0 => String::new(),
+            ms => format!(", each object call delayed {ms} ms (as R2's)"),
+        };
+        format!("a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine{delay}: a STAND-IN for the route and for R2")
     }
 
     fn objects(&self) -> Value {
@@ -181,8 +192,8 @@ impl Place for Cloudflare {
         net::worker(self.c.host(), &self.key, "POST", "/destroy", &json!({}), Duration::from_secs(60)).map(|_| ())
     }
 
-    fn what(&self) -> &'static str {
-        "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
+    fn what(&self) -> String {
+        "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2".into()
     }
 
     fn objects(&self) -> Value {
@@ -459,6 +470,7 @@ pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64) -> Result<Val
         p.kill()?;
         lives.push(json!({
             "start": st, "mount_events_ms": { "opened": m["opened"]["ms"], "fuse": m["fuse"]["ms"], "loop": m["loop"]["ms"], "mounted": m["mounted"]["ms"], "pack": m["pack"]["ms"] },
+            "opened": m["opened"], "mounted": m["mounted"], "pack_header": m["pack-header"],
             "pack": m["pack"], "boot_read_ok": code == 0, "boot_read_ms": boot_read, "misses_after_boot_read": status["misses"],
             "wake_to_boot_read_ms": wake_ms, "far_1mib_read_ms": far, "sleep_ms": sl["sleep_ms"],
         }));
@@ -498,7 +510,7 @@ sqlite3 b.sqlite "pragma journal_mode=wal; create table f(id integer primary key
 t=$(now); sqlite3 b.sqlite < /tmp/full.sql; echo "sqlite_10k_txns_full $(ms $t)"
 t=$(now); sqlite3 b.sqlite < /tmp/normal.sql; echo "sqlite_10k_txns_normal $(ms $t)"
 t=$(now); sqlite3 b.sqlite "with recursive c(x) as (select 1 union all select x+1 from c where x < 1000000) insert into big(v) select hex(randomblob(32)) from c;"; echo "sqlite_1m_rows_one_txn $(ms $t)"
-t=$(now); sqlite3 b.sqlite "select count(*) from (with recursive c(x) as (select 1 union all select x+1 from c where x < 100000) select (select v from big where id = 1 + abs(random()) % 1000000) from c);" > /dev/null; echo "sqlite_100k_point_reads_warm $(ms $t)"
+t=$(now); sqlite3 b.sqlite "select sum(length(v)) from (with recursive c(x) as (select 1 union all select x+1 from c where x < 100000) select (select v from big where id = 1 + abs(random()) % 1000000) as v from c);" > /dev/null; echo "sqlite_100k_point_reads_warm $(ms $t)"
 echo "journal_mode $(sqlite3 b.sqlite 'pragma journal_mode')"
 rm -f b.sqlite*"#;
 

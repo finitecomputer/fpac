@@ -20,7 +20,7 @@ use fpac_device::linux::{self, FuseMount, Loop};
 use fpac_device::serve::{Backing, File};
 use fpac_format::limits::EXTENT_BYTES;
 use fpac_remote::Remote;
-use fpac_store::{OpenInfo, Store, StoreError};
+use fpac_store::{Ask, OpenInfo, Store, StoreError};
 use serde_json::{json, Value};
 
 use crate::disk::{self, Disk, FileCache};
@@ -120,71 +120,137 @@ fn lock_memory() -> bool {
     unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) == 0 && libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) == 0 }
 }
 
-/// Segment headers a replay fetches at once.
-const REPLAY_FETCHES: u64 = 16;
+/// Fetches at once in the open's round (docs/design.md, A wake): a
+/// 20 GB ext4 spreads its metadata over 22 map pages, with 16 segment
+/// headers and the pack's head that is 39 asks, and each round trip to R2
+/// is about 100 ms, so all of them go at once.
+const OPEN_FETCHES: usize = 64;
 
-/// The remote for an open: a replay reads segment headers one after
-/// another, each a round trip (about 100 ms to R2); this fetches the next
-/// REPLAY_FETCHES headers at once on the first ask and answers from them.
+/// Runs `jobs` on at most `workers` threads, in order of start, each
+/// answer in its job's place.
+fn pool<T: Send, R: Send>(jobs: Vec<T>, workers: usize, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let n = jobs.len();
+    let jobs = std::sync::Mutex::new(jobs.into_iter().enumerate().collect::<std::collections::VecDeque<_>>());
+    let out = std::sync::Mutex::new((0..n).map(|_| None).collect::<Vec<Option<R>>>());
+    std::thread::scope(|s| {
+        for _ in 0..workers.min(n) {
+            s.spawn(|| {
+                // Bounded by the jobs.
+                loop {
+                    let Some((i, job)) = jobs.lock().unwrap().pop_front() else { break };
+                    let r = f(job);
+                    out.lock().unwrap()[i] = Some(r);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap().into_iter().map(|r| r.expect("every job ran")).collect()
+}
+
+/// The remote for an open. The store names its second round at once
+/// (`prefetch`: pages, the replay's first headers, the pack's head); this
+/// fetches them in parallel and answers the calls that follow from them.
+/// A replay past the asked headers fetches the next OPEN_SEGMENT_HEADERS
+/// at once on its first miss. A fetch that failed is not kept: the call
+/// that follows makes it again, directly.
 struct Prefetching<'a> {
     remote: &'a mut Remote,
     host: String,
     port: u16,
-    headers: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    fetched: std::collections::HashMap<Ask, Option<Vec<u8>>>,
+    /// Each parallel round: its asks and its time, for the open's event.
+    rounds: Vec<Value>,
+}
+
+impl Prefetching<'_> {
+    fn fetch_all(&mut self, asks: Vec<Ask>) {
+        let t = Instant::now();
+        let count = asks.len();
+        let (host, port) = (self.host.clone(), self.port);
+        let got = pool(asks.clone(), OPEN_FETCHES, |a| {
+            let mut r = Remote::new(&host, port);
+            match &a {
+                Ask::Whole(name) => {
+                    let mut body = Vec::new();
+                    r.get(name, &mut |b| body.extend_from_slice(b)).ok().map(|o| o.map(|_| body))
+                }
+                Ask::Range { name, offset, len } => {
+                    let mut b = vec![0u8; *len];
+                    r.get_range(name, *offset, &mut b).ok().map(|o| {
+                        o.map(|k| {
+                            b.truncate(k);
+                            b
+                        })
+                    })
+                }
+            }
+        });
+        let mut failed = 0;
+        for (a, g) in asks.into_iter().zip(got) {
+            match g {
+                Some(g) => {
+                    self.fetched.insert(a, g);
+                }
+                None => failed += 1,
+            }
+        }
+        self.rounds.push(json!({ "asks": count, "failed": failed, "ms": t.elapsed().as_secs_f64() * 1000.0 }));
+    }
 }
 
 impl fpac_store::RemoteGate for Prefetching<'_> {
     fn get_range(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<Option<usize>, fpac_remote::RemoteError> {
-        let seg = name.split_once("/s").and_then(|(e, n)| Some((e.to_string(), n.parse::<u64>().ok()?)));
-        if let (0, Some((epoch, seq))) = (offset, seg) {
-            if !self.headers.contains_key(name) {
-                let names: Vec<String> = (seq..seq + REPLAY_FETCHES).map(|q| format!("{epoch}/s{q}")).collect();
-                let len = buf.len();
-                let got: Vec<(String, Option<Vec<u8>>)> = std::thread::scope(|s| {
-                    let hs: Vec<_> = names
-                        .iter()
-                        .map(|n| {
-                            let (host, port) = (self.host.clone(), self.port);
-                            s.spawn(move || {
-                                let mut r = Remote::new(&host, port);
-                                let mut b = vec![0u8; len];
-                                match r.get_range(n, 0, &mut b) {
-                                    Ok(Some(k)) => {
-                                        b.truncate(k);
-                                        Some(Some(b))
-                                    }
-                                    Ok(None) => Some(None),
-                                    Err(_) => None,
-                                }
-                            })
-                        })
-                        .collect();
-                    names.iter().cloned().zip(hs.into_iter().map(|h| h.join().expect("a fetch thread"))).filter_map(|(n, r)| r.map(|r| (n, r))).collect()
-                });
-                self.headers.extend(got);
+        let ask = Ask::Range { name: name.to_string(), offset, len: buf.len() };
+        if !self.fetched.contains_key(&ask) {
+            // a replay's header past the asked ones: the next round of them
+            let seg = name.split_once("/s").and_then(|(e, n)| Some((e.to_string(), n.parse::<u64>().ok()?)));
+            if let (0, Some((epoch, seq))) = (offset, seg) {
+                let asks = (seq..seq + u64::from(fpac_store::OPEN_SEGMENT_HEADERS)).map(|q| Ask::Range { name: format!("{epoch}/s{q}"), offset: 0, len: buf.len() }).collect();
+                self.fetch_all(asks);
             }
-            // one answer per ask: a header that fails its checksum is
-            // fetched again directly
-            if let Some(h) = self.headers.remove(name) {
-                return Ok(h.map(|b| {
-                    buf[..b.len()].copy_from_slice(&b);
-                    b.len()
-                }));
-            }
+        }
+        // one answer per ask: a header that fails its checksum is
+        // fetched again directly
+        if let Some(h) = self.fetched.remove(&ask) {
+            return Ok(h.map(|b| {
+                buf[..b.len()].copy_from_slice(&b);
+                b.len()
+            }));
         }
         self.remote.get_range(name, offset, buf)
     }
 
     fn get(&mut self, name: &str, sink: &mut dyn FnMut(&[u8])) -> Result<Option<u64>, fpac_remote::RemoteError> {
+        if let Some(b) = self.fetched.remove(&Ask::Whole(name.to_string())) {
+            return Ok(b.map(|b| {
+                sink(&b);
+                b.len() as u64
+            }));
+        }
         self.remote.get(name, sink)
     }
 
     fn put(&mut self, name: &str, body: &[u8]) -> Result<fpac_remote::Put, fpac_remote::RemoteError> {
         self.remote.put(name, body)
     }
+
+    fn prefetch(&mut self, asks: &[Ask]) {
+        self.fetch_all(asks.to_vec());
+    }
 }
 
-fn open_store(host: &str, port: u16) -> Result<(Store, u64, String, bool), String> {
+/// An opened store, and what the open's round fetched that the open did
+/// not read: the pack's head, when there is a pack.
+struct Opened {
+    store: Store,
+    volume: u64,
+    disk: String,
+    fresh: bool,
+    pack_head: Option<Vec<u8>>,
+    rounds: Vec<Value>,
+}
+
+fn open_store(host: &str, port: u16) -> Result<Opened, String> {
     let t0 = Instant::now();
     let mut last = String::new();
     // Bounded by OPEN_MS_MAX.
@@ -194,9 +260,13 @@ fn open_store(host: &str, port: u16) -> Result<(Store, u64, String, bool), Strin
             Ok(o) => {
                 let fresh = o.head.is_none();
                 let info = OpenInfo { epoch: o.epoch, volume_bytes: o.volume_bytes - o.volume_bytes % EXTENT_BYTES as u64, head: o.head };
-                let mut gate = Prefetching { remote: &mut r, host: host.to_string(), port, headers: Default::default() };
+                let mut gate = Prefetching { remote: &mut r, host: host.to_string(), port, fetched: Default::default(), rounds: Vec::new() };
                 match Store::open(&mut gate, &info) {
-                    Ok(s) => return Ok((s, info.volume_bytes, o.disk, fresh)),
+                    Ok(store) => {
+                        let pack_head = store.pack_to_fetch().and_then(|(name, _)| gate.fetched.remove(&Ask::Range { name, offset: 0, len: fpac_store::PACK_HEAD_FETCH_BYTES })).flatten();
+                        let rounds = std::mem::take(&mut gate.rounds);
+                        return Ok(Opened { store, volume: info.volume_bytes, disk: o.disk, fresh, pack_head, rounds });
+                    }
                     Err(StoreError::Unavailable(e)) => last = e,
                     Err(e) => return Err(format!("the disk does not open: {e}")),
                 }
@@ -208,64 +278,74 @@ fn open_store(host: &str, port: u16) -> Result<(Store, u64, String, bool), Strin
     Err(format!("the remote is unavailable: {last}"))
 }
 
-/// The pack this life opened with: its header, fetched before the mount
-/// (one round trip, which the mount's first read would have taken as a
-/// miss anyway), its extents marked as coming so a read of one waits for
-/// it rather than fetching it twice. None when there is no pack.
-fn pack_header(disk: &Disk, t0: Instant) -> Option<(String, fpac_format::PackHeader)> {
+/// The pack this life opened with: its head (its header and first
+/// extents, fetched in the open's round, or here when that fetch failed),
+/// those extents installed at once and the rest marked as coming, so a
+/// read of one waits for it rather than fetching it twice. Answers the
+/// pack's name, header and how many extents the head held; None when
+/// there is no pack.
+fn pack_header(disk: &Disk, t0: Instant, head: Option<Vec<u8>>) -> Option<(String, fpac_format::PackHeader, u64)> {
     let (name, pr) = disk.inner.lock().unwrap().store.pack_to_fetch()?;
-    let mut r = disk.remote();
-    let mut head = vec![0u8; fpac_store::PACK_HEADER_FETCH_BYTES];
-    let header = match r.get_range(&name, 0, &mut head) {
-        Ok(Some(n)) => disk.inner.lock().unwrap().store.pack_header(&pr, &head[..n]),
-        other => Err(StoreError::Unavailable(format!("{other:?}"))),
+    let head = head.or_else(|| {
+        let mut r = disk.remote();
+        let mut b = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
+        let got = r.get_range(&name, 0, &mut b);
+        disk.give_back(r);
+        got.ok().flatten().map(|n| {
+            b.truncate(n);
+            b
+        })
+    });
+    let header = match &head {
+        Some(b) => disk.inner.lock().unwrap().store.pack_header(&pr, b),
+        None => Err(StoreError::Unavailable("the pack's head".into())),
     };
-    disk.give_back(r);
-    match header {
-        Ok(h) => {
-            disk.expect_pack(h.entries.iter().map(|(e, _)| *e));
-            event(t0, "pack-header", json!({ "extents": h.entries.len() }));
-            Some((name, h))
+    match (header, head) {
+        (Ok(h), Some(b)) => {
+            let ext = EXTENT_BYTES as usize;
+            let held = (b.len() - h.len()) / ext;
+            disk.expect_pack(h.entries.iter().enumerate().skip(held).map(|(i, (e, _))| (*e, i)));
+            let installed = {
+                let mut g = disk.inner.lock().unwrap();
+                let disk::Inner { store, cache } = &mut *g;
+                store.pack_install(cache, &h, h.len() as u64, &b[h.len()..h.len() + held * ext]).unwrap_or(0)
+            };
+            event(t0, "pack-header", json!({ "extents": h.entries.len(), "head_extents": held, "head_installed": installed }));
+            Some((name, h, held as u64))
         }
-        Err(e) => {
-            event(t0, "pack-skipped", json!({ "why": e.to_string() }));
+        (r, _) => {
+            let why = r.err().map(|e| e.to_string()).unwrap_or_default();
+            event(t0, "pack-skipped", json!({ "why": why }));
             None
         }
     }
 }
 
-/// Fetches the pack's extents, PACK_FETCHES ranges at once, installing
-/// each range as it arrives; whatever did not arrive stops being waited
-/// for at the end.
-fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader) {
-    let ranges = Store::pack_ranges(&h, PACK_RANGE_BYTES);
+/// Fetches the rest of the pack, from extent `from`, in ranges on
+/// PACK_FETCHES connections at once, installing each range as it arrives;
+/// whatever did not arrive stops being waited for at the end.
+fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader, from: u64) {
+    let ranges = Store::pack_ranges(&h, from, PACK_RANGE_BYTES);
     let installed = std::sync::atomic::AtomicU32::new(0);
-    for chunk in ranges.chunks(PACK_FETCHES) {
-        std::thread::scope(|s| {
-            for &(off, len) in chunk {
-                let (name, h, installed) = (&name, &h, &installed);
-                s.spawn(move || {
-                    let mut r = disk.remote();
-                    let mut b = vec![0u8; len as usize];
-                    let got = r.get_range(name, off, &mut b);
-                    disk.give_back(r);
-                    if let Ok(Some(n)) = got {
-                        let mut g = disk.inner.lock().unwrap();
-                        let disk::Inner { store, cache } = &mut *g;
-                        if let Ok(k) = store.pack_install(cache, h, off, &b[..n - n % EXTENT_BYTES as usize]) {
-                            installed.fetch_add(k, Ordering::Relaxed);
-                        }
-                    }
-                    // this range's extents are no longer coming
-                    let first = ((off - h.len() as u64) / EXTENT_BYTES as u64) as usize;
-                    let count = (len / EXTENT_BYTES as u64) as usize;
-                    disk.arrived(h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
-                });
+    pool(ranges, PACK_FETCHES, |(off, len)| {
+        let mut r = disk.remote();
+        let mut b = vec![0u8; len as usize];
+        let got = r.get_range(&name, off, &mut b);
+        disk.give_back(r);
+        if let Ok(Some(n)) = got {
+            let mut g = disk.inner.lock().unwrap();
+            let disk::Inner { store, cache } = &mut *g;
+            if let Ok(k) = store.pack_install(cache, &h, off, &b[..n - n % EXTENT_BYTES as usize]) {
+                installed.fetch_add(k, Ordering::Relaxed);
             }
-        });
-    }
+        }
+        // this range's extents are no longer coming
+        let first = ((off - h.len() as u64) / EXTENT_BYTES as u64) as usize;
+        let count = (len / EXTENT_BYTES as u64) as usize;
+        disk.arrived(h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
+    });
     disk.arrived(h.entries.iter().map(|(e, _)| *e));
-    event(t0, "pack", json!({ "extents": h.entries.len(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
+    event(t0, "pack", json!({ "extents": h.entries.len(), "from": from, "waited_at": *disk.waited.lock().unwrap(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
 }
 
 fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
@@ -278,7 +358,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "misses": disk.stats.misses.load(Ordering::Relaxed), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
@@ -303,17 +383,16 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> 
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let (mut store, volume, disk_name, fresh) = open_store(host, port)?;
-    event(t0, "opened", json!({ "disk": disk_name, "epoch": store.epoch(), "volume_bytes": volume, "new": fresh, "replayed": store.opened().replayed, "extents_mapped": store.opened().extents_mapped, "memory_locked": locked, "writeback_set": writeback }));
+    let Opened { mut store, volume, disk: disk_name, fresh, pack_head, rounds } = open_store(host, port)?;
+    event(t0, "opened", json!({ "disk": disk_name, "epoch": store.epoch(), "volume_bytes": volume, "new": fresh, "replayed": store.opened().replayed, "extents_mapped": store.opened().extents_mapped, "pages": store.opened().pages, "rounds": rounds, "memory_locked": locked, "writeback_set": writeback }));
     store.record_boot();
     let cache = FileCache::create(cache_path, volume).map_err(|e| format!("the cache file: {e}"))?;
     let disk = Arc::new(Disk::new(store, cache, host, port));
     let progress = Arc::new(Progress::default());
-    // the pack, beside the mount
-    // the pack's header before the mount; its extents beside it
-    if let Some((name, h)) = pack_header(&disk, t0) {
+    // the pack's head before the mount; the rest of it beside the mount
+    if let Some((name, h, from)) = pack_header(&disk, t0, pack_head) {
         let d = disk.clone();
-        std::thread::spawn(move || fetch_pack(&d, t0, name, h));
+        std::thread::spawn(move || fetch_pack(&d, t0, name, h, from));
     }
     let flusher = {
         let (d, p, w) = (disk.clone(), progress.clone(), status_writer(state.to_path_buf(), t0));
@@ -338,7 +417,7 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> 
         event(t0, "mkfs", json!({}));
     }
     linux::mount_ext4(&lo.path, dir).map_err(|e| e.to_string())?;
-    event(t0, "mounted", json!({ "dir": dir }));
+    event(t0, "mounted", json!({ "dir": dir, "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "waited_at": *disk.waited.lock().unwrap() }));
     // until SIGTERM or SIGINT
     let mut sig: libc::c_int = 0;
     // SAFETY: sigwait on the set this thread blocked.

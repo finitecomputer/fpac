@@ -22,7 +22,7 @@ use fpac_format::{self as format};
 use fpac_remote::limits::OBJECT_BYTES_MAX;
 use fpac_remote::{Put, RemoteError};
 use fpac_store::head::{decide, Decision};
-use fpac_store::{ship, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
+use fpac_store::{ship, Ask, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
 
 const EXT: usize = EXTENT_BYTES as usize;
 const VOLUME: u64 = 64 * EXTENT_BYTES as u64 * 64; // 4,096 extents: one page and change of room
@@ -422,8 +422,12 @@ impl Life<'_> {
 /// Opens a life, retrying an unavailable or lying remote; checks it opened
 /// to what the model says.
 fn open<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: u64, expected: BTreeMap<u64, Vec<u8>>, crash_at: u64) -> Life<'a> {
+    open_sized(remote, platform, epoch, expected, crash_at, VOLUME)
+}
+
+fn open_sized<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: u64, expected: BTreeMap<u64, Vec<u8>>, crash_at: u64, volume_bytes: u64) -> Life<'a> {
     platform.running = epoch;
-    let info = OpenInfo { epoch, volume_bytes: VOLUME, head: platform.head };
+    let info = OpenInfo { epoch, volume_bytes, head: platform.head };
     let mut store = None;
     // Bounded: faults are a few in a thousand calls.
     for _ in 0..1000 {
@@ -684,7 +688,7 @@ fn the_pack_makes_the_boot_reads_local() {
     let h = life.store.pack_header(&pr, &head[..n]).unwrap();
     assert_eq!(h.entries.len(), 20);
     let mut installed = 0;
-    for (off, len) in Store::pack_ranges(&h, 4 * EXTENT_BYTES as u64) {
+    for (off, len) in Store::pack_ranges(&h, 0, 4 * EXTENT_BYTES as u64) {
         let mut b = vec![0u8; len as usize];
         assert_eq!(life.remote.get_range(&name, off, &mut b).unwrap(), Some(len as usize));
         installed += life.store.pack_install(&mut life.cache, &h, off, &b).unwrap();
@@ -731,7 +735,7 @@ fn a_stale_pack_entry_is_ignored() {
     let mut head = vec![0u8; fpac_store::PACK_HEADER_FETCH_BYTES];
     let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
     let h = life.store.pack_header(&pr, &head[..n]).unwrap();
-    let (off, len) = Store::pack_ranges(&h, 1 << 20)[0];
+    let (off, len) = Store::pack_ranges(&h, 0, 1 << 20)[0];
     let mut b = vec![0u8; len as usize];
     life.remote.get_range(&name, off, &mut b).unwrap();
     assert_eq!(life.store.pack_install(&mut life.cache, &h, off, &b).unwrap(), 0, "the changed extent is not taken from the pack");
@@ -762,6 +766,86 @@ fn a_full_pack_fits_one_object() {
     let exp = life.model.after_crash(life.remote);
     let life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
     assert!(life.store.pack_to_fetch().is_some(), "the next life wakes from it");
+}
+
+/// A gate that keeps what an open asked for at once, and every read it
+/// made before and after.
+struct Recording<'a> {
+    inner: &'a mut SimRemote,
+    asked: Vec<Ask>,
+    reads: Vec<Ask>,
+    /// Reads made before the one round of asks.
+    before: Option<usize>,
+}
+
+impl RemoteGate for Recording<'_> {
+    fn get_range(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<Option<usize>, RemoteError> {
+        self.reads.push(Ask::Range { name: name.into(), offset, len: buf.len() });
+        self.inner.get_range(name, offset, buf)
+    }
+    fn get(&mut self, name: &str, sink: &mut dyn FnMut(&[u8])) -> Result<Option<u64>, RemoteError> {
+        self.reads.push(Ask::Whole(name.into()));
+        self.inner.get(name, sink)
+    }
+    fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError> {
+        self.inner.put(name, body)
+    }
+    fn prefetch(&mut self, asks: &[Ask]) {
+        assert!(self.before.is_none(), "one round of asks");
+        self.before = Some(self.reads.len());
+        self.asked.extend_from_slice(asks);
+    }
+}
+
+// Goal: an open waits for two rounds of reads, whatever the disk holds:
+// the checkpoint, then everything else at once (its pages, the replay's
+// headers, the pack's head), since each round trip is about 100 ms on R2.
+// Method: a disk with a checkpoint, a pack and a crashed life's segments
+// after it; open it through a gate that records, and check that every
+// read after the checkpoint's was asked for in the one round.
+#[test]
+fn an_open_reads_in_two_rounds() {
+    let mut remote = SimRemote::new(12, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    // four map pages of room
+    let volume = 4 * 4096 * EXTENT_BYTES as u64;
+    let mut life = open_sized(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX, volume);
+    life.post_head().unwrap();
+    // extents across the pages, as ext4's metadata is spread
+    for e in [0u64, 1, 2, 4095, 4096, 8191, 12_288] {
+        let b = content(200 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.store.read(life.remote, &mut life.cache, 0, &mut vec![0u8; EXT]).unwrap();
+    life.sleep(&mut Rng(3)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open_sized(&mut remote, &mut platform, 2, exp, u64::MAX, volume);
+    life.post_head().unwrap();
+    for i in 0..3u64 {
+        let b = content(300 + i);
+        life.store.write(life.remote, &mut life.cache, 1, 0, &b).unwrap();
+        life.model.live.insert(1, b);
+        life.flush().unwrap();
+        life.land_all(&mut Rng(3)).unwrap();
+    }
+    // a crash: no checkpoint of this life
+    let exp = life.model.after_crash(life.remote);
+    platform.running = 3;
+    let mut gate = Recording { inner: &mut remote, asked: Vec::new(), reads: Vec::new(), before: None };
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 3, volume_bytes: volume, head: platform.head }).unwrap();
+    assert_eq!(s.opened().replayed, 3);
+    let before = gate.before.expect("a round of asks");
+    assert!(matches!(&gate.reads[..before], [Ask::Whole(n)] if n.starts_with("e1/c")), "{:?}", &gate.reads[..before]);
+    assert_eq!(gate.asked.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).count(), 3, "the pages written (0, 1, 3): {:?}", gate.asked);
+    assert!(gate.asked.iter().any(|a| matches!(a, Ask::Range { name, len, .. } if name.starts_with("e1/p") && *len == fpac_store::PACK_HEAD_FETCH_BYTES)), "the pack's head");
+    for r in &gate.reads[before..] {
+        assert!(gate.asked.contains(r), "{r:?} was not asked for in the round");
+    }
+    drop(gate);
+    let mut life = open_sized(&mut remote, &mut platform, 3, exp, u64::MAX, volume);
+    life.read_check(1).unwrap();
+    life.read_check(12_288).unwrap();
 }
 
 // Goal: a put that meets another writer's bytes fences the life: it

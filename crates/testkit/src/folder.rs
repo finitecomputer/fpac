@@ -18,7 +18,7 @@ use fpac_remote::{hex, limits, name_epoch, sha256, unhex32, Head, DISK_HEADER, E
 use fpac_store::head::{decide, Decision};
 
 /// Connections served at once; past it a connection is closed at once.
-pub const CONNECTIONS_MAX: usize = 64;
+pub const CONNECTIONS_MAX: usize = 128;
 /// Requests on one kept-alive connection.
 pub const REQUESTS_PER_CONNECTION_MAX: usize = 100_000;
 
@@ -47,6 +47,10 @@ pub struct Folder {
     /// The disk's head, as the platform keeps it, moved only by `decide`.
     pub head: std::sync::Mutex<Option<Head>>,
     pub faults: Faults,
+    /// Each object call waits this long before it is answered: R2's cost
+    /// as P2 measured it (about 90 ms a get), so a krun run shows how many
+    /// round trips a wake waits for. 0, the default, adds nothing.
+    pub object_ms: u64,
     live: AtomicUsize,
 }
 
@@ -66,7 +70,7 @@ impl Folder {
     pub fn new(root: &Path, disk: &str, epoch: u64) -> Folder {
         assert!(epoch > 0);
         assert!(!disk.is_empty() && disk.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
-        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, volume_bytes: 1 << 30, head: std::sync::Mutex::new(None), faults: Faults::default(), live: AtomicUsize::new(0) }
+        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, volume_bytes: 1 << 30, head: std::sync::Mutex::new(None), faults: Faults::default(), object_ms: 0, live: AtomicUsize::new(0) }
     }
 
     /// A later life of the same disk: the same folder and head, a new
@@ -74,7 +78,7 @@ impl Folder {
     pub fn next_life(&self, epoch: u64) -> Folder {
         assert!(epoch > self.epoch);
         let head = *self.head.lock().unwrap();
-        Folder { root: self.root.clone(), disk: self.disk.clone(), epoch, volume_bytes: self.volume_bytes, head: std::sync::Mutex::new(head), faults: Faults::default(), live: AtomicUsize::new(0) }
+        Folder { root: self.root.clone(), disk: self.disk.clone(), epoch, volume_bytes: self.volume_bytes, head: std::sync::Mutex::new(head), faults: Faults::default(), object_ms: self.object_ms, live: AtomicUsize::new(0) }
     }
 
     pub fn start(self, listen: Listen) -> Running {
@@ -131,6 +135,9 @@ impl Folder {
             return Ok(true);
         }
         let route = req.path.strip_prefix("/o/");
+        if route.is_some() && self.object_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.object_ms));
+        }
         match (req.method.as_str(), req.path.as_str(), route) {
             ("GET", "/open", _) => {
                 let head = self.head.lock().unwrap().map(|h| h.encode()).unwrap_or_else(|| "none".into());

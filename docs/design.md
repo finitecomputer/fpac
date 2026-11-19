@@ -63,13 +63,20 @@ Why it is fast:
 2. The agent's own start begins at once (in the product; the spike's
    harness mounts first, then starts Hermes, and measures both).
 3. Beside it, `fpac mount` (crates/fpac): open (the route answers from
-   what the platform gave it: no storage read), load the head's
-   checkpoint and pages, replay the head life's segments after it
-   (their headers fetched sixteen at a time), fetch the pack's header,
-   serve the FUSE file, attach the loop device, mount ext4. The pack's
-   extents stream in beside the mount as parallel ranged gets; a read of
-   one waits for it rather than fetching it twice; a block not in the
-   pack is one ranged get with 1 MiB of read-ahead (a **miss**).
+   what the platform gave it: no storage read), then **two rounds** to
+   the store, since each round trip is about 100 ms on R2: the head's
+   checkpoint; then, all at once, every map page it names, the first
+   sixteen segment headers a replay may read, and the pack's head (its
+   header and first sixteen extents, which hold the mount's own reads).
+   Replay the head life's segments after the checkpoint (past sixteen,
+   their headers come sixteen at a time), serve the FUSE file, attach the
+   loop device, mount ext4. The rest of the pack streams in beside the
+   mount as ranged gets on eight connections; a read of one of its
+   extents waits for it rather than fetching it twice; a block not in the
+   pack is one ranged get with 1 MiB of read-ahead (a **miss**). Before
+   P5 the pages came one at a time: a 20 GB ext4 spreads its metadata
+   over about twenty pages, and opens on Cloudflare took 2.5 to 9 s,
+   growing with the data.
 
 The pack is what the last boot read, in its order, then what the last
 life wrote, newest first (its databases' pages, its logs' tails), each
