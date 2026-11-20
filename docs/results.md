@@ -428,6 +428,23 @@ The test also showed that the daemon's state (`/run/fpac`) was on the
 disk it filled, so its log and status stopped with it; the test puts it
 on a tmpfs, and the platform's image should too.
 
+### A sealed cache on a copy-on-write disk (`full.json`, `encryption.json`, krun)
+
+A sealed extent opens whole or not at all, and the cache wrote it over
+its last copy in place: a write that failed partway (a full
+copy-on-write disk refuses even an overwrite) left neither copy
+readable, and the extent may be the only copy of acknowledged bytes.
+Now each extent has two sides in the cache file; a write goes to the
+side not in use, its tag moves there once it is whole, and only then is
+the old side punched. A test tears a sealed write halfway: before the
+change the extent no longer opened ("the cache's seal does not open");
+now it reads its last whole write, and the same write made again lands
+and gives the old side's room back. krun's disk is not copy-on-write,
+so it cannot tear a write; on krun the sealed daemon (`b6d8d38`) passed
+the full disk (No space left on device, typed; 4,255 acknowledged
+extents unshipped at the fill, all found by the next life), 10 lives
+killed at random (0 failures) and two lives checked. **Passes.**
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -464,10 +481,8 @@ on a tmpfs, and the platform's image should too.
   API and the model); fragment's real API and model would differ.
 - A full disk (leftover 4): a read of an extent the cache does not hold
   still fails while the disk is full (its install needs room); it could
-  be answered without being kept. A sealed cache on a copy-on-write disk
-  whose overwrite fails partway leaves that extent's seal broken: one
-  extent of acknowledged bytes. Both untested on Cloudflare, whose
-  container disk's file system is not known here.
+  be answered without being kept. Untested on Cloudflare, whose container
+  disk's file system is not known here.
 
 ## Decided (the owner, 2026-11-20)
 

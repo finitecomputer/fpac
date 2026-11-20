@@ -40,7 +40,7 @@ associated data.
 | A checkpoint: **authenticated, not sealed** (decided 2026-11-20) | its name and all its bytes | at its end; its bytes stay readable |
 | A pack's header | its name | after the header |
 | A packed extent | the pack's name, its index, its extent | after its 64 KiB |
-| An extent in the cache file | the life, the extent, this life's count of writes to it | in memory, with the count |
+| An extent in the cache file | the life, the extent, this life's count of writes to it | in memory, with the count; written beside the last copy, never over it, so a write that fails partway leaves the last one whole |
 
 So no sealed piece can be spliced into another object, moved within one,
 or swapped for another disk's; in the cache, an earlier write of the same
