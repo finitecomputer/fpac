@@ -158,7 +158,7 @@ pub fn main() {
             }
         },
         _ => {
-            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] [--cache-max bytes] [--key-file path] | fpac status [--state dir]");
+            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] [--cache-max bytes] [--key-file path] | fpac clean --sizes file [--host h] [--port p] [--budget-bytes n] | fpac status [--state dir]");
             std::process::exit(2);
         }
     }

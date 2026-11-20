@@ -320,7 +320,7 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
             return Err("the cleaner's run is on Cloudflare only".into());
         }
         let mut c = disk::Cloudflare::new(&format!("clean-{}", now_ms()), volume)?;
-        let kill_after = Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(1500));
+        let kill_after = Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(2500));
         let r = disk::clean(&mut c, kill_after);
         let objects = disk::Place::objects(&c);
         let cleaned = disk::Place::cleanup(&mut c);

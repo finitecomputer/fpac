@@ -554,10 +554,16 @@ for i in $(seq 1 128); do head -c 4194304 /dev/urandom > /data/big/b$i; done
 sync
 echo written"#;
 
-/// Life 2: three quarters of them written again, so most of life 1's
-/// segments hold dead extents.
+/// Life 2: three of every four 256 KiB of each file written again in
+/// place, so each of life 1's segments keeps about a quarter of its
+/// extents live: what compaction moves. (Files written again whole leave
+/// segments all dead or all live, and nothing to move.)
 const REWRITE_BIG: &str = r#"set -e
-for i in $(seq 1 96); do head -c 4194304 /dev/urandom > /data/big/b$i; done
+for i in $(seq 1 128); do
+  for k in $(seq 1 15); do
+    [ $((k % 4)) -eq 0 ] || dd if=/dev/urandom of=/data/big/b$i bs=256K seek=$k count=1 conv=notrunc status=none
+  done
+done
 sha256sum /data/big/* > /data/big.sha256
 sync
 echo rewritten"#;
