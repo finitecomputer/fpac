@@ -45,23 +45,6 @@ pub struct Progress {
     /// write that finished before it is in the store.
     pub durable_ms: AtomicU64,
     pub head_posted: AtomicBool,
-    /// Wakes the flusher early: a stop.
-    pub wake: (std::sync::Mutex<bool>, std::sync::Condvar),
-}
-
-impl Progress {
-    /// Asks the flusher to stop now rather than at its next tick.
-    pub fn stop(&self) {
-        *self.wake.0.lock().unwrap() = true;
-        self.wake.1.notify_all();
-    }
-
-    /// Waits a tick, or less if a stop is asked: whether to stop.
-    fn tick(&self) -> bool {
-        let g = self.wake.0.lock().unwrap();
-        let (g, _) = self.wake.1.wait_timeout_while(g, Duration::from_millis(FLUSH_MS), |stop| !*stop).unwrap();
-        *g
-    }
 }
 
 /// Puts objects, `PUTS_IN_FLIGHT` at a time, each until it lands. A
@@ -134,31 +117,49 @@ pub fn first_head(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// One cut, shipped and landed: the segments it took.
+/// One cut, built, shipped and landed, with whatever cuts before it are
+/// still unbuilt: the segments it shipped. A sleep's last turns.
 pub fn flush_once(disk: &Disk, p: &Progress) -> Result<u32, StoreError> {
-    let (objs, at) = {
-        let mut g = disk.inner.lock().unwrap();
-        let Inner { store, cache } = &mut *g;
-        let at = now_ms();
-        (store.cut(cache)?, at)
-    };
+    let at = now_ms();
+    let cut = disk.inner.lock().unwrap().store.cut()?;
     disk.cut.notify_all();
-    if objs.is_empty() {
-        return Ok(0);
-    }
-    ship_all(disk, &objs)?;
-    {
+    let mut n = 0;
+    // Bounded by the segments planned.
+    loop {
+        let batch: Vec<Outgoing> = {
+            let mut g = disk.inner.lock().unwrap();
+            let Inner { store, cache } = &mut *g;
+            let mut b = Vec::new();
+            while b.len() < PUTS_IN_FLIGHT {
+                match store.build_next(cache)? {
+                    Some(o) => b.push(o),
+                    None => break,
+                }
+            }
+            b
+        };
+        if batch.is_empty() {
+            break;
+        }
+        ship_all(disk, &batch)?;
         let mut g = disk.inner.lock().unwrap();
-        for o in &objs {
+        for o in &batch {
             let Kind::Segment(seq) = o.kind else { unreachable!("a cut is segments") };
             g.store.landed(seq);
         }
+        drop(g);
+        disk.cut.notify_all();
+        p.segments.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        p.bytes.fetch_add(batch.iter().map(|o| o.body.len() as u64).sum(), Ordering::Relaxed);
+        n += u32::try_from(batch.len()).expect("bounded");
     }
-    p.cuts.fetch_add(1, Ordering::Relaxed);
-    p.segments.fetch_add(objs.len() as u64, Ordering::Relaxed);
-    p.bytes.fetch_add(objs.iter().map(|o| o.body.len() as u64).sum(), Ordering::Relaxed);
-    p.durable_ms.store(at, Ordering::SeqCst);
-    Ok(u32::try_from(objs.len()).expect("bounded"))
+    if !cut.is_empty() {
+        p.cuts.fetch_add(1, Ordering::Relaxed);
+    }
+    if n > 0 || !cut.is_empty() {
+        p.durable_ms.store(at, Ordering::SeqCst);
+    }
+    Ok(n)
 }
 
 /// A checkpoint of what has landed, then the head names it.
@@ -180,24 +181,111 @@ pub fn checkpoint(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The flusher's loop, until `stop`.
+/// A put that ended: its segment and its bytes, and how.
+struct Ended {
+    seq: u64,
+    bytes: u64,
+    result: Result<(), StoreError>,
+}
+
+/// The flusher's loop, until a stop (docs/design.md, The sleep): a cut
+/// each FLUSH_MS (at once when a write waits on a full cut), its segments
+/// built from the cache as there is room, PUTS_IN_FLIGHT puts at once,
+/// each segment landed as its put ends, and a checkpoint now and then.
+/// Writes go on meanwhile, up to UNSHIPPED_BYTES_MAX unlanded. On a stop
+/// it lets the puts in flight end and leaves the rest to `last`.
 pub fn run(disk: Arc<Disk>, p: Arc<Progress>, status: impl Fn(&Disk, &Progress)) {
     if let Err(e) = first_head(&disk, &p) {
         fence(&disk, &e);
         return;
     }
-    let (mut since, mut last_checkpoint) = (0u32, Instant::now());
+    let (tx, rx) = std::sync::mpsc::channel::<Ended>();
+    let mut in_flight = 0usize;
+    let (mut since, mut last_checkpoint, mut last_cut, mut last_status) = (0u32, Instant::now(), Instant::now(), Instant::now());
+    // each cut's last segment and its time, until it is applied
+    let mut cuts: std::collections::VecDeque<(u64, u64)> = Default::default();
+    let mut seen = 0u64;
     // Unbounded on purpose: the life of the mount, until a stop.
-    while !p.tick() {
-        match flush_once(&disk, &p) {
-            Ok(n) => since += n,
-            Err(e) => {
-                fence(&disk, &e);
-                return;
+    loop {
+        let (stop, events) = disk.wait_flusher(seen, Duration::from_millis(FLUSH_MS));
+        seen = events;
+        // the puts that ended
+        let mut ended: Vec<Ended> = rx.try_iter().collect();
+        if stop {
+            // Bounded by the puts in flight, each of which ends (landed or
+            // fenced).
+            while ended.len() < in_flight {
+                ended.push(rx.recv().expect("a put thread answers"));
             }
         }
-        let due = since >= CHECKPOINT_AFTER_SEGMENTS || (since > 0 && last_checkpoint.elapsed() >= Duration::from_millis(CHECKPOINT_MS));
-        if due {
+        if let Err(e) = land(&disk, &p, &mut ended, &mut in_flight, &mut since) {
+            fence(&disk, &e);
+            return;
+        }
+        let applied = disk.inner.lock().unwrap().store.applied_seq();
+        while let Some(&(last, at)) = cuts.front() {
+            if last > applied {
+                break;
+            }
+            p.durable_ms.store(at, Ordering::SeqCst);
+            cuts.pop_front();
+        }
+        if stop {
+            status(&disk, &p);
+            return;
+        }
+        // a cut at once when a write waits on a full one; otherwise each
+        // FLUSH_MS while shipping keeps up. When it falls behind, the
+        // timed cut waits, so rewrites of the same extents coalesce
+        // rather than each second's copy queueing (the loss window grows
+        // with the backlog: docs/contract.md)
+        let wanted = disk.cut_wanted.swap(false, Ordering::SeqCst);
+        let behind = disk.inner.lock().unwrap().store.planned() > PUTS_IN_FLIGHT;
+        if wanted || (last_cut.elapsed() >= Duration::from_millis(FLUSH_MS) && !behind) {
+            last_cut = Instant::now();
+            let at = now_ms();
+            match disk.inner.lock().unwrap().store.cut() {
+                Ok(planned) => {
+                    if let Some((seq, _)) = planned.last() {
+                        cuts.push_back((*seq, at));
+                        p.cuts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    fence(&disk, &e);
+                    return;
+                }
+            }
+            disk.cut.notify_all();
+        }
+        // build and put, up to PUTS_IN_FLIGHT at once
+        while in_flight < PUTS_IN_FLIGHT {
+            let built = {
+                let mut g = disk.inner.lock().unwrap();
+                let Inner { store, cache } = &mut *g;
+                store.build_next(cache)
+            };
+            match built {
+                Ok(Some(o)) => {
+                    in_flight += 1;
+                    let (d, tx) = (disk.clone(), tx.clone());
+                    std::thread::spawn(move || {
+                        let Kind::Segment(seq) = o.kind else { unreachable!("a build is a segment") };
+                        let result = ship_one(&d, &o);
+                        let _ = tx.send(Ended { seq, bytes: o.body.len() as u64, result });
+                        d.nudge();
+                    });
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    fence(&disk, &e);
+                    return;
+                }
+            }
+        }
+        // the store stays as of its last landing while a checkpoint ships
+        // (ended puts wait in the channel)
+        if since >= CHECKPOINT_AFTER_SEGMENTS || (since > 0 && last_checkpoint.elapsed() >= Duration::from_millis(CHECKPOINT_MS)) {
             if let Err(e) = checkpoint(&disk, &p) {
                 fence(&disk, &e);
                 return;
@@ -205,8 +293,28 @@ pub fn run(disk: Arc<Disk>, p: Arc<Progress>, status: impl Fn(&Disk, &Progress))
             since = 0;
             last_checkpoint = Instant::now();
         }
-        status(&disk, &p);
+        if last_status.elapsed() >= Duration::from_millis(FLUSH_MS) {
+            status(&disk, &p);
+            last_status = Instant::now();
+        }
     }
+}
+
+/// Lands the segments whose puts ended; the first failure fences.
+fn land(disk: &Disk, p: &Progress, ended: &mut Vec<Ended>, in_flight: &mut usize, since: &mut u32) -> Result<(), StoreError> {
+    if ended.is_empty() {
+        return Ok(());
+    }
+    for e in ended.drain(..) {
+        *in_flight -= 1;
+        e.result?;
+        disk.inner.lock().unwrap().store.landed(e.seq);
+        *since += 1;
+        p.segments.fetch_add(1, Ordering::Relaxed);
+        p.bytes.fetch_add(e.bytes, Ordering::Relaxed);
+    }
+    disk.cut.notify_all();
+    Ok(())
 }
 
 fn fence(disk: &Disk, e: &StoreError) {

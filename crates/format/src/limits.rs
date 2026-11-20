@@ -19,12 +19,21 @@ pub const SEGMENT_BYTES_MAX: u64 = 64 << 20;
 pub const SEGMENT_EXTENTS_MAX: u32 = (SEGMENT_BYTES_MAX / EXTENT_BYTES as u64) as u32 - 1;
 /// Extents a segment of a cut takes at most: the target size.
 pub const SEGMENT_EXTENTS_TARGET: u32 = (SEGMENT_BYTES_TARGET / EXTENT_BYTES as u64) as u32;
-/// What may be written and not yet cut, at most. A cut takes every dirty
-/// extent at one instant (a subset would reorder writes across the
-/// flushes ext4 orders its journal by), copying them under the store's
-/// lock; past this, writes wait for the next cut.
+/// What may be written and not yet cut, at most: one cut's size. A cut
+/// takes every dirty extent at one instant (a subset would reorder writes
+/// across the flushes ext4 orders its journal by), naming them only (its
+/// segments are built from the cache later); past this, a write asks for
+/// a cut at once and waits for it.
 pub const DIRTY_BYTES_MAX: u64 = 256 << 20;
 pub const DIRTY_EXTENTS_MAX: u32 = (DIRTY_BYTES_MAX / EXTENT_BYTES as u64) as u32;
+/// What may be written and not yet landed, at most: every cut planned,
+/// built or in flight, and what is dirty. Held in the cache file, not in
+/// memory, so a burst this large goes at the local disk's speed with
+/// shipping behind it. It is section 10's sequential-write line (4 GiB and
+/// an fsync), and it bounds both a crash's loss during a burst and a
+/// sleep's flush: about 85 s at the 50 MB/s a Cloudflare container ships.
+pub const UNSHIPPED_BYTES_MAX: u64 = 4 << 30;
+pub const UNSHIPPED_EXTENTS_MAX: u64 = UNSHIPPED_BYTES_MAX / EXTENT_BYTES as u64;
 /// Segments one cut may need.
 pub const CUT_SEGMENTS_MAX: u32 = DIRTY_EXTENTS_MAX.div_ceil(SEGMENT_EXTENTS_TARGET);
 
@@ -78,6 +87,7 @@ pub const CHECKPOINT_BYTES_MAX: u64 = 128 + PAGES_MAX as u64 * 56 + LIVE_SEGMENT
 const _: () = assert!(SEGMENT_BYTES_TARGET <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_EXTENTS_TARGET <= SEGMENT_EXTENTS_MAX);
 const _: () = assert!(CUT_SEGMENTS_MAX * SEGMENT_EXTENTS_TARGET >= DIRTY_EXTENTS_MAX);
+const _: () = assert!(UNSHIPPED_EXTENTS_MAX >= DIRTY_EXTENTS_MAX as u64);
 const _: () = assert!((SEGMENT_HEADER_BYTES_MAX as u64) + SEGMENT_EXTENTS_MAX as u64 * EXTENT_BYTES as u64 <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_BYTES_MAX < 100 << 20, "the intercept's body limit");
 const _: () = assert!(PACK_OBJECT_BYTES_MAX < 100 << 20, "the intercept's body limit");

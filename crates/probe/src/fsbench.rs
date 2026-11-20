@@ -14,7 +14,8 @@ use serde_json::{json, Value};
 
 use crate::{ms, stats};
 
-const SEQ_BYTES: usize = 1 << 30;
+/// Section 10's line: 4 GiB and an fsync.
+const SEQ_BYTES: usize = 4 << 30;
 const SMALL_FILES: usize = 10_000;
 const DIR_ENTRIES: usize = 30_000;
 const SAVES: usize = 500;
@@ -31,7 +32,7 @@ fn noise(n: usize, seed: u64) -> Vec<u8> {
     fpac_testkit::conformance::noise(n, seed)
 }
 
-/// A sequential write of 1 GiB with an fsync, then a cold read: MB/s.
+/// A sequential write of 4 GiB with an fsync, then a cold read: MB/s.
 fn sequential(dir: &Path) -> std::io::Result<Value> {
     let p = dir.join("seq.bin");
     let chunk = noise(1 << 20, 1);
@@ -184,12 +185,14 @@ pub fn run(dir: &str) -> Value {
     let r = |v: std::io::Result<Value>| v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
     let out = json!({
         "evidence": "fsbench", "dir": dir,
-        "sequential_1gib": r(sequential(&d)),
         "random_4k_write_10s": r(random_writes(&d)),
         "write_4k_osync_ms": r(sync_writes(&d)),
         "small_files": r(small_files(&d)),
         "saves": r(saves(&d)),
         "dir_30k": r(big_dir(&d)),
+        // last: each of section 10's rows on its own, not behind a 4 GiB
+        // burst still shipping
+        "sequential_4gib": r(sequential(&d)),
     });
     let _ = fs::remove_dir_all(&d);
     out

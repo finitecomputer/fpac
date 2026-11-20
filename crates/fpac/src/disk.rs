@@ -13,7 +13,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use fpac_device::serve::{Backing, BackingError};
-use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX};
+use fpac_format::limits::{DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
 use fpac_remote::Remote;
 use fpac_store::{CacheGate, Fetch, Read, Store, StoreError};
 
@@ -31,16 +31,36 @@ const PACK_WAIT_MS: u64 = 3000;
 const OP_TRIES_MAX: u32 = 8;
 
 /// The cache file: one sparse file of the volume's size on the container's
-/// own disk, an extent at `extent * EXTENT_BYTES`.
+/// own disk, an extent at `extent * EXTENT_BYTES`; and beside it the
+/// shadow file, where a frozen extent's bytes as of its cut wait for its
+/// segment's build when a write changes them first, one slot each
+/// (bounded by UNSHIPPED_EXTENTS_MAX), its space freed when taken.
 pub struct FileCache {
     file: File,
+    shadow: File,
+    slots: std::collections::HashMap<(u64, u64), u64>,
+    free: Vec<u64>,
+    next_slot: u64,
 }
 
 impl FileCache {
     pub fn create(path: &Path, volume_bytes: u64) -> std::io::Result<FileCache> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).custom_flags(libc::O_CLOEXEC).open(path)?;
+        let open = |p: &Path| OpenOptions::new().read(true).write(true).create(true).truncate(true).custom_flags(libc::O_CLOEXEC).open(p);
+        let file = open(path)?;
         file.set_len(volume_bytes)?;
-        Ok(FileCache { file })
+        let shadow = open(&path.with_extension("shadow"))?;
+        Ok(FileCache { file, shadow, slots: Default::default(), free: Vec::new(), next_slot: 0 })
+    }
+}
+
+fn punch_hole(f: &File, offset: u64) -> std::io::Result<()> {
+    let (o, l) = (i64::try_from(offset).expect("bounded"), i64::from(EXTENT_BYTES));
+    // SAFETY: a plain syscall on a file we own.
+    let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, o, l) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -52,14 +72,25 @@ impl CacheGate for FileCache {
         self.file.write_all_at(bytes, extent * EXTENT_BYTES as u64)
     }
     fn punch(&mut self, extent: u64) -> std::io::Result<()> {
-        let (o, l) = (i64::try_from(extent * EXTENT_BYTES as u64).expect("bounded"), i64::from(EXTENT_BYTES));
-        // SAFETY: a plain syscall on a file we own.
-        let r = unsafe { libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, o, l) };
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        punch_hole(&self.file, extent * EXTENT_BYTES as u64)
+    }
+    fn shadow_save(&mut self, extent: u64, seq: u64) -> std::io::Result<()> {
+        let mut b = vec![0u8; EXTENT_BYTES as usize];
+        self.file.read_exact_at(&mut b, extent * EXTENT_BYTES as u64)?;
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.next_slot += 1;
+            self.next_slot - 1
+        });
+        self.shadow.write_all_at(&b, slot * EXTENT_BYTES as u64)?;
+        assert!(self.slots.insert((extent, seq), slot).is_none(), "one copy per extent and segment");
+        Ok(())
+    }
+    fn shadow_take(&mut self, extent: u64, seq: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let slot = self.slots.remove(&(extent, seq)).ok_or_else(|| std::io::Error::other("no such shadow"))?;
+        self.shadow.read_exact_at(buf, slot * EXTENT_BYTES as u64)?;
+        punch_hole(&self.shadow, slot * EXTENT_BYTES as u64)?;
+        self.free.push(slot);
+        Ok(())
     }
 }
 
@@ -90,6 +121,14 @@ pub struct Stats {
 /// pack's event (which of them a larger pack head would have held).
 const WAITED_KEPT: usize = 16;
 
+/// What wakes the flusher: a stop, or an event (a put that ended, a
+/// writer waiting on a full store).
+#[derive(Default)]
+pub struct Wake {
+    pub stop: bool,
+    pub events: u64,
+}
+
 pub struct Disk {
     pub inner: Mutex<Inner>,
     /// Signaled after every cut, for writes waiting on a full store.
@@ -118,12 +157,45 @@ pub struct Disk {
     /// Extents a partial write is reading first: never dropped between
     /// the fetch of their bytes and the write over them.
     pinned: Mutex<std::collections::HashMap<u64, u32>>,
+    /// The flusher waits on this between turns.
+    pub wake: (Mutex<Wake>, Condvar),
+    /// A write waits on a full cut: the flusher cuts at once.
+    pub cut_wanted: AtomicBool,
 }
 
 impl Disk {
     pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: Option<u64>) -> Disk {
         let cache_max = cache_max_bytes.map(|b| (b / EXTENT_BYTES as u64) as usize);
-        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()) }
+        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) }
+    }
+
+    /// Wakes the flusher early: a put ended, or a write waits.
+    pub fn nudge(&self) {
+        self.wake.0.lock().unwrap().events += 1;
+        self.wake.1.notify_all();
+    }
+
+    /// A write waits: if on a full cut, the flusher cuts at once; if on
+    /// the unshipped budget, only landings help, and the flusher wakes
+    /// writers as they come.
+    fn want_cut(&self, store: &Store) {
+        if store.dirty_extents() >= DIRTY_EXTENTS_MAX as usize && !self.cut_wanted.swap(true, Ordering::SeqCst) {
+            self.nudge();
+        }
+    }
+
+    /// Asks the flusher to stop now rather than at its next turn.
+    pub fn stop_flusher(&self) {
+        self.wake.0.lock().unwrap().stop = true;
+        self.wake.1.notify_all();
+    }
+
+    /// Waits until something happened since `seen` events, a stop, or
+    /// `timeout`: (stop, events).
+    pub fn wait_flusher(&self, seen: u64, timeout: Duration) -> (bool, u64) {
+        let g = self.wake.0.lock().unwrap();
+        let (g, _) = self.wake.1.wait_timeout_while(g, timeout, |w| !w.stop && w.events == seen).unwrap();
+        (g.stop, g.events)
     }
 
     /// Notes extents the cache just took, then, past `cache_max`, drops
@@ -294,6 +366,7 @@ impl Disk {
                     match store.write_local(cache, extent, offset, data) {
                         Err(StoreError::Full(_)) => {
                             self.stats.full_waits.fetch_add(1, Ordering::Relaxed);
+                            self.want_cut(&g.store);
                             g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0;
                         }
                         other => {
@@ -326,7 +399,10 @@ impl Disk {
         loop {
             let Inner { store, cache } = &mut *g;
             match store.punch(cache, extent) {
-                Err(StoreError::Full(_)) => g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0,
+                Err(StoreError::Full(_)) => {
+                    self.want_cut(&g.store);
+                    g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0;
+                }
                 other => return other,
             }
         }

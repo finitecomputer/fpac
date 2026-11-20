@@ -132,9 +132,21 @@ enum Local {
     Clean,
     /// Written since the last cut: the cache is its truth.
     Dirty,
-    /// Cut into this life's segment `seq`, not yet landed; a write makes
+    /// Named by this life's cut segment `seq`, not yet built: its bytes as
+    /// of the cut are the cache's until a write changes them, which keeps
+    /// them apart first (`CacheGate::shadow_save`).
+    Frozen(u64),
+    /// Built into this life's segment `seq`, not yet landed; a write makes
     /// it Dirty again.
     Shipping(u64),
+}
+
+/// A segment a cut named and nobody has built yet.
+#[derive(Debug)]
+struct Planned {
+    cut: u64,
+    last_of_cut: bool,
+    extents: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -166,6 +178,13 @@ pub struct Store {
     local: BTreeMap<u64, Local>,
     /// How many of `local` are Dirty (kept with every change of state).
     dirty: u32,
+    /// Segments cut and not yet built, in order, and the extents they name.
+    planned: BTreeMap<u64, Planned>,
+    planned_extents: u64,
+    /// Extents in segments built and not yet landed.
+    shipping_extents: u64,
+    /// A frozen extent's bytes kept apart, by (extent, segment).
+    shadows: BTreeSet<(u64, u64)>,
     /// What this life's next segment follows.
     chain_end: Link,
     /// What the map reflects: the last segment applied.
@@ -212,6 +231,10 @@ impl Store {
             segments: BTreeMap::new(),
             local: BTreeMap::new(),
             dirty: 0,
+            planned: BTreeMap::new(),
+            planned_extents: 0,
+            shipping_extents: 0,
+            shadows: BTreeSet::new(),
             chain_end: GENESIS,
             applied_end: GENESIS,
             next_seq: 1,
@@ -397,6 +420,38 @@ impl Store {
         self.shipping.len()
     }
 
+    /// Segments cut and not yet built.
+    pub fn planned(&self) -> usize {
+        self.planned.len()
+    }
+
+    /// Images written and not yet landed: dirty, planned or in flight
+    /// (an extent written again after its cut counts twice). Writes wait
+    /// past UNSHIPPED_EXTENTS_MAX.
+    pub fn unshipped_extents(&self) -> u64 {
+        u64::from(self.dirty) + self.planned_extents + self.shipping_extents
+    }
+
+    /// The last segment the map reflects: every cut up to it has landed.
+    pub fn applied_seq(&self) -> u64 {
+        if self.applied_end.epoch == self.epoch { self.applied_end.seq } else { 0 }
+    }
+
+    /// Whether a write that is not to a dirty extent must wait.
+    fn full(&self) -> bool {
+        self.dirty >= DIRTY_EXTENTS_MAX || self.unshipped_extents() >= UNSHIPPED_EXTENTS_MAX
+    }
+
+    /// Before the cache's bytes for `extent` change: a frozen extent's
+    /// bytes as of its cut are kept apart for its segment.
+    fn keep_frozen(&mut self, cache: &mut dyn CacheGate, extent: u64) -> Result<(), StoreError> {
+        if let Some(Local::Frozen(seq)) = self.local.get(&extent).copied() {
+            cache.shadow_save(extent, seq)?;
+            assert!(self.shadows.insert((extent, seq)), "a frozen extent is kept apart once");
+        }
+        Ok(())
+    }
+
     /// Extents the cache holds (clean, dirty or shipping).
     pub fn cached_extents(&self) -> usize {
         self.local.len()
@@ -499,7 +554,7 @@ impl Store {
         assert!(extent < self.extents());
         self.note(extent);
         match self.local.get(&extent).copied() {
-            Some(Local::Dirty) | Some(Local::Shipping(_)) => {
+            Some(Local::Dirty) | Some(Local::Frozen(_)) | Some(Local::Shipping(_)) => {
                 cache.read(extent, buf)?;
                 return Ok(Read::Done);
             }
@@ -606,11 +661,12 @@ impl Store {
             return Err(StoreError::Fenced("this life".into()));
         }
         let was = self.local.get(&extent).copied();
-        if was != Some(Local::Dirty) && self.dirty >= DIRTY_EXTENTS_MAX {
+        if was != Some(Local::Dirty) && self.full() {
             return Err(StoreError::Full(self.dirty));
         }
         let whole_extent = offset == 0 && data.len() == EXTENT_BYTES as usize;
         if whole_extent {
+            self.keep_frozen(cache, extent)?;
             cache.write(extent, data)?;
         } else {
             let mut buf = vec![0u8; EXTENT_BYTES as usize];
@@ -620,6 +676,7 @@ impl Store {
                 (None, _) => {}
             }
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+            self.keep_frozen(cache, extent)?;
             cache.write(extent, &buf)?;
         }
         self.set_local(extent, Some(Local::Dirty));
@@ -632,19 +689,23 @@ impl Store {
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
         }
-        if self.local.get(&extent) != Some(&Local::Dirty) && self.dirty >= DIRTY_EXTENTS_MAX {
+        if self.local.get(&extent) != Some(&Local::Dirty) && self.full() {
             return Err(StoreError::Full(self.dirty));
         }
+        self.keep_frozen(cache, extent)?;
         cache.punch(extent)?;
         self.set_local(extent, Some(Local::Dirty));
         Ok(())
     }
 
-    /// Cuts everything written since the last cut into segments at this
-    /// instant (docs/design.md, The cut): one cut, as many segments as it
-    /// needs (at most CUT_SEGMENTS_MAX), the last one marked. Answers them
-    /// in order, for the caller to put, several at once.
-    pub fn cut(&mut self, cache: &mut dyn CacheGate) -> Result<Vec<Outgoing>, StoreError> {
+    /// Cuts everything written since the last cut at this instant
+    /// (docs/design.md, The cut): one cut, as many segments as it needs
+    /// (at most CUT_SEGMENTS_MAX), the last one marked. It only names
+    /// them: each segment is built from the cache by `build_next`, in
+    /// order, as there is room to put it, and an extent written again
+    /// before then keeps its bytes as of the cut apart. Answers each
+    /// segment's number and the extents it names.
+    pub fn cut(&mut self) -> Result<Vec<(u64, Vec<u64>)>, StoreError> {
         assert!(self.head_posted, "a life ships only after its head is posted");
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
@@ -659,30 +720,52 @@ impl Store {
         let groups: Vec<&[u64]> = dirty.chunks(SEGMENT_EXTENTS_TARGET as usize).collect();
         assert!(groups.len() <= CUT_SEGMENTS_MAX as usize);
         let mut out = Vec::with_capacity(groups.len());
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(SEGMENT_EXTENTS_TARGET as usize);
         for (gi, g) in groups.iter().enumerate() {
-            bytes.clear();
-            for e in g.iter() {
-                let mut b = vec![0u8; EXTENT_BYTES as usize];
-                cache.read(*e, &mut b)?;
-                bytes.push(b);
-            }
-            // an extent of zeros ships as a zeroed entry, with no image
-            let images: Vec<Image<'_>> = g.iter().zip(&bytes).map(|(e, b)| Image { extent: *e, bytes: if b.iter().all(|&x| x == 0) { None } else { Some(b.as_slice()) } }).collect();
-            let id = SegId { epoch: self.epoch, seq: self.next_seq };
-            let body = format::encode_segment(id, self.chain_end, cut, gi + 1 == groups.len(), &images);
-            let h = format::decode_segment_header(&body).expect("a segment we made decodes");
-            let link = h.link();
-            let entries = h.entries.iter().map(|en| (en.extent, Loc { seg: id, offset: en.offset, len: en.len, sum: en.sum })).collect();
-            for e in g.iter() {
-                self.set_local(*e, Some(Local::Shipping(id.seq)));
-            }
-            self.shipping.insert(id.seq, Shipment { base: self.chain_end, link, last_of_cut: gi + 1 == groups.len(), entries, landed: false });
-            self.chain_end = link;
+            let seq = self.next_seq;
             self.next_seq += 1;
-            out.push(Outgoing { name: format::segment_name(id), body, kind: Kind::Segment(id.seq) });
+            for e in g.iter() {
+                self.set_local(*e, Some(Local::Frozen(seq)));
+            }
+            self.planned.insert(seq, Planned { cut, last_of_cut: gi + 1 == groups.len(), extents: g.to_vec() });
+            self.planned_extents += g.len() as u64;
+            out.push((seq, g.to_vec()));
         }
         Ok(out)
+    }
+
+    /// Builds the next segment a cut named, from the bytes its extents had
+    /// at the cut (the cache's, or those kept apart since): the object to
+    /// put. None when every cut is built.
+    pub fn build_next(&mut self, cache: &mut dyn CacheGate) -> Result<Option<Outgoing>, StoreError> {
+        if self.fenced {
+            return Err(StoreError::Fenced("this life".into()));
+        }
+        let Some((&seq, _)) = self.planned.first_key_value() else { return Ok(None) };
+        let p = self.planned.remove(&seq).expect("present");
+        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(p.extents.len());
+        for &e in &p.extents {
+            let mut b = vec![0u8; EXTENT_BYTES as usize];
+            if self.shadows.remove(&(e, seq)) {
+                cache.shadow_take(e, seq, &mut b)?;
+            } else {
+                assert_eq!(self.local.get(&e), Some(&Local::Frozen(seq)), "an extent not written since its cut is still frozen");
+                cache.read(e, &mut b)?;
+                self.set_local(e, Some(Local::Shipping(seq)));
+            }
+            bytes.push(b);
+        }
+        // an extent of zeros ships as a zeroed entry, with no image
+        let images: Vec<Image<'_>> = p.extents.iter().zip(&bytes).map(|(e, b)| Image { extent: *e, bytes: if b.iter().all(|&x| x == 0) { None } else { Some(b.as_slice()) } }).collect();
+        let id = SegId { epoch: self.epoch, seq };
+        let body = format::encode_segment(id, self.chain_end, p.cut, p.last_of_cut, &images);
+        let h = format::decode_segment_header(&body).expect("a segment we made decodes");
+        let link = h.link();
+        let entries: Vec<(u64, Loc)> = h.entries.iter().map(|en| (en.extent, Loc { seg: id, offset: en.offset, len: en.len, sum: en.sum })).collect();
+        self.planned_extents -= p.extents.len() as u64;
+        self.shipping_extents += entries.len() as u64;
+        self.shipping.insert(seq, Shipment { base: self.chain_end, link, last_of_cut: p.last_of_cut, entries, landed: false });
+        self.chain_end = link;
+        Ok(Some(Outgoing { name: format::segment_name(id), body, kind: Kind::Segment(seq) }))
     }
 
     /// Segment `seq` of this life landed. The map moves a whole cut at a
@@ -713,6 +796,7 @@ impl Store {
             for q in cut {
                 let s = self.shipping.remove(&q).expect("present");
                 assert_eq!(s.base, self.applied_end, "segments are applied in chain order");
+                self.shipping_extents -= s.entries.len() as u64;
                 for (e, loc) in &s.entries {
                     self.map.insert(*e, *loc);
                     self.pages_dirty.insert(page_of(*e));

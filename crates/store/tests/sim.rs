@@ -337,32 +337,47 @@ impl Life<'_> {
         Ok(())
     }
 
-    /// A cut: its segments wait in flight, with any earlier cut's.
+    /// A cut: it only names its segments; they are built later, in
+    /// order, while writes go on (`build_one`), and the model keeps what
+    /// each extent held at this instant.
     fn flush(&mut self) -> Result<(), Crash> {
         self.step()?;
-        let out = self.store.cut(&mut self.cache).expect("a cut");
-        if out.is_empty() {
+        let planned = self.store.cut().expect("a cut");
+        if planned.is_empty() {
             return Ok(());
         }
         let mut shipped = BTreeMap::new();
-        for o in &out {
-            let h = format::decode_segment_header(&o.body).expect("ours");
-            for en in &h.entries {
-                shipped.insert(en.extent, self.model.get(en.extent));
+        let mut names = Vec::new();
+        for (seq, extents) in &planned {
+            names.push(format::segment_name(format::SegId { epoch: self.store.epoch(), seq: *seq }));
+            for e in extents {
+                shipped.insert(*e, self.model.get(*e));
             }
         }
         if std::env::var("SIM_TRACE").is_ok() {
-            eprintln!("  cut {:?} has15={} {:?}", out.iter().map(|o| o.name.clone()).collect::<Vec<_>>(), shipped.contains_key(&15), shipped.get(&15).map(|b| b[..4].to_vec()));
+            eprintln!("  cut {names:?}");
         }
-        self.model.cuts.push((out.iter().map(|o| o.name.clone()).collect(), shipped));
-        self.in_flight.extend(out);
+        self.model.cuts.push((names, shipped));
         Ok(())
+    }
+
+    /// The next planned segment is built (from the bytes its extents had
+    /// at its cut) and joins those in flight.
+    fn build_one(&mut self) -> Result<bool, Crash> {
+        self.step()?;
+        match self.store.build_next(&mut self.cache).expect("a build") {
+            Some(o) => {
+                self.in_flight.push(o);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// One segment in flight, chosen at random, lands: the map must still
     /// move in segment order.
     fn land_one(&mut self, rng: &mut Rng) -> Result<(), Crash> {
-        if self.in_flight.is_empty() {
+        if self.in_flight.is_empty() && !self.build_one()? {
             return Ok(());
         }
         let o = self.in_flight.remove(rng.below(self.in_flight.len() as u64) as usize);
@@ -377,7 +392,8 @@ impl Life<'_> {
     }
 
     fn land_all(&mut self, rng: &mut Rng) -> Result<(), Crash> {
-        // Bounded by the segments in flight.
+        // Bounded by the segments planned and in flight.
+        while self.build_one()? {}
         while !self.in_flight.is_empty() {
             self.land_one(rng)?;
         }
@@ -482,8 +498,11 @@ fn run(seed: u64, lives: u64, ops: u64, faults: Faults) -> (u64, u64, u64, u64) 
                     30..=32 => life.burst(&wide, &mut rng)?,
                     33..=36 => life.punch(e)?,
                     37..=64 => life.read_check(e)?,
-                    65..=76 => life.flush()?,
-                    77..=93 => life.land_one(&mut rng)?,
+                    65..=72 => life.flush()?,
+                    73..=79 => {
+                        life.build_one()?;
+                    }
+                    80..=93 => life.land_one(&mut rng)?,
                     _ => life.checkpoint()?,
                 }
             }
@@ -886,12 +905,64 @@ fn another_writer_fences_the_life() {
     life.post_head().unwrap();
     life.store.write(life.remote, &mut life.cache, 1, 0, &content(3)).unwrap();
     life.remote.objects.insert("e1/s1".into(), b"another writer".to_vec());
-    let out = life.store.cut(&mut life.cache).unwrap();
-    let r = ship(life.remote, &out[0], 3);
+    life.store.cut().unwrap();
+    let out = life.store.build_next(&mut life.cache).unwrap().expect("a segment");
+    let r = ship(life.remote, &out, 3);
     assert!(matches!(r, Err(StoreError::Fenced(_))), "{r:?}");
     life.store.fence();
     assert!(matches!(life.store.write(life.remote, &mut life.cache, 1, 0, &content(4)), Err(StoreError::Fenced(_))));
-    assert!(matches!(life.store.cut(&mut life.cache), Err(StoreError::Fenced(_))));
+    assert!(matches!(life.store.cut(), Err(StoreError::Fenced(_))));
+}
+
+// Goal: a cut is the disk at its instant, however long its segment waits
+// to be built: a write after the cut, whole or partial, or a discard,
+// reaches the next cut and not that one. Method: write, cut, write again
+// before the build, crash with only the first cut landed, and reopen.
+#[test]
+fn a_write_after_its_cut_stays_out_of_that_cut() {
+    let mut remote = SimRemote::new(14, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    let (a, b) = (content(500), content(501));
+    for (e, bytes) in [(3u64, &a), (4, &a), (5, &a)] {
+        life.store.write(life.remote, &mut life.cache, e, 0, bytes).unwrap();
+        life.model.live.insert(e, bytes.clone());
+    }
+    life.flush().unwrap();
+    // before the cut's segment is built: a whole write, a partial write, a discard
+    life.store.write(life.remote, &mut life.cache, 3, 0, &b).unwrap();
+    life.store.write(life.remote, &mut life.cache, 4, 100, &b[..50]).unwrap();
+    life.store.punch(&mut life.cache, 5).unwrap();
+    let mut four = a.clone();
+    four[100..150].copy_from_slice(&b[..50]);
+    // reads see the newest bytes meanwhile
+    let mut buf = vec![0u8; EXT];
+    life.store.read(life.remote, &mut life.cache, 3, &mut buf).unwrap();
+    assert_eq!(buf, b);
+    life.land_all(&mut Rng(5)).unwrap();
+    assert!(life.cache.shadows.is_empty(), "every copy kept apart was used");
+    // a crash now: the second cut never happened
+    let exp = life.model.after_crash(life.remote);
+    assert_eq!(exp.get(&3), Some(&a));
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    for e in [3, 4, 5] {
+        life.read_check(e).unwrap();
+    }
+    // and the writes after the cut, cut and landed in the next life's
+    // terms, are what a later open sees
+    life.post_head().unwrap();
+    life.store.write(life.remote, &mut life.cache, 3, 0, &b).unwrap();
+    life.model.live.insert(3, b.clone());
+    life.store.write(life.remote, &mut life.cache, 4, 0, &four).unwrap();
+    life.model.live.insert(4, four);
+    life.flush().unwrap();
+    life.land_all(&mut Rng(5)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+    for e in [3, 4, 5] {
+        life.read_check(e).unwrap();
+    }
 }
 
 // Goal: the head's rules, each case: a new disk, a new life, a later

@@ -50,12 +50,19 @@ pub trait CacheGate {
     fn write(&mut self, extent: u64, bytes: &[u8]) -> std::io::Result<()>;
     /// The extent reads as zeros from now on.
     fn punch(&mut self, extent: u64) -> std::io::Result<()>;
+    /// Keeps the extent's bytes as they are now, apart, for the cut
+    /// segment `seq` that named them: a write is about to change them
+    /// before that segment is built (copy on write).
+    fn shadow_save(&mut self, extent: u64, seq: u64) -> std::io::Result<()>;
+    /// The bytes `shadow_save` kept, into `buf`; the copy is then freed.
+    fn shadow_take(&mut self, extent: u64, seq: u64, buf: &mut [u8]) -> std::io::Result<()>;
 }
 
 /// A cache in memory: tests and the simulator.
 #[derive(Default)]
 pub struct MemCache {
     pub extents: std::collections::BTreeMap<u64, Vec<u8>>,
+    pub shadows: std::collections::BTreeMap<(u64, u64), Vec<u8>>,
 }
 
 impl CacheGate for MemCache {
@@ -72,6 +79,16 @@ impl CacheGate for MemCache {
     }
     fn punch(&mut self, extent: u64) -> std::io::Result<()> {
         self.extents.remove(&extent);
+        Ok(())
+    }
+    fn shadow_save(&mut self, extent: u64, seq: u64) -> std::io::Result<()> {
+        let now = self.extents.get(&extent).cloned().unwrap_or_else(|| vec![0u8; fpac_format::limits::EXTENT_BYTES as usize]);
+        assert!(self.shadows.insert((extent, seq), now).is_none(), "one copy per extent and segment");
+        Ok(())
+    }
+    fn shadow_take(&mut self, extent: u64, seq: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let b = self.shadows.remove(&(extent, seq)).ok_or_else(|| std::io::Error::other("no such shadow"))?;
+        buf.copy_from_slice(&b);
         Ok(())
     }
 }

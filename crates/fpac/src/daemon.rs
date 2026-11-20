@@ -368,7 +368,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
@@ -442,7 +442,7 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
         let frozen = linux::freeze(dir);
         event(t0, "ext4-frozen", json!({ "ok": frozen.is_ok(), "error": frozen.err().map(|e| e.to_string()) }));
     }
-    progress.stop();
+    disk.stop_flusher();
     let _ = flusher.join();
     let last = flush::last(&disk, &progress).map_err(|e| e.to_string());
     status_writer(state.to_path_buf(), t0)(&disk, &progress);
