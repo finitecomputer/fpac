@@ -777,6 +777,12 @@ pub fn room(p: &mut dyn Place, ceiling: u64) -> Result<Value, String> {
 /// acknowledged file.
 pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     let st = p.start()?;
+    // the daemon's log and status on a tmpfs: on the disk this fills, they
+    // would stop the moment it is full (the guest's own kernel mounts it)
+    let (code, out) = p.sh("mkdir -p /run/fpac && (mountpoint -q /run/fpac || mount -t tmpfs -o size=64m tmpfs /run/fpac) && echo state-on-tmpfs")?;
+    if code != 0 || !out.contains("state-on-tmpfs") {
+        return Err(format!("the state's tmpfs: {out}"));
+    }
     let m = mount(p)?;
     let free = guest_free(p)?;
     // a computer's own disk only, never one this run should not fill
