@@ -130,8 +130,11 @@ landing. What it costs:
 - **The sleep's flush.** A sleep ships the backlog first: up to 50 to
   80 s right after a 4 GiB burst (measured on Cloudflare: 52 s and 82 s
   for 3.2 and 3.4 GB left after a 100 GB fill, `wake.json`), and 2.3 to
-  3.7 s otherwise, at 1 to 100 GB. Section 10's "≤ 4 s at any size" holds
-  only when no burst is behind.
+  3.7 s otherwise, at 1 to 100 GB. **Decided (the owner, 2026-11-20):**
+  the 4 GiB budget stays and section 10's sleep line holds for a disk at
+  rest; right after a burst a sleep takes as long as shipping its backlog
+  does. A wake cancels a sleep, so a person who comes back never waits
+  on it.
 
 ## The cache
 
@@ -260,7 +263,7 @@ the cache; "cold" is after a wake on a host with an empty cache.
 | SQLite: 10,000 single-row transactions (`FULL`, `NORMAL`); 1 M rows in one; 100,000 point reads | ≤ 1.25× local |
 | Sequential write, 4 GiB and an fsync | ≥ 0.7× local; shipped behind it at ≥ 50 MB/s |
 | 4 KiB random write, 30 s and an fsync | ≥ 0.7× local |
-| A sleep's flush | ≤ 4 s at any size |
+| A sleep's flush | ≤ 4 s for a disk at rest (after a burst: its backlog's shipping, decided) |
 
 **The sniff test:** the store alone should read cached blocks at 1 GB/s
 and take writes at 300 MB/s on a workstation; through the loop device it

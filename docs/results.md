@@ -32,7 +32,7 @@ container sustained to R2 in P2). **R2 modelled is not R2.**
 | SQLite: 10,000 transactions (`FULL`, `NORMAL`); 1 M rows in one; 100,000 point reads | ≤ 1.25× local | 0.02–1.00× | 0.31–0.93× | yes (it failed at 1.28× before item 1) |
 | Sequential write, 4 GiB and an fsync | ≥ 0.7× local; shipped behind it at ≥ 50 MB/s | 0.71–1.97× (the host's own disk varies); 43–45 MB/s, the stand-in's 50 MB/s pipe the bound | **0.45×** (322 against 714 MB/s); 85 MB/s behind | **no** on Cloudflare (0.40× before item 1's changes) |
 | 4 KiB random write, 10 s and an fsync | ≥ 0.7× local | 0.66–1.87× (the host's own run varied 0.8–1.8 M IOPS) | 39.7× | yes |
-| A sleep's flush | ≤ 4 s at any size | 0.2–1.1 s | 2.3–3.7 s at 1 to 100 GB; 52 and 82 s right after a 100 GB fill | **no right after a burst**: a sleep ships the backlog (up to 4 GiB) first |
+| A sleep's flush | ≤ 4 s for a disk at rest (decided: after a burst, as long as shipping the backlog takes) | 0.2–1.1 s | 2.3–3.7 s at 1 to 100 GB at rest; 52 and 82 s right after a 100 GB fill | yes, as decided |
 | An office save (spike.md, acceptance 6) | ≤ 1.5× local | 0.31–0.33 ms against 2.45–8.8 ms | **3.81 against 0.96 ms** p50 beside the shipping (12.4 before the shipping's priority, 4.98 before item 1); 0.65 against 0.94 ms with nothing shipping | **no** beside the shipping on Cloudflare; yes at rest |
 | 100 GB: the open does not grow with the data (item 2) | flat | 191–278 ms at 1 and 10 GB of a 120 GiB volume, R2 modelled | 0.51–1.0 s at 1 and 10 GB, 0.90–0.92 s at 100 GB, one round each | nearly: the checkpoint's list of 12,800 live segments (614 KB) is the difference |
 | Nothing flushed is lost (crash rounds) | every round | 70 of 70 (50 plain, 20 R2 modelled) | 10 of 10; the mount after a crash 2.4–3.4 s (6.9 s p50 before item 4's boost) | yes |
@@ -290,12 +290,12 @@ recommendation.
 - Hermes' first reply crosses the relay twice per call (STAND-INS for the
   API and the model); fragment's real API and model would differ.
 
-## For the owner
+## Decided (the owner, 2026-11-20)
 
-- **The sleep line** ("≤ 4 s at any size") cannot hold right after a burst
-  with the 4 GiB budget the owner approved: a sleep ships the backlog
-  first (52 and 82 s after a 100 GB fill). Keep the line for a disk at
-  rest, and accept a sleep the length of the backlog after a burst?
-- **A sealed disk and the cleaner** (A): the platform cannot read a sealed
-  checkpoint's list of what it names. Keep that list (object names only)
-  in the clear, authenticated by the seal?
+- **The sleep line holds for a disk at rest.** The 4 GiB unshipped budget
+  stays; right after a burst a sleep may take as long as shipping 4 GiB
+  takes (52 and 82 s after a 100 GB fill). A wake cancels a sleep, so a
+  person who comes back never waits on it.
+- **A sealed checkpoint's list of the objects it names is in the clear,**
+  authenticated by its seal but not encrypted, so the platform's cleaner
+  can plan from it (A, item 6).
