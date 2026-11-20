@@ -262,3 +262,26 @@ fn sealed_packs_and_objects_open_only_where_sealed() {
     assert_eq!(s.open_object("e1/m1-1", &sealed), Err(FormatError::Sealed));
     assert!(!sealed.windows(8).any(|w| w == b"FPACMAP1"), "a sealed page shows nothing plain");
 }
+
+// Goal: a sealed disk's checkpoint is readable without the key (what it
+// names is the platform's cleaner's) and authenticated by it: a byte
+// changed, another name or another key is refused. Method: a checkpoint
+// authenticated, read back each way.
+#[test]
+fn an_authenticated_checkpoint_reads_without_the_key_and_verifies_with_it() {
+    let s = Sealer::new(&[7u8; 32], "disk-a");
+    let c = Checkpoint { epoch: 3, seq: 2, end: GENESIS, volume_bytes: 1 << 30, pack: None, crash_pack: None, pages: vec![PageRef { page: 1, epoch: 3, seq: 2, sum: [9; 32] }], boot_pages: vec![], segments: vec![(SegId { epoch: 3, seq: 1 }, [8; 32])] };
+    let plain = encode_checkpoint(&c);
+    let auth = s.authenticate_object("e3/c2", &plain);
+    assert_eq!(decode_checkpoint_unverified(&auth).unwrap(), c, "readable without the key");
+    assert_eq!(decode_checkpoint_unverified(&plain).unwrap(), c, "a plain disk's too");
+    assert_eq!(s.verify_object("e3/c2", &auth).unwrap(), plain);
+    assert_eq!(s.verify_object("e3/c3", &auth), Err(FormatError::Sealed), "another name");
+    assert_eq!(Sealer::new(&[8u8; 32], "disk-a").verify_object("e3/c2", &auth), Err(FormatError::Sealed), "another key");
+    for i in [0, 8, 40, auth.len() - 1] {
+        let mut bad = auth.clone();
+        bad[i] ^= 1;
+        assert!(s.verify_object("e3/c2", &bad).is_err(), "byte {i} changed");
+    }
+}
+

@@ -20,7 +20,7 @@ pub mod limits;
 pub mod seal;
 
 use limits::*;
-pub use seal::{Place, Sealer, SEALED_EXTENT_BYTES, SEALED_PREFIX_BYTES, TAG_BYTES};
+pub use seal::{authenticated_contents, Place, Sealer, SEALED_EXTENT_BYTES, SEALED_PREFIX_BYTES, TAG_BYTES};
 use sha2::{Digest, Sha256};
 
 pub type Sum = [u8; 32];
@@ -595,6 +595,16 @@ pub fn encode_checkpoint(c: &Checkpoint) -> Vec<u8> {
     w.seal();
     assert!(w.0.len() as u64 <= CHECKPOINT_BYTES_MAX);
     w.0
+}
+
+/// A checkpoint as the platform's cleaner reads it: plain, or a sealed
+/// disk's authenticated one (its tag not checked: the cleaner has no key).
+pub fn decode_checkpoint_unverified(b: &[u8]) -> Result<Checkpoint, FormatError> {
+    match authenticated_contents(b) {
+        Ok(plain) => decode_checkpoint(plain),
+        Err(FormatError::Magic(_)) => decode_checkpoint(b),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {

@@ -35,8 +35,12 @@ pub const SEALED_PREFIX_BYTES: u32 = 16;
 pub(crate) const SEGMENT_SEALED_MAGIC: &[u8; 8] = b"FPACSEGS";
 pub(crate) const PACK_SEALED_MAGIC: &[u8; 8] = b"FPACPAKS";
 const OBJECT_SEALED_MAGIC: &[u8; 8] = b"FPACSEAL";
-/// What sealing adds to a whole object (a page, a checkpoint): its magic
-/// and its tag. A sealed object's limit is its plain limit and this.
+/// A whole object kept readable and authenticated (a checkpoint: decided
+/// 2026-11-20, so the platform's cleaner can read what it names).
+const OBJECT_AUTH_MAGIC: &[u8; 8] = b"FPACAUTH";
+/// What sealing (or authenticating) adds to a whole object (a page, a
+/// checkpoint): its magic and its tag. Its limit is its plain limit and
+/// this.
 pub const SEALED_OBJECT_EXTRA_BYTES: u64 = 8 + TAG_BYTES as u64;
 /// The associated data's first bytes: which scheme sealed it.
 const DOMAIN: &[u8; 8] = b"fpacsiv1";
@@ -166,6 +170,37 @@ impl Sealer {
         Ok(plain)
     }
 
+    /// A tag over `plain` at `name`: GCM-SIV over nothing, its associated
+    /// data the place and the bytes, so it authenticates without hiding.
+    fn tag_over(&self, name: &str, plain: &[u8]) -> [u8; 16] {
+        let (n, mut ad) = self.nonce_ad(Place::Object(name));
+        ad.extend_from_slice(plain);
+        let tag = self.aead.encrypt_inout_detached(&n, &ad, (&mut [][..]).into()).expect("a tag within GCM-SIV's limits");
+        tag.into()
+    }
+
+    /// A whole object kept readable, authenticated by the key:
+    /// `FPACAUTH`, its bytes, a tag over them (a sealed disk's checkpoint:
+    /// what it names is the cleaner's to read, docs/encryption.md).
+    pub fn authenticate_object(&self, name: &str, plain: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + plain.len() + TAG_BYTES as usize);
+        out.extend_from_slice(OBJECT_AUTH_MAGIC);
+        out.extend_from_slice(plain);
+        out.extend_from_slice(&self.tag_over(name, plain));
+        out
+    }
+
+    /// The plain bytes of an authenticated object named `name`; refused
+    /// when its tag is not this key's over these bytes at this name.
+    pub fn verify_object(&self, name: &str, auth: &[u8]) -> Result<Vec<u8>, FormatError> {
+        let plain = authenticated_contents(auth)?;
+        let tag: [u8; 16] = auth[auth.len() - TAG_BYTES as usize..].try_into().expect("16");
+        let (n, mut ad) = self.nonce_ad(Place::Object(name));
+        ad.extend_from_slice(plain);
+        self.aead.decrypt_inout_detached(&n, &ad, (&mut [][..]).into(), &Tag::from(tag)).map_err(|_| FormatError::Sealed)?;
+        Ok(plain.to_vec())
+    }
+
     /// A sealed extent's sum: the first 8 bytes of its tag (what the map
     /// keeps, and a pack entry names).
     pub fn sum_of(tag: &[u8; 16]) -> u64 {
@@ -186,3 +221,17 @@ impl Sealer {
         self.open_detached(at, out, &tag)
     }
 }
+
+/// What an authenticated object holds, read without the key and so not
+/// checked: the platform's cleaner reads a sealed disk's checkpoints so
+/// (the guest checks them with `Sealer::verify_object`).
+pub fn authenticated_contents(auth: &[u8]) -> Result<&[u8], FormatError> {
+    if auth.len() < 8 + TAG_BYTES as usize {
+        return Err(FormatError::Short { what: "an authenticated object", need: 8 + TAG_BYTES as usize, got: auth.len() });
+    }
+    if &auth[..8] != OBJECT_AUTH_MAGIC {
+        return Err(FormatError::Magic("an authenticated object"));
+    }
+    Ok(&auth[8..auth.len() - TAG_BYTES as usize])
+}
+

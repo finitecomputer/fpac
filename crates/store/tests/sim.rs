@@ -685,7 +685,12 @@ fn a_sealed_disk_opens_only_with_its_key() {
         life.model.live.insert(e, b);
     }
     life.sleep(&mut Rng(5)).unwrap();
-    assert!(remote.objects.values().all(|o| !o.windows(8).any(|w| w == b"FPACCKP3" || w == b"FPACMAP1" || w == b"FPACSEG1")), "nothing plain is stored");
+    // segments and pages hidden; a checkpoint readable (what it names is
+    // the cleaner's to read) and authenticated
+    assert!(remote.objects.iter().filter(|(n, _)| !n.contains("/c")).all(|(_, o)| !o.windows(8).any(|w| w == b"FPACMAP1" || w == b"FPACSEG1")), "no segment or page in the clear");
+    let cr = platform.head.unwrap().checkpoint.unwrap();
+    let ck = &remote.objects[&format::checkpoint_name(cr.epoch, cr.seq)];
+    assert!(format::decode_checkpoint_unverified(ck).is_ok(), "the cleaner reads a sealed disk's checkpoint");
     for (seal, why) in [(Some(Sealer::new(&[2u8; 32], "sim")), "another key"), (Some(Sealer::new(&[1u8; 32], "other")), "another disk"), (None, "no key")] {
         let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: seal.map(std::sync::Arc::new) };
         assert!(matches!(Store::open(&mut remote, &info), Err(StoreError::Corrupt(_))), "{why} is refused");

@@ -415,7 +415,7 @@ impl Store {
         if format::sha256(&body) != cr.sum {
             return Err(StoreError::Corrupt(format!("{name} is not the checkpoint the head names")));
         }
-        let c = format::decode_checkpoint(&self.opened_object(&name, &body)?).map_err(|e| StoreError::Corrupt(format!("{name}: {e}")))?;
+        let c = format::decode_checkpoint(&self.verified_checkpoint(&name, &body)?).map_err(|e| StoreError::Corrupt(format!("{name}: {e}")))?;
         if (c.epoch, c.seq) != (cr.epoch, cr.seq) {
             return Err(StoreError::Corrupt(format!("{name} names itself otherwise")));
         }
@@ -672,6 +672,15 @@ impl Store {
         match &self.seal {
             Some(s) => s.seal_object(name, &plain),
             None => plain,
+        }
+    }
+
+    /// A checkpoint's plain bytes, from those stored: on a sealed disk,
+    /// checked against its tag.
+    fn verified_checkpoint(&self, name: &str, body: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match &self.seal {
+            Some(s) => s.verify_object(name, body).map_err(|e| StoreError::Corrupt(format!("{name}: {e}"))),
+            None => Ok(body.to_vec()),
         }
     }
 
@@ -1232,7 +1241,14 @@ impl Store {
         assert!(segments.len() <= LIVE_SEGMENTS_MAX as usize, "live segments past their limit: the cleaner's compaction is P5's");
         let boot_pages: Vec<u32> = self.boot_pages.iter().copied().filter(|p| pages.contains_key(p)).collect();
         let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, crash_pack: self.crash_pack, pages: pages.into_values().collect(), boot_pages, segments };
-        let body = self.sealed_object(&format::checkpoint_name(self.epoch, seq), format::encode_checkpoint(&c));
+        // a sealed disk's checkpoint is readable and authenticated, not
+        // sealed: what it names is the platform's cleaner's to read
+        let name = format::checkpoint_name(self.epoch, seq);
+        let plain = format::encode_checkpoint(&c);
+        let body = match &self.seal {
+            Some(s) => s.authenticate_object(&name, &plain),
+            None => plain,
+        };
         let cr = CheckpointRef { epoch: self.epoch, seq, sum: format::sha256(&body) };
         out.push(Outgoing { name: format::checkpoint_name(self.epoch, seq), body, kind: Kind::Checkpoint(cr) });
         out
@@ -1242,7 +1258,7 @@ impl Store {
     /// checkpoints build on. The pages it wrote are clean.
     pub fn checkpoint_landed(&mut self, objects: &[Outgoing]) {
         let Some(Outgoing { name, body, kind: Kind::Checkpoint(cr) }) = objects.last() else { panic!("a checkpoint's objects end with it") };
-        let c = format::decode_checkpoint(&self.opened_object(name, body).expect("a checkpoint we sealed opens")).expect("a checkpoint we made decodes");
+        let c = format::decode_checkpoint(&self.verified_checkpoint(name, body).expect("a checkpoint we authenticated verifies")).expect("a checkpoint we made decodes");
         assert_eq!(c.end, self.applied_end, "a checkpoint lands before anything else is applied");
         self.pages_dirty.clear();
         self.segments_landed_since = 0;

@@ -36,7 +36,8 @@ associated data.
 | -- | -- | -- |
 | A segment's image | segment (epoch, seq), extent, offset in the object | after its 64 KiB; the map keeps its first 8 bytes in place of sum64 |
 | A segment's header | the segment's name | after the header, before the first image |
-| A map page, a checkpoint | its name | at its end |
+| A map page | its name | at its end |
+| A checkpoint: **authenticated, not sealed** (decided 2026-11-20) | its name and all its bytes | at its end; its bytes stay readable |
 | A pack's header | its name | after the header |
 | A packed extent | the pack's name, its index, its extent | after its 64 KiB |
 | An extent in the cache file | the life, the extent, this life's count of writes to it | in memory, with the count |
@@ -45,21 +46,30 @@ So no sealed piece can be spliced into another object, moved within one,
 or swapped for another disk's; in the cache, an earlier write of the same
 extent fails as surely as a changed byte (the count is in memory). Object
 names, sizes and the clear prefixes (a segment's or pack's magic and
-count) are not sealed.
+count) are not sealed. Nor is a checkpoint (decided by the owner,
+2026-11-20): it names the map pages, the live segments and the packs a
+disk keeps, with their checksums and its own place in the chain, all of
+it object names or hashes of ciphertext. Kept readable and authenticated
+by the key, it lets the platform's cleaner plan deletes from it without
+the key (item 6), and the guest still refuses one changed in any byte.
+What the cleaner cannot do on a sealed disk is compact: that reads the
+sealed map pages and images, so it is the guest's to do.
 
 **What a read checks.** A fetched image opens at its place, and its tag
 must be the one the map names: the tag replaces sum64, and a wrong ranged
 read (R2 served two in P2) fails its seal and is fetched again, as a wrong
-sum was. A page or checkpoint is checked by its SHA-256 (what names it)
-and opens under its name. A cached clean extent whose seal fails is
+sum was. A page or checkpoint is checked by its SHA-256 (what names it);
+a page opens under its name, and a checkpoint's tag is checked over its
+bytes and its name. A cached clean extent whose seal fails is
 dropped and fetched again; a dirty one (the cache is its only copy) is an
 I/O error.
 
 **The layouts** (crates/format/src/seal.rs): a segment is `FPACSEGS`, its
 count, its plain header sealed (the header's own SHA-256 kept inside, so
 the chain of links is unchanged), then each image and its tag; a pack is
-`FPACPAKS` the same way; a page or checkpoint is `FPACSEAL`, its plain
-bytes sealed, its tag.
+`FPACPAKS` the same way; a page is `FPACSEAL`, its plain bytes sealed,
+its tag; a checkpoint is `FPACAUTH`, its plain bytes, then a tag over
+them (GCM-SIV over nothing, its associated data the name and the bytes).
 
 ## What it costs
 
