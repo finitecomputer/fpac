@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX, PACK_EXTENTS_MAX};
+use fpac_format::limits::{EXTENT_BYTES, FETCH_TRIES_MAX, LIVE_SEGMENTS_MAX, PACK_EXTENTS_MAX};
 use fpac_format::{self as format};
 use fpac_remote::limits::OBJECT_BYTES_MAX;
 use fpac_remote::{Put, RemoteError};
@@ -438,7 +438,7 @@ impl Life<'_> {
             }
         }
         // the pages it rewrites that are not loaded yet
-        for pr in self.store.checkpoint_needs() {
+        for pr in self.store.checkpoint_needs(self.sleeping) {
             self.step()?;
             let mut body = Vec::new();
             // Bounded: the faults are a few in a thousand calls.
@@ -863,6 +863,82 @@ impl RemoteGate for Recording<'_> {
     }
     fn prefetch(&mut self, asks: &[Ask]) {
         self.rounds.push((self.reads.len(), asks.to_vec()));
+    }
+}
+
+// Goal: an open's work does not grow with the data. A checkpoint that
+// lists more than half LIVE_SEGMENTS_MAX segments (a disk past about
+// 64 GiB of 8 MiB segments) opens with no page fetched but the boot's;
+// the life's first checkpoint loads every page instead, off the wake's
+// path, and then lists exactly the segments the map names; a sleep loads
+// none (it has 4 s). Method: a disk with pages 0, 1 and 3, its last
+// checkpoint made again by hand listing 9,000 segments more; open it
+// through a gate that records; a life that writes and sleeps; a life that
+// writes, lands and checkpoints.
+#[test]
+fn an_open_past_half_the_live_list_fetches_no_page() {
+    let mut remote = SimRemote::new(13, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    life.store.stop_boot();
+    for e in [0u64, 1, 4096, 12_288] {
+        let b = content(400 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.store.record_boot();
+    life.store.read(life.remote, &mut life.cache, 0, &mut vec![0u8; EXT]).unwrap();
+    life.sleep(&mut Rng(3)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    // the same checkpoint, listing segments a larger disk would
+    let cr = platform.head.unwrap().checkpoint.unwrap();
+    let mut c = format::decode_checkpoint(&remote.objects[&format::checkpoint_name(cr.epoch, cr.seq)]).unwrap();
+    let extra = u64::from(LIVE_SEGMENTS_MAX) / 2 + 808;
+    c.segments.extend((0..extra).map(|i| (format::SegId { epoch: 1, seq: 100_000 + i }, [7u8; 32])));
+    c.seq += 1;
+    let body = format::encode_checkpoint(&c);
+    let sum = format::sha256(&body);
+    remote.objects.insert(format::checkpoint_name(c.epoch, c.seq), body);
+    platform.head = Some(Head { epoch: 1, checkpoint: Some(fpac_store::CheckpointRef { epoch: 1, seq: c.seq, sum }), clean: true });
+    platform.running = 2;
+    let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head }).unwrap();
+    assert_eq!(s.opened().pages, 3);
+    let pages: Vec<&Ask> = gate.reads.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).collect();
+    assert!(pages.len() == 1 && matches!(pages[0], Ask::Whole(n) if n.ends_with("-0")), "the boot's page only: {pages:?}");
+    assert_eq!(s.pages_unloaded(), 2);
+    drop(gate);
+    // a write and a sleep: the sleep loads no page (its list fits the
+    // limit) and keeps the long list
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    life.post_head().unwrap();
+    let b = content(500);
+    life.store.write(life.remote, &mut life.cache, 1, 0, &b).unwrap();
+    life.model.live.insert(1, b);
+    life.sleep(&mut Rng(3)).unwrap();
+    assert_eq!(life.store.pages_unloaded(), 2, "the sleep loaded no page");
+    let cr = life.platform.head.unwrap().checkpoint.unwrap();
+    let c = format::decode_checkpoint(&life.remote.objects[&format::checkpoint_name(cr.epoch, cr.seq)]).unwrap();
+    assert!(c.segments.len() as u64 > extra, "{} segments", c.segments.len());
+    let exp = life.model.after_crash(life.remote);
+    // the next life's first checkpoint, in the flusher
+    platform.running = 3;
+    let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+    life.post_head().unwrap();
+    assert_eq!(life.store.pages_unloaded(), 2);
+    let b = content(501);
+    life.store.write(life.remote, &mut life.cache, 1, 0, &b).unwrap();
+    life.model.live.insert(1, b);
+    life.flush().unwrap();
+    life.land_all(&mut Rng(3)).unwrap();
+    life.checkpoint().unwrap();
+    assert_eq!(life.store.pages_unloaded(), 0, "the first checkpoint loaded every page");
+    let cr = life.platform.head.unwrap().checkpoint.unwrap();
+    let c = format::decode_checkpoint(&life.remote.objects[&format::checkpoint_name(cr.epoch, cr.seq)]).unwrap();
+    assert!(c.segments.len() <= 4, "the list is exact again: {} segments", c.segments.len());
+    for e in [0u64, 1, 4096, 12_288] {
+        life.read_check(e).unwrap();
     }
 }
 

@@ -291,16 +291,13 @@ quote them as they are.
 
 *Each item stays here until it is paid.*
 
-- **A segment is built under the store's lock** (reading up to 8 MiB
-  from the cache file and hashing it, about 10 ms): writes pause that
-  long, a few times a second while shipping. Building outside the lock
-  (take the images under it, encode outside, register in order) removes
-  it. Delete when a pause shows in `tools.json` or the agent's turns.
 - **The checkpoint's live-segment list is a superset while map pages are
   unloaded** (lazy pages): a segment only an unloaded page names can't be
-  told dead. Past half of LIVE_SEGMENTS_MAX a checkpoint loads every page
-  and lists exactly. The cleaner, which reads every page, keeps it exact
-  (P5's item 6).
+  told dead. Past half of LIVE_SEGMENTS_MAX a periodic checkpoint loads
+  every page, in the flusher, and lists exactly. An open and a sleep load
+  every page only when their list would pass the limit itself, so neither
+  grows with the data (a disk past about 64 GiB is past half). The
+  cleaner, which reads every page, keeps it exact (P5's item 6).
 - **Live segments are never compacted**: an extent rewritten often
   leaves old segments live while any extent in them is current. Bounded
   by LIVE_SEGMENTS_MAX (asserted); the cleaner's compaction is the fix.

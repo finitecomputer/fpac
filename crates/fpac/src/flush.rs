@@ -194,7 +194,7 @@ pub fn checkpoint(disk: &Disk, p: &Progress, clean: bool) -> Result<(), StoreErr
     }
     // the pages it rewrites that are not loaded yet (only this thread lands
     // segments, so none becomes dirty meanwhile)
-    let needs = disk.inner.lock().unwrap().store.checkpoint_needs();
+    let needs = disk.inner.lock().unwrap().store.checkpoint_needs(clean);
     for pr in needs {
         // Bounded: an unavailable remote is retried a few times, then the
         // checkpoint waits for the next turn.

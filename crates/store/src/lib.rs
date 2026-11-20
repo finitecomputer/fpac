@@ -377,7 +377,7 @@ impl Store {
         }
         // the pages a replay changed are loaded now: the head's preparation
         // checkpoints them (a wake after a crash)
-        let need = s.checkpoint_needs();
+        let need = s.open_needs();
         if !need.is_empty() {
             remote.prefetch(&need.iter().map(|p| Ask::Whole(page_name(p))).collect::<Vec<_>>());
             for pr in need {
@@ -492,14 +492,33 @@ impl Store {
         out
     }
 
+    /// The pages an open loads before its head: those its replay changed,
+    /// which the head's checkpoint rewrites. Every page only when that
+    /// checkpoint's list (the last one's and the segments replayed) could
+    /// pass LIVE_SEGMENTS_MAX: past half of it, `checkpoint_needs` loads
+    /// every page at the life's first checkpoint instead, in the flusher,
+    /// so the open stays the same size however much the disk holds.
+    fn open_needs(&self) -> Vec<PageRef> {
+        self.needs(self.opened.replayed as usize, LIVE_SEGMENTS_MAX)
+    }
+
     /// The pages a checkpoint would rewrite that are not loaded: fetch and
     /// install each before `checkpoint`.
     /// When the live list (a superset while pages are unloaded) passes
     /// half its limit, every page: the checkpoint then lists exactly the
-    /// segments the map names.
-    pub fn checkpoint_needs(&self) -> Vec<PageRef> {
-        let superset = self.checkpoint.as_ref().map_or(0, |c| c.segments.len()) + self.segments_landed_since;
-        if !self.unloaded.is_empty() && superset > LIVE_SEGMENTS_MAX as usize / 2 {
+    /// segments the map names. A sleep's checkpoint loads every page only
+    /// when the list would pass the limit itself: a sleep has 4 s, and at
+    /// 100 GB every page is about 70 MB.
+    pub fn checkpoint_needs(&self, sleep: bool) -> Vec<PageRef> {
+        self.needs(self.segments_landed_since, if sleep { LIVE_SEGMENTS_MAX } else { LIVE_SEGMENTS_MAX / 2 })
+    }
+
+    /// The pages not loaded that a checkpoint now rewrites; every page not
+    /// loaded when the last checkpoint's list and `since` more segments
+    /// pass `limit`.
+    fn needs(&self, since: usize, limit: u32) -> Vec<PageRef> {
+        let superset = self.checkpoint.as_ref().map_or(0, |c| c.segments.len()) + since;
+        if !self.unloaded.is_empty() && superset > limit as usize {
             return self.unloaded.values().copied().collect();
         }
         self.pages_dirty.iter().filter_map(|p| self.unloaded.get(p).copied()).collect()
