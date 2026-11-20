@@ -235,8 +235,11 @@ the live ones.
 Measured on Cloudflare (`docs/evidence/clean.json`): a disk of 1.2 GB
 stored, its 512 MiB of files three quarters rewritten in place. A pass
 moved 2,056 extents (128 MiB) out of 69 segments in 65 s, from a 2-vCPU
-container, one extent at a time (the leftover is to read each segment
-whole). Two lives later the delete pass, planned in 2 s, deleted 98
+container, reading a run of live extents at a time. It now reads each
+segment it moves in one ranged get, from its first live image to its
+last: on krun with R2's costs modelled the same pass went from 54.8 s to
+14.2 s (the rest is the new segments' puts and a round trip a segment).
+Two lives later the delete pass, planned in 2 s, deleted 98
 objects (742 MB): the store went from 1,407 MB to 666 MB. A cleaner killed
 30 s into its pass, and the disk after the deletes, each opened whole:
 every file, SQLite, git and `e2fsck -f -n` checked.

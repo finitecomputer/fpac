@@ -304,7 +304,8 @@ place (1.2 GB stored):
 
 The simulator stops a cleaner at every step and opens the disk after
 each; a delete plan that keeps too little fails its test (a planted one
-did). **Passes**, slowly: the pass reads one extent at a time.
+did). **Passes.** It was slow (a run of live extents a get); now each
+segment it moves is one ranged get (below, leftover 1).
 
 The store builds for `wasm32-unknown-unknown`, the platform's Worker's
 target, so compaction can run there, beside R2, with no container egress.
@@ -351,6 +352,28 @@ A unit test holds `room_bound` to its rules (the mount's rule with
 nothing cached, the floor, the ceiling, the room taken back). One PR, as
 sized. **Passes.**
 
+### Leftover 1. Compaction reads each segment it moves once (`clean.json`, krun)
+
+The pass read a run of live extents at a time (one to four, in a segment
+a quarter live and scattered): a round trip each. Now one ranged get per
+segment, from its first live image to its last, each extent installed
+from its own place (the dead between come along, unused). The same
+cleaner's run on krun, R2's costs modelled (90 ms an object call, puts
+sharing 50 MB/s):
+
+| | Before (`8f26f3d`) | After (`85d99b9`) |
+| -- | --: | --: |
+| A pass: extents moved, segments | 2,050 from 65 | 2,056 from 66 |
+| Its time | 54.8 s | **14.2 s** |
+| Killed 5 s in, then the next life | all checked | all checked |
+| The delete pass; the store | 86 objects; 1,405 → 665 MB | 89 objects; 1,406 → 665 MB |
+| The life after the deletes | all checked | all checked |
+
+The simulator counts the gets: 40 for 4 segments before, 4 now (the test
+failed before the change). What is left of the 14 s is the new segments'
+puts (128 MiB at 50 MB/s) and a round trip per segment; gets in
+parallel would take a few seconds more off. **Passes.**
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -370,13 +393,11 @@ sized. **Passes.**
    (plan PR list).
 7. **The harness's 19th Hermes start that never replied** (outside this
    repository).
-8. **Compaction reads each segment whole** (one get, its live extents
-   taken from it), not one extent at a time: 65 s for 128 MiB now. One PR.
-9. **The cleaner in the platform's Worker**: the remote gate over the R2
+8. **The cleaner in the platform's Worker**: the remote gate over the R2
    binding, compaction as a Durable Object's alarm after a sleep, the
    delete pass from the stored head. Fragment's cell, two PRs.
-10. **A sealed disk's compaction**, by a life that holds its key (its
-    pages are sealed). One PR.
+9. **A sealed disk's compaction**, by a life that holds its key (its
+   pages are sealed). One PR.
 
 ## Gaps
 
