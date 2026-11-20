@@ -1,0 +1,7 @@
+# One toolchain for every build here and in CI, so a release's digest can
+# be made again (docs/release.md). The fuzz targets name nightly themselves.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy"]
+targets = ["x86_64-unknown-linux-musl", "wasm32-unknown-unknown"]

@@ -1,5 +1,7 @@
-# The checks on every push: the workspace on stable (clippy, tests), and
-# each fuzz target briefly on nightly, as its own job.
+# The checks on every push: the workspace on Linux and macOS (clippy,
+# tests, and the store built for a Worker's wasm32), the release binary
+# built twice and named by its digest, and each fuzz target briefly on
+# nightly. A tag v* publishes the release binary (docs/release.md).
 name: ci
 on:
   push:
@@ -8,12 +10,66 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --component clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --release --workspace
+      # rust-toolchain.toml's toolchain, components and targets
+      - run: rustup toolchain install
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --release --workspace
+      - run: cargo build --locked --release -p fpac-store --target wasm32-unknown-unknown
+  release:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - name: the binary, built twice, named by its digest
+        id: build
+        run: |
+          set -euo pipefail
+          build() {
+            RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$PWD=/fpac" \
+              CARGO_TARGET_DIR="$1" cargo build --locked --release --target x86_64-unknown-linux-musl -p fpac
+            sha256sum "$1/x86_64-unknown-linux-musl/release/fpac" | cut -d' ' -f1
+          }
+          one=$(build target/release-1)
+          two=$(build target/release-2)
+          if [ "$one" != "$two" ]; then echo "two builds differ: $one $two"; exit 1; fi
+          mkdir dist
+          cp target/release-1/x86_64-unknown-linux-musl/release/fpac "dist/fpac-$one"
+          echo "$one  fpac-$one" > dist/fpac.sha256
+          echo "sha256=$one" >> "$GITHUB_OUTPUT"
+          echo "fpac-$one" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fpac-${{ steps.build.outputs.sha256 }}
+          path: dist/
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fpac-${{ needs.release.outputs.sha256 }}
+          path: dist
+      - name: the release, its binary named by its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum -c fpac.sha256
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "fpac for x86_64-linux-musl, static. SHA-256 $SHA; the file is named by it." "fpac-$SHA" fpac.sha256
   fuzz:
     runs-on: ubuntu-24.04
     steps:

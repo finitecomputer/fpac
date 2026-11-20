@@ -48,7 +48,8 @@ What it showed (2026-11-19):
 
 ## Build and test
 
-Rust stable (1.99 on Linux and 1.98 on macOS tested):
+Rust 1.99.0, pinned by `rust-toolchain.toml` (rustup installs it), on
+Linux or macOS:
 
 ```sh
 cargo build --workspace
@@ -56,6 +57,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release --target x86_64-unknown-linux-musl -p fpac-probe -p fpac
 ```
+
+The release binary, named by its SHA-256, and how to build the same
+bytes again: docs/release.md.
 
 The evidence (Linux, with Docker; the krun place needs a sandcastle
 engine; the Cloudflare place needs a local config outside this

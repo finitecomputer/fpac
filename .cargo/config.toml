@@ -1,5 +1,8 @@
 # The guest's binaries are static (musl), as sandcastle's guest is, so one
 # file runs in any image: `cargo build --release --target
-# x86_64-unknown-linux-musl -p fpac-probe`.
+# x86_64-unknown-linux-musl -p fpac-probe`. Linked by the toolchain's own
+# lld against its own musl, so no build machine's C toolchain goes in
+# (docs/release.md).
 [target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static"]
