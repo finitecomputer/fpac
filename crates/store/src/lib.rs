@@ -25,6 +25,7 @@
 //! it follows). A contradiction in our own state is corruption: the store
 //! refuses to go on.
 
+pub mod evict;
 pub mod gates;
 pub mod head;
 
@@ -466,22 +467,39 @@ impl Store {
     /// each. Empty after a clean sleep.
     pub fn replay_fetches(&self) -> Vec<Fetch> {
         let mut seen = BTreeSet::new();
-        let mut want: Vec<(u64, Loc)> = Vec::new();
+        let mut want: Vec<u64> = Vec::new();
         for &e in self.replayed.iter().rev() {
-            if want.len() == REPLAY_FETCH_EXTENTS || !seen.insert(e) || self.local.contains_key(&e) {
+            if want.len() == REPLAY_FETCH_EXTENTS || !seen.insert(e) {
                 continue;
             }
-            if let Some(l) = self.map.get(&e).copied().filter(|l| !l.is_zero()) {
-                want.push((e, l));
-            }
+            want.push(e);
         }
-        // runs: consecutive places in one segment, a read-ahead's length
+        self.fetches_for(want, READ_AHEAD_EXTENTS as usize)
+    }
+
+    /// A sequential read's next extents (docs/design.md, Read-ahead): those
+    /// in `from..to` the cache does not hold and the map places, as
+    /// fetches of runs within a segment of at most `run_max` extents, for
+    /// the caller to make in parallel and `install` (each extent once,
+    /// whoever asks). An extent whose page is not loaded is left to its
+    /// read.
+    pub fn ahead(&self, from: u64, to: u64, run_max: usize) -> Vec<Fetch> {
+        assert!(to >= from && to - from <= u64::from(AHEAD_EXTENTS_MAX), "a read-ahead window within its limit");
+        self.fetches_for((from..to.min(self.extents())).collect(), run_max)
+    }
+
+    /// The fetches for `extents` the cache does not hold and the map
+    /// places: runs of consecutive places in one segment, at most
+    /// `run_max` extents each.
+    fn fetches_for(&self, extents: Vec<u64>, run_max: usize) -> Vec<Fetch> {
+        assert!(run_max >= 1 && run_max <= SEGMENT_EXTENTS_MAX as usize);
+        let mut want: Vec<(u64, Loc)> = extents.into_iter().filter(|e| !self.local.contains_key(e)).filter_map(|e| self.map.get(&e).copied().filter(|l| !l.is_zero()).map(|l| (e, l))).collect();
         want.sort_by_key(|(_, l)| (l.seg, l.offset));
         let mut out: Vec<Fetch> = Vec::new();
         for (e, l) in want {
             if let Some(f) = out.last_mut() {
                 let (_, last) = *f.run.last().expect("non-empty");
-                if last.seg == l.seg && last.offset + EXTENT_BYTES == l.offset && f.run.len() < READ_AHEAD_EXTENTS as usize {
+                if last.seg == l.seg && last.offset + EXTENT_BYTES == l.offset && f.run.len() < run_max {
                     f.run.push((e, l));
                     f.len += EXTENT_BYTES as usize;
                     continue;
@@ -654,6 +672,14 @@ impl Store {
     /// Extents the cache holds (clean, dirty or shipping).
     pub fn cached_extents(&self) -> usize {
         self.local.len()
+    }
+
+    /// Whether the cache holds `extent` as the store's bytes (clean) and it
+    /// may leave: not one the boot read (or, on a new disk, wrote), which
+    /// the next pack takes from the cache (at most PACK_EXTENTS_MAX, so
+    /// 100 MB stays).
+    pub fn may_leave(&self, extent: u64) -> bool {
+        self.local.get(&extent) == Some(&Local::Clean) && !self.boot_seen.contains(&extent)
     }
 
     /// Whether the cache holds `extent`.
