@@ -5,6 +5,9 @@ is its SHA-256: `fpac-<64 hex digits>`. An image that runs it fetches
 that name and checks the bytes against it, so what runs is exactly what
 was built and tested, and a changed binary is a changed name.
 
+**In the image:** `/run/fpac` (the daemon's log and status) goes on a
+tmpfs, never on the disk the cache fills (results.md, leftover 4).
+
 ## How it is built
 
 CI's `release` job (`.github/workflows/ci.yml`) builds it on every push:

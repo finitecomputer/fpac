@@ -445,6 +445,23 @@ the full disk (No space left on device, typed; 4,255 acknowledged
 extents unshipped at the fill, all found by the next life), 10 lives
 killed at random (0 failures) and two lives checked. **Passes.**
 
+### Reads on a full disk (`full.json`, krun)
+
+A read of an extent the cache did not hold failed while the disk was
+full: keeping the fetched bytes needs room. Now the fetch answers the
+read and keeps nothing (the next read fetches again), and a pack's
+extents that find no room are skipped, the rest of the pack going on.
+The full-disk run's next life fills its disk before it reads the
+acknowledged files:
+
+| | Before (`2e10c87`) | After (`dab1eeb`) |
+| -- | -- | -- |
+| Reading the acknowledged files on a full disk | **read error** (2 read errors) | all read and right; 2,698 fetched, none kept |
+
+A sim test reads a full disk twice (fetched both times, right, nothing
+kept), then with room (kept); it failed before ("the cache file's disk
+is full"). **Passes.**
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -479,10 +496,8 @@ killed at random (0 failures) and two lives checked. **Passes.**
   absolute FPAC times hold.
 - Hermes' first reply crosses the relay twice per call (STAND-INS for the
   API and the model); fragment's real API and model would differ.
-- A full disk (leftover 4): a read of an extent the cache does not hold
-  still fails while the disk is full (its install needs room); it could
-  be answered without being kept. Untested on Cloudflare, whose container
-  disk's file system is not known here.
+- A full disk (leftover 4 and after): untested on Cloudflare, whose
+  container disk's file system is not known here.
 
 ## Decided (the owner, 2026-11-20)
 
