@@ -2,7 +2,9 @@
 //! file under one lock, a pool of connections to the remote, and the
 //! FUSE file's backing. The lock is never held across the network: a read
 //! that misses plans its fetch under the lock, fetches without it, and
-//! installs under it again (docs/design.md, The face).
+//! installs under it again (docs/design.md, The face). Nor across a
+//! segment's build: its 8 MiB are read from the cache file and encoded
+//! without it (`read_unlocked`, `Store::build_take`).
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -10,7 +12,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fpac_device::serve::{Backing, BackingError};
 use fpac_format::limits::{DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
@@ -51,6 +53,11 @@ impl FileCache {
         file.set_len(volume_bytes)?;
         let shadow = open(&path.with_extension("shadow"))?;
         Ok(FileCache { file, shadow, slots: Default::default(), free: Vec::new(), next_slot: 0 })
+    }
+
+    /// A second handle on the cache file, for reads outside the lock.
+    pub fn reader(&self) -> std::io::Result<File> {
+        self.file.try_clone()
     }
 }
 
@@ -118,6 +125,11 @@ pub struct Stats {
     pub write_errors: AtomicU64,
     /// Map pages fetched (lazy pages).
     pub page_loads: AtomicU64,
+    /// Writes that waited over a millisecond for the lock, and the
+    /// longest wait (µs): what a segment's build or a fetch's install
+    /// costs the writes beside it.
+    pub lock_waits_over_1ms: AtomicU64,
+    pub lock_wait_max_us: AtomicU64,
 }
 
 /// The first extents a read waited for the pack to bring, kept for the
@@ -134,6 +146,8 @@ pub struct Wake {
 
 pub struct Disk {
     pub inner: Mutex<Inner>,
+    /// The cache file, read without the lock (a segment's build).
+    reader: File,
     /// Signaled after every cut, for writes waiting on a full store.
     pub cut: Condvar,
     pool: Mutex<Vec<Remote>>,
@@ -167,9 +181,24 @@ pub struct Disk {
 }
 
 impl Disk {
-    pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: Option<u64>) -> Disk {
+    pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: Option<u64>) -> std::io::Result<Disk> {
         let cache_max = cache_max_bytes.map(|b| (b / EXTENT_BYTES as u64) as usize);
-        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) }
+        let reader = cache.reader()?;
+        Ok(Disk { inner: Mutex::new(Inner { store, cache }), reader, cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) })
+    }
+
+    /// Extents' bytes from the cache file, without the lock: a write
+    /// meanwhile may tear one, and `Store::build_resolve` replaces each
+    /// extent written since its cut with the copy kept apart before it.
+    pub fn read_unlocked(&self, extents: &[u64]) -> std::io::Result<Vec<Vec<u8>>> {
+        extents
+            .iter()
+            .map(|&e| {
+                let mut b = vec![0u8; EXTENT_BYTES as usize];
+                self.reader.read_exact_at(&mut b, e * EXTENT_BYTES as u64)?;
+                Ok(b)
+            })
+            .collect()
     }
 
     /// Wakes the flusher early: a put ended, or a write waits.
@@ -385,7 +414,13 @@ impl Disk {
         let mut fetches = 0;
         loop {
             let need = {
+                let asked = Instant::now();
                 let mut g = self.inner.lock().unwrap();
+                let waited = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if waited > 1000 {
+                    self.stats.lock_waits_over_1ms.fetch_add(1, Ordering::Relaxed);
+                }
+                self.stats.lock_wait_max_us.fetch_max(waited, Ordering::Relaxed);
                 loop {
                     let Inner { store, cache } = &mut *g;
                     match store.write_local(cache, extent, offset, data) {

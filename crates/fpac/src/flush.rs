@@ -117,6 +117,22 @@ pub fn first_head(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The next planned segment, its bytes read and encoded outside the
+/// lock: the FUSE threads wait only while it is taken and while copies
+/// kept apart since its cut are swapped in, not behind its 8 MiB read
+/// and its checksums.
+fn build(disk: &Disk) -> Result<Option<Outgoing>, StoreError> {
+    let Some(b) = disk.inner.lock().unwrap().store.build_take()? else { return Ok(None) };
+    let mut bytes = disk.read_unlocked(b.extents())?;
+    {
+        let mut g = disk.inner.lock().unwrap();
+        let Inner { store, cache } = &mut *g;
+        store.build_resolve(cache, &b, &mut bytes)?;
+    }
+    let body = b.encode(&bytes);
+    Ok(Some(disk.inner.lock().unwrap().store.build_done(b, body)))
+}
+
 /// One cut, built, shipped and landed, with whatever cuts before it are
 /// still unbuilt: the segments it shipped. A sleep's last turns.
 pub fn flush_once(disk: &Disk, p: &Progress) -> Result<u32, StoreError> {
@@ -126,18 +142,13 @@ pub fn flush_once(disk: &Disk, p: &Progress) -> Result<u32, StoreError> {
     let mut n = 0;
     // Bounded by the segments planned.
     loop {
-        let batch: Vec<Outgoing> = {
-            let mut g = disk.inner.lock().unwrap();
-            let Inner { store, cache } = &mut *g;
-            let mut b = Vec::new();
-            while b.len() < PUTS_IN_FLIGHT {
-                match store.build_next(cache)? {
-                    Some(o) => b.push(o),
-                    None => break,
-                }
+        let mut batch: Vec<Outgoing> = Vec::new();
+        while batch.len() < PUTS_IN_FLIGHT {
+            match build(disk)? {
+                Some(o) => batch.push(o),
+                None => break,
             }
-            b
-        };
+        }
         if batch.is_empty() {
             break;
         }
@@ -297,12 +308,7 @@ pub fn run(disk: Arc<Disk>, p: Arc<Progress>, status: impl Fn(&Disk, &Progress))
         }
         // build and put, up to PUTS_IN_FLIGHT at once
         while in_flight < PUTS_IN_FLIGHT {
-            let built = {
-                let mut g = disk.inner.lock().unwrap();
-                let Inner { store, cache } = &mut *g;
-                store.build_next(cache)
-            };
-            match built {
+            match build(&disk) {
                 Ok(Some(o)) => {
                     in_flight += 1;
                     let (d, tx) = (disk.clone(), tx.clone());

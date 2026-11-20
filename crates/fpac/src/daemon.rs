@@ -445,6 +445,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed),
+            "lock_waits_over_1ms": disk.stats.lock_waits_over_1ms.load(Ordering::Relaxed), "lock_wait_max_us": disk.stats.lock_wait_max_us.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
         });
         let tmp = state.join("status.json.tmp");
@@ -471,7 +472,7 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
     event(t0, "opened", json!({ "disk": disk_name, "epoch": store.epoch(), "volume_bytes": volume, "new": fresh, "replayed": store.opened().replayed, "extents_mapped": store.opened().extents_mapped, "pages": store.opened().pages, "rounds": rounds, "memory_locked": locked, "writeback_set": writeback }));
     store.record_boot();
     let cache = FileCache::create(cache_path, volume).map_err(|e| format!("the cache file: {e}"))?;
-    let disk = Arc::new(Disk::new(store, cache, host, port, cache_max));
+    let disk = Arc::new(Disk::new(store, cache, host, port, cache_max).map_err(|e| format!("the cache file: {e}"))?);
     let progress = Arc::new(Progress::default());
     // the pack's head before the mount; the rest of it beside the mount
     // after a crash: the newest extents the replay brought back, beside

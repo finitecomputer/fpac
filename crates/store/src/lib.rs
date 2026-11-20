@@ -174,6 +174,34 @@ struct Planned {
     extents: Vec<u64>,
 }
 
+/// A segment taken to be built (`Store::build_take`): its extents' bytes
+/// are read and encoded outside the disk's lock, between `build_take` and
+/// `build_resolve`, and between that and `build_done`.
+#[derive(Debug)]
+pub struct Building {
+    id: SegId,
+    base: Link,
+    cut: u64,
+    last_of_cut: bool,
+    extents: Vec<u64>,
+}
+
+impl Building {
+    /// The extents whose bytes to read, in the segment's order.
+    pub fn extents(&self) -> &[u64] {
+        &self.extents
+    }
+
+    /// The segment's object, from its extents' bytes as of the cut (an
+    /// extent of zeros ships as a zeroed entry, with no image). Pure, so
+    /// a disk runs it outside its lock.
+    pub fn encode(&self, bytes: &[Vec<u8>]) -> Vec<u8> {
+        assert_eq!(bytes.len(), self.extents.len());
+        let images: Vec<Image<'_>> = self.extents.iter().zip(bytes).map(|(e, b)| Image { extent: *e, bytes: if b.iter().all(|&x| x == 0) { None } else { Some(b.as_slice()) } }).collect();
+        format::encode_segment(self.id, self.base, self.cut, self.last_of_cut, &images)
+    }
+}
+
 #[derive(Debug)]
 struct Shipment {
     base: Link,
@@ -207,6 +235,9 @@ pub struct Store {
     /// Segments cut and not yet built, in order, and the extents they name.
     planned: BTreeMap<u64, Planned>,
     planned_extents: u64,
+    /// The segment taken from `planned` and being built outside the
+    /// disk's lock (`build_take`), at most one.
+    building: Option<u64>,
     /// Extents in segments built and not yet landed.
     shipping_extents: u64,
     /// A frozen extent's bytes kept apart, by (extent, segment).
@@ -286,6 +317,7 @@ impl Store {
             dirty: 0,
             planned: BTreeMap::new(),
             planned_extents: 0,
+            building: None,
             shipping_extents: 0,
             shadows: BTreeSet::new(),
             chain_end: GENESIS,
@@ -903,39 +935,71 @@ impl Store {
         Ok(out)
     }
 
-    /// Builds the next segment a cut named, from the bytes its extents had
-    /// at the cut (the cache's, or those kept apart since): the object to
-    /// put. None when every cut is built.
+    /// The next planned segment, built here from the cache: `build_take`,
+    /// the reads, `build_resolve`, `Building::encode` and `build_done` in
+    /// one go. A disk does the reads and the encoding outside its lock
+    /// instead, so writes are not held behind a segment's 8 MiB.
     pub fn build_next(&mut self, cache: &mut dyn CacheGate) -> Result<Option<Outgoing>, StoreError> {
+        let Some(b) = self.build_take()? else { return Ok(None) };
+        let mut bytes = vec![vec![0u8; EXTENT_BYTES as usize]; b.extents.len()];
+        for (&e, buf) in b.extents.iter().zip(bytes.iter_mut()) {
+            cache.read(e, buf)?;
+        }
+        self.build_resolve(cache, &b, &mut bytes)?;
+        let body = b.encode(&bytes);
+        Ok(Some(self.build_done(b, body)))
+    }
+
+    /// Takes the next planned segment to build, in order. Its extents stay
+    /// frozen: a write to one meanwhile keeps the cut's bytes apart first,
+    /// so the cache's bytes may be read without the lock and be torn.
+    pub fn build_take(&mut self) -> Result<Option<Building>, StoreError> {
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
         }
+        assert!(self.building.is_none(), "one segment is built at a time");
         let Some((&seq, _)) = self.planned.first_key_value() else { return Ok(None) };
         let p = self.planned.remove(&seq).expect("present");
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(p.extents.len());
-        for &e in &p.extents {
-            let mut b = vec![0u8; EXTENT_BYTES as usize];
+        self.building = Some(seq);
+        Ok(Some(Building { id: SegId { epoch: self.epoch, seq }, base: self.chain_end, cut: p.cut, last_of_cut: p.last_of_cut, extents: p.extents }))
+    }
+
+    /// The segment's bytes as of its cut, from what was read of the cache:
+    /// an extent written since then had its bytes kept apart before that
+    /// write, and that copy replaces whatever the read saw; any other was
+    /// not written, so the read saw its bytes as of the cut. From here on
+    /// they ship.
+    pub fn build_resolve(&mut self, cache: &mut dyn CacheGate, b: &Building, bytes: &mut [Vec<u8>]) -> Result<(), StoreError> {
+        if self.fenced {
+            return Err(StoreError::Fenced("this life".into()));
+        }
+        let seq = b.id.seq;
+        assert_eq!(self.building, Some(seq), "the segment taken");
+        assert_eq!(bytes.len(), b.extents.len());
+        for (&e, buf) in b.extents.iter().zip(bytes.iter_mut()) {
             if self.shadows.remove(&(e, seq)) {
-                cache.shadow_take(e, seq, &mut b)?;
+                cache.shadow_take(e, seq, buf)?;
             } else {
                 assert_eq!(self.local.get(&e), Some(&Local::Frozen(seq)), "an extent not written since its cut is still frozen");
-                cache.read(e, &mut b)?;
                 self.set_local(e, Some(Local::Shipping(seq)));
             }
-            bytes.push(b);
         }
-        // an extent of zeros ships as a zeroed entry, with no image
-        let images: Vec<Image<'_>> = p.extents.iter().zip(&bytes).map(|(e, b)| Image { extent: *e, bytes: if b.iter().all(|&x| x == 0) { None } else { Some(b.as_slice()) } }).collect();
-        let id = SegId { epoch: self.epoch, seq };
-        let body = format::encode_segment(id, self.chain_end, p.cut, p.last_of_cut, &images);
+        Ok(())
+    }
+
+    /// The built segment joins those in flight.
+    pub fn build_done(&mut self, b: Building, body: Vec<u8>) -> Outgoing {
+        assert_eq!(self.building.take(), Some(b.id.seq), "the segment taken");
+        assert_eq!(b.base, self.chain_end, "segments are built in order, one at a time");
         let h = format::decode_segment_header(&body).expect("a segment we made decodes");
         let link = h.link();
+        let id = b.id;
         let entries: Vec<(u64, Loc)> = h.entries.iter().map(|en| (en.extent, Loc { seg: id, offset: en.offset, len: en.len, sum: en.sum })).collect();
-        self.planned_extents -= p.extents.len() as u64;
+        self.planned_extents -= b.extents.len() as u64;
         self.shipping_extents += entries.len() as u64;
-        self.shipping.insert(seq, Shipment { base: self.chain_end, link, last_of_cut: p.last_of_cut, entries, landed: false });
+        self.shipping.insert(id.seq, Shipment { base: self.chain_end, link, last_of_cut: b.last_of_cut, entries, landed: false });
         self.chain_end = link;
-        Ok(Some(Outgoing { name: format::segment_name(id), body, kind: Kind::Segment(seq) }))
+        Outgoing { name: format::segment_name(id), body, kind: Kind::Segment(id.seq) }
     }
 
     /// Segment `seq` of this life landed. The map moves a whole cut at a

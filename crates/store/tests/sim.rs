@@ -22,7 +22,7 @@ use fpac_format::{self as format};
 use fpac_remote::limits::OBJECT_BYTES_MAX;
 use fpac_remote::{Put, RemoteError};
 use fpac_store::head::{decide, Decision};
-use fpac_store::{ship, Ask, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
+use fpac_store::{ship, Ask, Building, CacheGate, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
 
 const EXT: usize = EXTENT_BYTES as usize;
 const VOLUME: u64 = 4 * 4096 * EXTENT_BYTES as u64; // 16,384 extents: four map pages
@@ -230,6 +230,10 @@ struct Life<'a> {
     /// Segments cut and not yet landed, from any number of flushes: they
     /// land in any order, as parallel puts do.
     in_flight: Vec<Outgoing>,
+    /// A segment taken to be built and not yet read: a disk reads its
+    /// extents outside the lock while writes go on, so the read here comes
+    /// steps later and sees whatever they wrote since.
+    building: Option<Building>,
     /// In its last turn: its checkpoint is a sleep's.
     sleeping: bool,
 }
@@ -363,17 +367,32 @@ impl Life<'_> {
         Ok(())
     }
 
-    /// The next planned segment is built (from the bytes its extents had
-    /// at its cut) and joins those in flight.
+    /// The next planned segment is taken to be built; its extents are read
+    /// at a later step (`build_one`), as a disk reads them outside its lock.
+    fn build_start(&mut self) -> Result<(), Crash> {
+        self.step()?;
+        if self.building.is_none() {
+            self.building = self.store.build_take().expect("a take");
+        }
+        Ok(())
+    }
+
+    /// The segment taken (or else the next planned one) is built from the
+    /// bytes its extents had at its cut, whatever was written since its
+    /// take, and joins those in flight.
     fn build_one(&mut self) -> Result<bool, Crash> {
         self.step()?;
-        match self.store.build_next(&mut self.cache).expect("a build") {
-            Some(o) => {
-                self.in_flight.push(o);
-                Ok(true)
-            }
-            None => Ok(false),
+        let Some(b) = self.building.take().or_else(|| self.store.build_take().expect("a take")) else { return Ok(false) };
+        // the cache as it is now: newer than the cut wherever a write came
+        // in since the take
+        let mut bytes = vec![vec![0u8; EXT]; b.extents().len()];
+        for (&e, buf) in b.extents().iter().zip(bytes.iter_mut()) {
+            self.cache.read(e, buf).expect("a cache read");
         }
+        self.store.build_resolve(&mut self.cache, &b, &mut bytes).expect("a resolve");
+        let body = b.encode(&bytes);
+        self.in_flight.push(self.store.build_done(b, body));
+        Ok(true)
     }
 
     /// One segment in flight, chosen at random, lands: the map must still
@@ -491,7 +510,7 @@ fn open_sized<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: 
     let mut store = store.expect("opened");
     store.record_boot();
     let model = Model { live: expected.clone(), opened: expected, head_posted: false, cuts: Vec::new(), landed: BTreeSet::new() };
-    Life { store, cache: MemCache::default(), remote, platform, model, steps: 0, crash_at, in_flight: Vec::new(), sleeping: false }
+    Life { store, cache: MemCache::default(), remote, platform, model, steps: 0, crash_at, in_flight: Vec::new(), building: None, sleeping: false }
 }
 
 /// One whole run: `lives` lives of random work, each crashing at a random
@@ -530,9 +549,10 @@ fn run(seed: u64, lives: u64, ops: u64, faults: Faults) -> (u64, u64, u64, u64) 
                     33..=36 => life.punch(e)?,
                     37..=64 => life.read_check(e)?,
                     65..=72 => life.flush()?,
-                    73..=79 => {
+                    73..=76 => {
                         life.build_one()?;
                     }
+                    77..=79 => life.build_start()?,
                     80..=93 => life.land_one(&mut rng)?,
                     _ => life.checkpoint()?,
                 }
