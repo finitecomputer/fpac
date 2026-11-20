@@ -66,6 +66,32 @@ fn event(t0: Instant, what: &str, extra: Value) {
     eprintln!("{v}");
 }
 
+/// One compaction pass as the cleaner's life (`fpac clean`).
+fn clean(host: &str, port: u16, sizes: &Path, budget: u64) -> Result<Value, String> {
+    let t0 = Instant::now();
+    let text = std::fs::read_to_string(sizes).map_err(|e| format!("{}: {e}", sizes.display()))?;
+    let mut map = std::collections::BTreeMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<u64> = line.split_whitespace().map(|x| x.parse::<u64>()).collect::<Result<_, _>>().map_err(|e| format!("a sizes line {line:?}: {e}"))?;
+        let [epoch, seq, bytes] = f[..] else { return Err(format!("a sizes line {line:?}: three numbers")) };
+        map.insert(fpac_format::SegId { epoch, seq }, bytes);
+    }
+    let mut r = Remote::new(host, port);
+    let o = r.open().map_err(|e| format!("the open: {e}"))?;
+    let info = OpenInfo { epoch: o.epoch, volume_bytes: o.volume_bytes - o.volume_bytes % EXTENT_BYTES as u64, head: o.head, seal: None };
+    let mut posts = Vec::new();
+    let c = {
+        let mut gate = Remote::new(host, port);
+        fpac_store::clean::compact(&mut gate, &info, &map, budget, |h| {
+            let ok = r.post_head(h).is_ok();
+            posts.push(json!({ "head": h.encode(), "taken": ok }));
+            ok
+        })
+        .map_err(|e| e.to_string())?
+    };
+    Ok(json!({ "fpac": "cleaned", "disk": o.disk, "epoch": o.epoch, "segments_listed": map.len(), "live_before": c.live_before, "live_after": c.live_after, "segments_compacted": c.segments_compacted, "extents_moved": c.extents_moved, "head": c.head.encode(), "posts": posts, "ms": t0.elapsed().as_secs_f64() * 1000.0 }))
+}
+
 /// A disk's data key from its file: 64 hex digits, a newline allowed. The
 /// file is removed once read: the key lives in the daemon's (locked)
 /// memory alone.
@@ -101,6 +127,23 @@ pub fn main() {
             };
             match mount(Path::new(&dir), &host, port, &state, &cache, cache_max, key) {
                 Ok(()) => {}
+                Err(e) => {
+                    eprintln!("{}", json!({ "fpac": "error", "why": e }));
+                    std::process::exit(1);
+                }
+            }
+        }
+        // the cleaner's life (docs/design.md, The cleaner): compacts the
+        // disk this container was started for, while it is asleep, and
+        // ends with a clean head. `--sizes` names a file of the segments'
+        // sizes ("<epoch> <seq> <bytes>" a line), from the platform's
+        // listing (the guest cannot list).
+        Some("clean") => {
+            let host = arg(&args, "--host").unwrap_or_else(|| REMOTE_HOST.into());
+            let port: u16 = arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(80);
+            let budget: u64 = arg(&args, "--budget-bytes").and_then(|b| b.parse().ok()).unwrap_or(fpac_store::clean::COMPACT_BYTES_MAX).min(fpac_store::clean::COMPACT_BYTES_MAX);
+            match arg(&args, "--sizes").ok_or_else(|| "--sizes <file>".to_string()).and_then(|f| clean(&host, port, Path::new(&f), budget)) {
+                Ok(v) => println!("{v}"),
                 Err(e) => {
                     eprintln!("{}", json!({ "fpac": "error", "why": e }));
                     std::process::exit(1);

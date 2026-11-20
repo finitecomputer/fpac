@@ -669,6 +669,162 @@ fn a_sealed_disk_with_a_full_page_opens() {
     life.read_check(5000).unwrap();
 }
 
+/// A disk with garbage: 400 extents written in four cuts, then 90% of them
+/// written again, so the first segments are mostly dead; slept. Answers
+/// the model after the sleep.
+fn disk_with_garbage(remote: &mut SimRemote, platform: &mut Platform) -> BTreeMap<u64, Vec<u8>> {
+    let mut life = open(remote, platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for round in 0..2u64 {
+        for e in 0..400u64 {
+            if round == 1 && e % 10 == 9 {
+                continue;
+            }
+            let b = content(1000 * round + e);
+            life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+            life.model.live.insert(e, b);
+            if e % 100 == 99 {
+                life.flush().unwrap();
+                life.land_all(&mut Rng(8)).unwrap();
+            }
+        }
+    }
+    life.sleep(&mut Rng(8)).unwrap();
+    life.model.after_crash(life.remote)
+}
+
+fn segment_sizes(remote: &SimRemote) -> BTreeMap<format::SegId, u64> {
+    remote.objects.iter().filter_map(|(n, b)| {
+        let (e, rest) = n.strip_prefix('e')?.split_once('/')?;
+        Some((format::SegId { epoch: e.parse().ok()?, seq: rest.strip_prefix('s')?.parse().ok()? }, b.len() as u64))
+    }).collect()
+}
+
+// Goal: compaction moves the live extents of mostly dead segments into new
+// ones and keeps every byte: the next life reads what the model says, the
+// live list is shorter, and a delete pass planned from the kept
+// checkpoints removes the dead segments and leaves a disk that still opens
+// and reads every extent. Method: a disk with garbage, compacted by a life
+// of the platform's, then a delete pass, each followed by a life that
+// reads all 400 extents.
+#[test]
+fn compaction_keeps_every_byte_and_lets_the_dead_go() {
+    let mut remote = SimRemote::new(17, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let exp = disk_with_garbage(&mut remote, &mut platform);
+    let sizes = segment_sizes(&remote);
+    platform.running = 2;
+    let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
+    let c = fpac_store::clean::compact(&mut remote, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
+    assert!(c.segments_compacted >= 1 && c.extents_moved >= 10, "{c:?}");
+    assert!(c.live_after < c.live_before, "{c:?}");
+    platform.running = 3;
+    let mut life = open(&mut remote, &mut platform, 3, exp.clone(), u64::MAX);
+    for e in 0..400 {
+        life.read_check(e).unwrap();
+    }
+    // two more lives write and sleep: the checkpoints that named the dead
+    // segments leave the kept window (KEPT_CHECKPOINTS)
+    let mut exp = exp;
+    for epoch in [3u64, 4] {
+        if epoch == 4 {
+            platform.running = 4;
+            life = open(&mut remote, &mut platform, 4, exp.clone(), u64::MAX);
+        }
+        life.post_head().unwrap();
+        let b = content(5000 + epoch);
+        life.store.write(life.remote, &mut life.cache, 0, 0, &b).unwrap();
+        life.model.live.insert(0, b);
+        life.sleep(&mut Rng(8)).unwrap();
+        exp = life.model.after_crash(life.remote);
+    }
+    drop(life);
+    // the delete pass: the stored head, its kept checkpoints, a day old
+    let head = platform.head.unwrap();
+    let names: Vec<String> = remote.objects.keys().cloned().collect();
+    let kept: Vec<format::Checkpoint> = fpac_store::clean::kept_checkpoints(&head, &names).into_iter().map(|(e, q)| fpac_store::clean::read_checkpoint(&remote.objects[&format::checkpoint_name(e, q)]).unwrap()).collect();
+    let day = fpac_store::clean::CLEAN_AGE_MS_MIN;
+    let listing: Vec<(String, u64)> = names.iter().map(|n| (n.clone(), day)).collect();
+    let gone = format::plan_deletes(&kept, head.epoch, &listing, day);
+    assert!(gone.iter().any(|n| n.starts_with("e1/s")), "the dead segments go: {gone:?}");
+    for n in &gone {
+        remote.objects.remove(n);
+    }
+    platform.running = 5;
+    let mut life = open(&mut remote, &mut platform, 5, exp, u64::MAX);
+    for e in 0..400 {
+        life.read_check(e).unwrap();
+    }
+}
+
+/// A gate that stops answering after `left` calls: the cleaner's crash.
+struct Stopping<'a> {
+    inner: &'a mut SimRemote,
+    left: u64,
+}
+
+impl Stopping<'_> {
+    fn take(&mut self) -> Result<(), RemoteError> {
+        if self.left == 0 {
+            return Err(RemoteError::Unavailable("sim: the cleaner stopped".into()));
+        }
+        self.left -= 1;
+        Ok(())
+    }
+}
+
+impl RemoteGate for Stopping<'_> {
+    fn get_range(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<Option<usize>, RemoteError> {
+        self.take()?;
+        self.inner.get_range(name, offset, buf)
+    }
+    fn get(&mut self, name: &str, sink: &mut dyn FnMut(&[u8])) -> Result<Option<u64>, RemoteError> {
+        self.take()?;
+        self.inner.get(name, sink)
+    }
+    fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError> {
+        self.take()?;
+        self.inner.put(name, body)
+    }
+}
+
+// Goal: a cleaner stopped anywhere leaves a disk that opens to every byte
+// it held: each of its cuts is whole, and its head moves by the platform's
+// rules. Method: the same compaction stopped after each of its remote
+// calls in turn; after each, a life that reads all 400 extents.
+#[test]
+fn a_cleaner_stopped_anywhere_leaves_a_disk_that_opens() {
+    // how many calls a whole compaction makes
+    let calls = {
+        let mut remote = SimRemote::new(18, CALM);
+        let mut platform = Platform { head: None, running: 0 };
+        disk_with_garbage(&mut remote, &mut platform);
+        let sizes = segment_sizes(&remote);
+        platform.running = 2;
+        let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
+        let mut gate = Stopping { inner: &mut remote, left: u64::MAX };
+        fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
+        u64::MAX - gate.left
+    };
+    assert!(calls > 10);
+    for stop in (0..calls).step_by(((calls / 60) as usize).max(1)) {
+        let mut remote = SimRemote::new(18, CALM);
+        let mut platform = Platform { head: None, running: 0 };
+        let exp = disk_with_garbage(&mut remote, &mut platform);
+        let sizes = segment_sizes(&remote);
+        platform.running = 2;
+        let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
+        let mut gate = Stopping { inner: &mut remote, left: stop };
+        let r = fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h));
+        assert!(r.is_err(), "stopped after {stop} of {calls} calls");
+        platform.running = 3;
+        let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+        for e in 0..400 {
+            life.read_check(e).unwrap();
+        }
+    }
+}
+
 // Goal: a sealed disk opens only with its key: another key, another
 // disk's name, or no key at all is refused at the open, before any read.
 // Method: a sealed life that writes and sleeps; three opens of it.

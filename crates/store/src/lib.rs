@@ -25,6 +25,7 @@
 //! it follows). A contradiction in our own state is corruption: the store
 //! refuses to go on.
 
+pub mod clean;
 pub mod evict;
 pub mod gates;
 pub mod head;

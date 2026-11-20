@@ -837,17 +837,19 @@ pub fn decode_pack_header(b: &[u8]) -> Result<PackHeader, FormatError> {
 
 /// What a cleaner may delete (docs/design.md: the platform deletes at its
 /// own pace, from its own state, never on a guest's call). An object is
-/// kept if any kept checkpoint names it (itself, its pages, its live
-/// segments, its pack), or if it belongs to a life at or after the oldest
-/// kept checkpoint's (a life still writing, or one a replay may read), or
-/// if it is younger than `age_ms_min`. Everything else is deleted.
-/// `objects` is (name, age in ms); names that are not FPAC's are kept.
-pub fn plan_deletes(kept: &[Checkpoint], objects: &[(String, u64)], age_ms_min: u64) -> Vec<String> {
+/// kept if a kept checkpoint names it (itself, its pages, its live
+/// segments, its pack and crash pack), if it is a segment a replay from a
+/// kept checkpoint may read (its chain's life, after its end), if it
+/// belongs to the head's life or a later one (a life still writing, or
+/// one a replay reads), or if it is younger than `age_ms_min`. Everything
+/// else of ours is deleted. `objects` is (name, age in ms); names that are
+/// not FPAC's are kept.
+pub fn plan_deletes(kept: &[Checkpoint], head_epoch: u64, objects: &[(String, u64)], age_ms_min: u64) -> Vec<String> {
     assert!(!kept.is_empty(), "a cleaner keeps at least the head's checkpoint");
     let mut keep = std::collections::BTreeSet::new();
-    let mut oldest_epoch = u64::MAX;
+    // a replay from a kept checkpoint reads its chain's life after its end
+    let mut replay_after: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for c in kept {
-        oldest_epoch = oldest_epoch.min(c.epoch);
         keep.insert(checkpoint_name(c.epoch, c.seq));
         for p in &c.pages {
             keep.insert(page_name(p.epoch, p.seq, p.page));
@@ -855,18 +857,23 @@ pub fn plan_deletes(kept: &[Checkpoint], objects: &[(String, u64)], age_ms_min: 
         for (id, _) in &c.segments {
             keep.insert(segment_name(*id));
         }
-        if let Some(p) = c.pack {
+        // its pack and its crash pack (a wake after a crash reads it)
+        for p in [c.pack, c.crash_pack].into_iter().flatten() {
             keep.insert(pack_name(p.epoch, p.seq));
         }
+        let after = replay_after.entry(c.end.epoch).or_insert(u64::MAX);
+        *after = (*after).min(c.end.seq);
     }
     let epoch_of = |n: &str| n.strip_prefix('e').and_then(|r| r.split_once('/')).and_then(|(e, _)| e.parse::<u64>().ok());
+    let segment_seq = |n: &str| n.split_once('/').and_then(|(_, r)| r.strip_prefix('s')).and_then(|q| q.parse::<u64>().ok());
     objects
         .iter()
         .filter(|(n, age)| {
-            let ours = epoch_of(n).is_some();
+            let Some(e) = epoch_of(n) else { return false };
             let recent = *age < age_ms_min;
-            let live_life = epoch_of(n).is_some_and(|e| e >= oldest_epoch);
-            ours && !recent && !live_life && !keep.contains(n)
+            let live_life = e >= head_epoch;
+            let replayed = segment_seq(n).is_some_and(|q| replay_after.get(&e).is_some_and(|&end| q > end));
+            !recent && !live_life && !replayed && !keep.contains(n)
         })
         .map(|(n, _)| n.clone())
         .collect()

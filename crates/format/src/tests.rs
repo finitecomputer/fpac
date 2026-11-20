@@ -172,24 +172,28 @@ fn pack_round_trip() {
 fn deletes_are_planned_from_kept_checkpoints_only() {
     let mut c = checkpoint();
     c.end = Link { epoch: 5, seq: 9, sum: [0; 32] };
+    c.crash_pack = Some(PackRef { epoch: 5, seq: 4, header_sum: [1; 32] });
     let day = 86_400_000;
     let objects: Vec<(String, u64)> = [
+        ("e5/p4", day),     // the kept checkpoint's crash pack: kept
+        ("e5/p3", day),     // an older pack, named by none: deleted
+        ("e5/s10", day),    // after the kept checkpoint's end (5/9): a replay reads it
         ("e5/s1", day),     // named: kept
         ("e5/s2", day),     // not named, before the oldest life: deleted
         ("e5/m3-0", day),   // named page: kept
         ("e5/m3-1", day),   // not named: deleted
         ("e4/c1", day),     // an older checkpoint: deleted
         ("e4/s9", 1000),    // too young: kept
-        ("e6/s99", day),    // the kept checkpoint's own life: kept
+        ("e6/s99", day),    // the head's life: kept
         ("e6/c12", day),    // the checkpoint itself: kept
         ("other/x", day),   // not ours: kept
     ]
     .iter()
     .map(|(n, a)| (n.to_string(), *a))
     .collect();
-    let mut plan = plan_deletes(&[c], &objects, 3_600_000);
+    let mut plan = plan_deletes(&[c], 6, &objects, 3_600_000);
     plan.sort();
-    assert_eq!(plan, vec!["e4/c1", "e5/m3-1", "e5/s2"]);
+    assert_eq!(plan, vec!["e4/c1", "e5/m3-1", "e5/p3", "e5/s2"]);
 }
 
 // Goal: a sealed segment's header and images open where they were
