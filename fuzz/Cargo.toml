@@ -1,0 +1,56 @@
+# The fuzz targets (fuzz/README.md): each narrows one of fpac's gates,
+# where bytes it did not make come in, and asserts its invariants. Its own
+# workspace, on nightly, so the product's stays on stable.
+[package]
+name = "fpac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# The fuzzing tools only, never in the product (docs/design.md, Dependencies).
+libfuzzer-sys = "=0.4.13"
+arbitrary = { version = "=1.5.0", features = ["derive"] }
+fpac-format = { path = "../crates/format" }
+fpac-device = { path = "../crates/device" }
+fpac-remote = { path = "../crates/remote" }
+fpac-store = { path = "../crates/store" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "format"
+path = "fuzz_targets/format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuse"
+path = "fuzz_targets/fuse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "head"
+path = "fuzz_targets/head.rs"
+test = false
+doc = false
+bench = false

@@ -239,8 +239,42 @@ pub fn encode_segment(id: SegId, base: Link, cut: u64, last_of_cut: bool, images
     assert!(!images.is_empty() && images.len() <= SEGMENT_EXTENTS_MAX as usize);
     assert!(images.windows(2).all(|w| w[0].extent < w[1].extent), "ascending, each once");
     let header = segment_header_len(images.len());
-    let data: usize = images.iter().filter(|i| i.bytes.is_some()).count() * EXTENT_BYTES as usize;
-    let mut w = W(Vec::with_capacity(header + data));
+    let mut offset = u32::try_from(header).expect("bounded");
+    let entries: Vec<Entry> = images
+        .iter()
+        .map(|i| match i.bytes {
+            Some(b) => {
+                let e = Entry { extent: i.extent, offset, len: EXTENT_BYTES, sum: sum64(b) };
+                offset += EXTENT_BYTES;
+                e
+            }
+            None => Entry { extent: i.extent, offset: 0, len: 0, sum: 0 },
+        })
+        .collect();
+    let mut w = W(Vec::with_capacity(offset as usize));
+    write_segment_header(&mut w, id, base, cut, last_of_cut, &entries);
+    for i in images {
+        if let Some(b) = i.bytes {
+            w.bytes(b);
+        }
+    }
+    assert_eq!(w.0.len(), offset as usize);
+    w.0
+}
+
+/// A segment's header alone, sealed: the bytes a decoded header came
+/// from, when they were canonical (the fuzz targets' round trip).
+pub fn encode_segment_header(h: &SegmentHeader) -> Vec<u8> {
+    let mut w = W(Vec::with_capacity(h.header_len()));
+    write_segment_header(&mut w, h.id, h.base, h.cut, h.last_of_cut, &h.entries);
+    w.0
+}
+
+fn write_segment_header(w: &mut W, id: SegId, base: Link, cut: u64, last_of_cut: bool, entries: &[Entry]) {
+    assert!(id.epoch > 0 && id.seq > 0);
+    assert!(!entries.is_empty() && entries.len() <= SEGMENT_EXTENTS_MAX as usize);
+    assert!(entries.windows(2).all(|w| w[0].extent < w[1].extent), "ascending, each once");
+    let start = w.0.len();
     w.bytes(SEGMENT_MAGIC);
     w.u32(VERSION);
     w.u32(if last_of_cut { LAST_OF_CUT } else { 0 });
@@ -250,36 +284,18 @@ pub fn encode_segment(id: SegId, base: Link, cut: u64, last_of_cut: bool, images
     w.u64(base.seq);
     w.bytes(&base.sum);
     w.u64(cut);
-    w.u32(u32::try_from(images.len()).expect("bounded"));
+    w.u32(u32::try_from(entries.len()).expect("bounded"));
     w.u32(0);
-    assert_eq!(w.0.len(), SEGMENT_FIXED_BYTES as usize);
-    let mut offset = u32::try_from(header).expect("bounded");
-    for i in images {
-        assert!(i.extent < EXTENTS_MAX);
-        w.u64(i.extent);
-        match i.bytes {
-            Some(b) => {
-                w.u32(offset);
-                w.u32(EXTENT_BYTES);
-                w.u64(sum64(b));
-                offset += EXTENT_BYTES;
-            }
-            None => {
-                w.u32(0);
-                w.u32(0);
-                w.u64(0);
-            }
-        }
+    assert_eq!(w.0.len() - start, SEGMENT_FIXED_BYTES as usize);
+    for e in entries {
+        assert!(e.extent < EXTENTS_MAX);
+        w.u64(e.extent);
+        w.u32(e.offset);
+        w.u32(e.len);
+        w.u64(e.sum);
     }
     w.seal();
-    assert_eq!(w.0.len(), header);
-    for i in images {
-        if let Some(b) = i.bytes {
-            w.bytes(b);
-        }
-    }
-    assert_eq!(w.0.len(), header + data);
-    w.0
+    assert_eq!(w.0.len() - start, segment_header_len(entries.len()));
 }
 
 /// A segment's header, from a prefix of its object at least as long as
@@ -296,7 +312,9 @@ pub fn decode_segment_header(b: &[u8]) -> Result<SegmentHeader, FormatError> {
     let base = Link { epoch: r.u64()?, seq: r.u64()?, sum: r.sum()? };
     let cut = r.u64()?;
     let count = r.u32()?;
-    let _reserved = r.u32()?;
+    if r.u32()? != 0 {
+        return Err(FormatError::Layout("a segment's reserved field"));
+    }
     if id.epoch == 0 || id.seq == 0 {
         return Err(FormatError::Layout("a segment's identity"));
     }
@@ -371,8 +389,11 @@ pub fn decode_page(b: &[u8]) -> Result<(u32, Vec<(u32, Loc)>), FormatError> {
         let len = r.u32()?;
         let seg = SegId { epoch: r.u64()?, seq: r.u64()? };
         let offset = r.u32()?;
-        let _reserved = r.u32()?;
+        let reserved = r.u32()?;
         let sum = r.u64()?;
+        if reserved != 0 {
+            return Err(FormatError::Layout("a page's reserved field"));
+        }
         if i >= PAGE_EXTENTS {
             return Err(FormatError::Limit("an entry's index"));
         }
@@ -507,12 +528,19 @@ pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {
     if pages_n > PAGES_MAX || segs_n > LIVE_SEGMENTS_MAX {
         return Err(FormatError::Limit("a checkpoint's lists"));
     }
+    // a pack named is a pack's; one not named is all zeros
+    for (named, p) in [(flags & 1 == 1, &pack), (flags & 2 == 2, &crash_pack)] {
+        let shaped = if named { p.epoch > 0 && p.seq > 0 } else { *p == PackRef { epoch: 0, seq: 0, header_sum: [0; 32] } };
+        if !shaped {
+            return Err(FormatError::Layout("a checkpoint's pack"));
+        }
+    }
     let mut pages: Vec<PageRef> = Vec::with_capacity(pages_n as usize);
     for _ in 0..pages_n {
         let page = r.u32()?;
-        let _ = r.u32()?;
+        let reserved = r.u32()?;
         let pr = PageRef { page, epoch: r.u64()?, seq: r.u64()?, sum: r.sum()? };
-        if pr.page >= PAGES_MAX || pr.epoch == 0 {
+        if pr.page >= PAGES_MAX || pr.epoch == 0 || reserved != 0 {
             return Err(FormatError::Layout("a checkpoint's page"));
         }
         if pages.last().is_some_and(|p| p.page >= pr.page) {
@@ -580,15 +608,32 @@ pub fn pack_header_len(count: usize) -> usize {
 /// A pack's object: its header (each extent and its place in the map),
 /// then each extent's bytes in order. Each place's sum is its bytes'.
 pub fn encode_pack(extents: &[(u64, Loc, &[u8])]) -> Vec<u8> {
-    assert!(!extents.is_empty() && extents.len() <= PACK_EXTENTS_MAX as usize);
+    assert!(extents.iter().all(|(_, l, b)| l.sum == sum64(b)));
+    let entries: Vec<(u64, Loc)> = extents.iter().map(|(e, l, _)| (*e, *l)).collect();
     let mut w = W(Vec::with_capacity(pack_header_len(extents.len()) + extents.len() * EXTENT_BYTES as usize));
+    write_pack_header(&mut w, &entries);
+    for (_, _, b) in extents {
+        w.bytes(b);
+    }
+    w.0
+}
+
+/// A pack's header alone, sealed (the fuzz targets' round trip).
+pub fn encode_pack_header(h: &PackHeader) -> Vec<u8> {
+    let mut w = W(Vec::with_capacity(h.len()));
+    write_pack_header(&mut w, &h.entries);
+    w.0
+}
+
+fn write_pack_header(w: &mut W, entries: &[(u64, Loc)]) {
+    assert!(!entries.is_empty() && entries.len() <= PACK_EXTENTS_MAX as usize);
     w.bytes(PACK_MAGIC);
     w.u32(VERSION);
     w.u32(0);
-    w.u32(u32::try_from(extents.len()).expect("bounded"));
+    w.u32(u32::try_from(entries.len()).expect("bounded"));
     w.u32(0);
-    for (e, l, b) in extents {
-        assert!(*e < EXTENTS_MAX && !l.is_zero() && l.sum == sum64(b));
+    for (e, l) in entries {
+        assert!(*e < EXTENTS_MAX && l.len == EXTENT_BYTES && l.seg.epoch > 0 && l.seg.seq > 0 && l.offset >= SEGMENT_FIXED_BYTES, "a packed extent has a segment's place");
         w.u64(*e);
         w.u32(l.len);
         w.u64(l.seg.epoch);
@@ -597,19 +642,17 @@ pub fn encode_pack(extents: &[(u64, Loc, &[u8])]) -> Vec<u8> {
         w.u64(l.sum);
     }
     w.seal();
-    for (_, _, b) in extents {
-        w.bytes(b);
-    }
-    w.0
 }
 
 /// A pack's header from a prefix of its object.
 pub fn decode_pack_header(b: &[u8]) -> Result<PackHeader, FormatError> {
     let mut r = R { b, at: 0, what: "a pack" };
     r.magic(PACK_MAGIC, VERSION)?;
-    let _ = r.u32()?;
+    let flags = r.u32()?;
     let count = r.u32()?;
-    let _ = r.u32()?;
+    if flags != 0 || r.u32()? != 0 {
+        return Err(FormatError::Layout("a pack's reserved fields"));
+    }
     if count == 0 || count > PACK_EXTENTS_MAX {
         return Err(FormatError::Limit("a pack's extents"));
     }
@@ -623,8 +666,9 @@ pub fn decode_pack_header(b: &[u8]) -> Result<PackHeader, FormatError> {
         if e >= EXTENTS_MAX {
             return Err(FormatError::Limit("an extent's number"));
         }
-        if len == 0 || len > EXTENT_BYTES {
-            return Err(FormatError::Limit("a packed extent's length"));
+        // a packed extent is one the map placed in a segment, as a page's
+        if len != EXTENT_BYTES || seg.epoch == 0 || seg.seq == 0 || offset < SEGMENT_FIXED_BYTES {
+            return Err(FormatError::Layout("a packed extent's place"));
         }
         entries.push((e, Loc { seg, offset, len, sum }));
     }

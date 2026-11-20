@@ -111,18 +111,25 @@ impl Head {
         }
     }
 
+    /// The head from its wire form: only the form `encode` writes (no
+    /// sign, no leading zero, lowercase hex), so a head has one spelling.
     pub fn decode(s: &str) -> Option<Head> {
+        Self::parse(s).filter(|h| h.encode() == s)
+    }
+
+    fn parse(s: &str) -> Option<Head> {
         let p: Vec<&str> = s.split(' ').collect();
         let (e, ce, cs, sum, clean) = match p.as_slice() {
             [e, ce, cs, sum] => (e, ce, cs, sum, false),
             [e, ce, cs, sum, "clean"] => (e, ce, cs, sum, true),
             _ => return None,
         };
-        let epoch: u64 = e.parse().ok().filter(|&e| e > 0)?;
+        let number = |s: &str| s.parse::<u64>().ok().filter(|&n| n > 0 && n <= limits::HEAD_NUMBER_MAX);
+        let epoch = number(e)?;
         if *ce == "-" && *cs == "-" && *sum == "-" {
             return Some(Head { epoch, checkpoint: None, clean });
         }
-        let c = CheckpointRef { epoch: ce.parse().ok().filter(|&e| e > 0)?, seq: cs.parse().ok().filter(|&s| s > 0)?, sum: unhex32(sum)? };
+        let c = CheckpointRef { epoch: number(ce)?, seq: number(cs)?, sum: unhex32(sum)? };
         Some(Head { epoch, checkpoint: Some(c), clean })
     }
 }
@@ -386,6 +393,7 @@ impl Remote {
 
 #[cfg(test)]
 mod tests {
+    use crate::limits::HEAD_NUMBER_MAX;
     use super::*;
 
     // Goal: names are refused outside their grammar. Method: the valid
@@ -415,6 +423,13 @@ mod tests {
         for bad in ["", "7", "0 - - -", "7 6 2", "7 6 0 aa", "7 - 2 -", "x - - -"] {
             assert_eq!(Head::decode(bad), None, "{bad}");
         }
+        // one spelling only: no sign, no leading zero, lowercase hex, and
+        // numbers the platform compares exactly
+        let line = h.encode();
+        for bad in [line.replacen('7', "+7", 1), line.replacen('7', "07", 1), line.replacen(" 2 ", " 02 ", 1), line.to_uppercase(), format!("{} - - -", HEAD_NUMBER_MAX + 1)] {
+            assert_eq!(Head::decode(&bad), None, "{bad}");
+        }
+        assert!(Head::decode(&format!("{HEAD_NUMBER_MAX} - - -")).is_some());
     }
 
     // Goal: hex round-trips, and anything but 64 lowercase digits is

@@ -102,6 +102,8 @@ pub enum AbiError {
     Short { got: usize, need: usize },
     #[error("a message says it is {said} bytes, but {got} arrived")]
     Length { said: u32, got: usize },
+    #[error("a {what} of {got} bytes, past the {max} the mount negotiated")]
+    Limit { what: &'static str, got: usize, max: u32 },
 }
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -156,7 +158,11 @@ pub struct ReadIn {
 
 pub fn read_in(message: &[u8]) -> Result<ReadIn, AbiError> {
     let b = body(message, READ_IN_BYTES)?;
-    Ok(ReadIn { offset: u64_at(b, 8), size: u32_at(b, 16) })
+    let size = u32_at(b, 16);
+    if size > crate::limits::FUSE_READ_BYTES_MAX {
+        return Err(AbiError::Limit { what: "read", got: size as usize, max: crate::limits::FUSE_READ_BYTES_MAX });
+    }
+    Ok(ReadIn { offset: u64_at(b, 8), size })
 }
 
 /// A write's offset and its data, borrowed from the request.
@@ -169,6 +175,9 @@ pub fn write_in(message: &[u8]) -> Result<WriteIn<'_>, AbiError> {
     let b = body(message, WRITE_IN_BYTES)?;
     let size = u32_at(b, 16) as usize;
     let data = &b[WRITE_IN_BYTES..];
+    if size > crate::limits::FUSE_WRITE_BYTES_MAX as usize {
+        return Err(AbiError::Limit { what: "write", got: size, max: crate::limits::FUSE_WRITE_BYTES_MAX });
+    }
     if data.len() == size {
         Ok(WriteIn { offset: u64_at(b, 8), data })
     } else {
@@ -359,6 +368,24 @@ mod tests {
         b[16..20].copy_from_slice(&4u32.to_ne_bytes());
         let m = request(opcode::WRITE, FILE_ID, &b);
         assert!(matches!(write_in(&m), Err(AbiError::Short { got: 3, need: 4 })));
+    }
+
+    // Goal: a read or write past the size the mount negotiated is refused
+    // by its decoder, so the answer never sees one. Method: one byte past
+    // each limit, and each limit itself.
+    #[test]
+    fn sizes_past_the_negotiated_limits_are_refused() {
+        let max = crate::limits::FUSE_READ_BYTES_MAX;
+        let mut r = vec![0u8; READ_IN_BYTES];
+        r[16..20].copy_from_slice(&max.to_ne_bytes());
+        assert!(read_in(&request(opcode::READ, FILE_ID, &r)).is_ok());
+        r[16..20].copy_from_slice(&(max + 1).to_ne_bytes());
+        assert!(matches!(read_in(&request(opcode::READ, FILE_ID, &r)), Err(AbiError::Limit { what: "read", .. })));
+        let wmax = crate::limits::FUSE_WRITE_BYTES_MAX;
+        let mut w = vec![0u8; WRITE_IN_BYTES];
+        w[16..20].copy_from_slice(&(wmax + 1).to_ne_bytes());
+        w.resize(WRITE_IN_BYTES + wmax as usize + 1, 0);
+        assert!(matches!(write_in(&request(opcode::WRITE, FILE_ID, &w)), Err(AbiError::Limit { what: "write", .. })));
     }
 
     // Goal: every answer we build is the size the kernel's struct is.

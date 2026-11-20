@@ -1,0 +1,28 @@
+# The checks on every push: the workspace on stable (clippy, tests), and
+# each fuzz target briefly on nightly, as its own job.
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --release --workspace
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly install cargo-fuzz --locked --version 0.13.2
+      - name: each target, 30 seconds
+        working-directory: fuzz
+        run: |
+          for t in format fuse http head; do
+            cargo +nightly fuzz run -O "$t" -- -max_total_time=30 -rss_limit_mb=4096
+          done

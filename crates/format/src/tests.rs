@@ -110,13 +110,50 @@ fn checkpoint_round_trip_and_refusals() {
     }
 }
 
+/// The header's own seal made again over bytes changed under it, so a
+/// layout check (not the seal) is what refuses them.
+fn resealed(mut b: Vec<u8>, header_len: usize) -> Vec<u8> {
+    let s = sha256(&b[..header_len - 32]);
+    b[header_len - 32..header_len].copy_from_slice(&s);
+    b
+}
+
+// Goal: an object has one spelling: a reserved field that is not zero,
+// or an absent pack's fields that are not, is refused even under a seal
+// that matches. Method: a segment, a page, a checkpoint and a pack, each
+// with one such field set and sealed again.
+#[test]
+fn reserved_fields_are_zero() {
+    let a = extent(1);
+    let seg = encode_segment(SegId { epoch: 1, seq: 1 }, GENESIS, 1, true, &[Image { extent: 3, bytes: Some(&a) }]);
+    let hl = segment_header_len(1);
+    let mut b = seg.clone();
+    b[92] = 1;
+    assert_eq!(decode_segment_header(&resealed(b, hl)), Err(FormatError::Layout("a segment's reserved field")));
+    let l = Loc { seg: SegId { epoch: 1, seq: 1 }, offset: hl as u32, len: EXTENT_BYTES, sum: sum64(&a) };
+    let page = encode_page(0, &[(3, l)]);
+    let mut b = page.clone();
+    b[48] = 1;
+    let n = b.len();
+    assert_eq!(decode_page(&resealed(b, n)), Err(FormatError::Layout("a page's reserved field")));
+    let c = Checkpoint { epoch: 1, seq: 1, end: GENESIS, volume_bytes: 1 << 30, pack: None, crash_pack: None, pages: vec![], boot_pages: vec![], segments: vec![] };
+    let mut b = encode_checkpoint(&c);
+    b[8 + 4 + 4 + 16 + 48 + 8] = 1;
+    let n = b.len();
+    assert_eq!(decode_checkpoint(&resealed(b, n)), Err(FormatError::Layout("a checkpoint's pack")));
+    let pack = encode_pack(&[(3, l, &a)]);
+    let mut b = pack.clone();
+    b[20] = 1;
+    assert_eq!(decode_pack_header(&resealed(b, pack_header_len(1))), Err(FormatError::Layout("a pack's reserved fields")));
+}
+
 // Goal: a pack's header round-trips and names each extent's place.
 // Method: two extents; then the refusals.
 #[test]
 fn pack_round_trip() {
     let (a, b) = (extent(7), extent(8));
     let la = Loc { seg: SegId { epoch: 3, seq: 9 }, offset: 4096, len: EXTENT_BYTES, sum: sum64(&a) };
-    let lb = Loc { seg: SegId { epoch: 2, seq: 1 }, offset: 0, len: EXTENT_BYTES, sum: sum64(&b) };
+    let lb = Loc { seg: SegId { epoch: 2, seq: 1 }, offset: 4096 + EXTENT_BYTES, len: EXTENT_BYTES, sum: sum64(&b) };
     let obj = encode_pack(&[(40, la, &a), (2, lb, &b)]);
     let h = decode_pack_header(&obj).unwrap();
     assert_eq!(h.entries, vec![(40, la), (2, lb)]);

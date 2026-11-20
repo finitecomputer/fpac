@@ -21,3 +21,7 @@ pub const IO_MS_MAX: u64 = 30_000;
 pub const READ_BUFFER_BYTES: usize = 256 << 10;
 
 const _: () = assert!(OBJECT_BYTES_MAX < INTERCEPT_BODY_BYTES_MAX);
+
+/// A head's numbers, at most: the platform compares them as JavaScript
+/// numbers, exact up to 2^53 - 1 (an epoch is a time in ms).
+pub const HEAD_NUMBER_MAX: u64 = (1 << 53) - 1;

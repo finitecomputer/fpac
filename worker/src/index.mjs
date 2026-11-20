@@ -596,13 +596,17 @@ export class FpacSpike extends DurableObject {
 // A head's line: "<epoch> <checkpoint epoch> <checkpoint seq> <sha256>",
 // or "<epoch> - - -", and " clean" after it for a clean sleep
 // (crates/remote/src/lib.rs, Head).
+// A head's numbers are compared as Numbers, so each must be exact: no
+// leading zero, and at most 2^53 - 1 (an epoch is a time in ms).
+const exact = (s) => /^[1-9][0-9]{0,15}$/.test(s) && Number.isSafeInteger(Number(s));
+
 function parseHead(line) {
   const p = String(line).split(" ");
   const clean = p.length === 5 && p[4] === "clean";
-  if ((p.length !== 4 && !clean) || !/^[1-9][0-9]{0,19}$/.test(p[0])) return null;
+  if ((p.length !== 4 && !clean) || !exact(p[0])) return null;
   const epoch = Number(p[0]);
   if (p[1] === "-" && p[2] === "-" && p[3] === "-") return { epoch, ck: null, clean };
-  if (!/^[1-9][0-9]{0,19}$/.test(p[1]) || !/^[1-9][0-9]{0,19}$/.test(p[2]) || !SHA256_HEX.test(p[3])) return null;
+  if (!exact(p[1]) || !exact(p[2]) || !SHA256_HEX.test(p[3])) return null;
   return { epoch, ck: { epoch: Number(p[1]), seq: Number(p[2]), sum: p[3] }, clean };
 }
 

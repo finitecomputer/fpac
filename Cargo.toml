@@ -6,6 +6,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/device", "crates/remote", "crates/testkit", "crates/probe", "crates/bench", "crates/format", "crates/store", "crates/fpac"]
+# the fuzz targets are their own workspace, on nightly (fuzz/README.md)
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"

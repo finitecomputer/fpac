@@ -5,3 +5,9 @@
 /worker/.wrangler
 /worker/wrangler.jsonc
 /local
+# The fuzzers' working files (fuzz/README.md): corpora grow on the machine
+# that runs them; a crash's input is kept as a test where it is fixed.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
