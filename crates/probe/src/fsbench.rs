@@ -58,6 +58,14 @@ fn wait_shipped() -> Option<u128> {
 /// its own, as section 10's row is: it starts once FPAC's daemon has
 /// landed what the earlier rows wrote, and it reports how fast the 4 GiB
 /// shipped behind it (the row's other half).
+/// `row` once the daemon has landed everything, with how long that took.
+fn idle(row: impl FnOnce() -> std::io::Result<Value>) -> std::io::Result<Value> {
+    let waited = wait_shipped();
+    let mut v = row()?;
+    v["waited_for_earlier_rows_ms"] = json!(waited);
+    Ok(v)
+}
+
 fn sequential(dir: &Path) -> std::io::Result<Value> {
     let p = dir.join("seq.bin");
     let chunk = noise(1 << 20, 1);
@@ -216,6 +224,11 @@ pub fn run(dir: &str) -> Value {
         "write_4k_osync_ms": r(sync_writes(&d)),
         "small_files": r(small_files(&d)),
         "saves": r(saves(&d)),
+        // the same two with nothing shipping (the rows above run while the
+        // random writes' backlog ships): is a slow save the store's work
+        // beside it, or the path itself?
+        "saves_idle": r(idle(|| saves(&d))),
+        "write_4k_osync_idle_ms": r(idle(|| sync_writes(&d))),
         "dir_30k": r(big_dir(&d)),
         // last: each of section 10's rows on its own, not behind a 4 GiB
         // burst still shipping
