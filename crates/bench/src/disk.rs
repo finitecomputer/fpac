@@ -796,6 +796,8 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     std::thread::sleep(Duration::from_secs(2));
     let after = status(p);
     let (_, log) = p.sh("grep -E 'no-space|\"error\"' /run/fpac/log | head -n 5")?;
+    // where an error came from, as the guest's kernel saw it
+    let (_, kernel) = p.sh("dmesg 2>&1 | grep -iE 'error|loop|ext4|fuse|space' | tail -n 25")?;
     let (_, reread) = p.sh("sha256sum -c --quiet /data/acked.sha256 && echo acked-readable")?;
     p.sh("rm -f /var/lib/ballast /var/lib/ballast-*")?;
     let s1 = sleep(p)?;
@@ -810,7 +812,7 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     let ok = loud && typed && after["fenced"] == false && s1["flushed"]["error"].is_null() && check.contains("acked-ok");
     Ok(json!({
         "what": p.what(), "ok": ok, "failed_loudly": loud, "typed": typed,
-        "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "reread_while_full": reread, "sleep": s1 },
+        "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "kernel": kernel, "reread_while_full": reread, "sleep": s1 },
         "life2": { "start": st2, "mount": m2, "check": check, "sleep": s2 },
     }))
 }
