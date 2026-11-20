@@ -175,7 +175,9 @@ answered ENOSPC, so the program above sees "No space left on device"
 daemon counts it (`no_space_errors`) and says it in its log at most every
 10 s. Nothing the write touched changes, and the same write made again
 once room is back lands (a copy-on-write disk refuses even an overwrite;
-the copy a frozen extent keeps apart is kept once). The daemon's own
+the copy a frozen extent keeps apart is kept once, and a sealed cache
+writes each extent beside its last copy, so one that fails partway leaves
+the last whole). The daemon's own
 state (`/run/fpac`: its log and status) must not be on the disk it may
 fill, or both stop when it fills: a tmpfs.
 

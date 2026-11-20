@@ -1,6 +1,6 @@
 {
   "evidence": "full",
-  "note": "krun, R2's costs modelled (90 ms an object call, puts sharing 50 MB/s); the daemon's state on a tmpfs in the guest. krun-before: main's daemon (the scenario at 72bfd33); krun-after: the typed no-space error (7989471).",
+  "note": "krun, R2's costs modelled (90 ms an object call, puts sharing 50 MB/s); the daemon's state on a tmpfs in the guest. krun-before: main's daemon (the scenario at 72bfd33); krun-after: the typed no-space error (7989471). krun-sealed: the same on a sealed disk, its cache's extents written beside their last copies (b6d8d38).",
   "places": {
     "krun-after": {
       "bulk_data_deleted": "the folder removed",
@@ -986,6 +986,495 @@
       "ok": false,
       "sealed": false,
       "typed": false,
+      "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's), puts sharing 50 MB/s (the rate a Cloudflare container sustained to R2): a STAND-IN for the route and for R2"
+    },
+    "krun-sealed": {
+      "bulk_data_deleted": "the folder removed",
+      "commit": {
+        "dirty": false,
+        "fpac": "b6d8d38cd44f"
+      },
+      "failed_loudly": true,
+      "life1": {
+        "acked": {
+          "ahead_extents": 0,
+          "ahead_waits": 0,
+          "ahead_windows": 0,
+          "bytes_shipped": 8393888,
+          "cache_bound_extents": 201087,
+          "cached_extents": 4252,
+          "checkpoints": 0,
+          "cpu_ms": {
+            "system": 906.568,
+            "user": 202.279
+          },
+          "cuts": 1,
+          "dirty_extents": 1813,
+          "durable_ms": 0,
+          "epoch": 1,
+          "evictions": 0,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 0,
+          "head_posted": true,
+          "lock_wait_max_us": 50455,
+          "lock_waits_over_1ms": 306,
+          "misses": 0,
+          "no_space_errors": 0,
+          "now_ms": 1795192659129,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 11,
+          "read_errors": 0,
+          "room_evictions": 0,
+          "segments": 1,
+          "shipping_behind": true,
+          "shipping_segments": 9,
+          "syncs": 135,
+          "unshipped_extents": 4255,
+          "up_ms": 2481,
+          "write_errors": 0
+        },
+        "after": {
+          "ahead_extents": 0,
+          "ahead_waits": 0,
+          "ahead_windows": 0,
+          "bytes_shipped": 279162656,
+          "cache_bound_extents": 67071,
+          "cached_extents": 4252,
+          "checkpoints": 0,
+          "cpu_ms": {
+            "system": 1304.56,
+            "user": 425.504
+          },
+          "cuts": 2,
+          "dirty_extents": 0,
+          "durable_ms": 1795192659340,
+          "epoch": 1,
+          "evictions": 0,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 0,
+          "head_posted": true,
+          "lock_wait_max_us": 50455,
+          "lock_waits_over_1ms": 307,
+          "misses": 0,
+          "no_space_errors": 107,
+          "now_ms": 1795192666560,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 0,
+          "read_errors": 0,
+          "room_evictions": 0,
+          "segments": 35,
+          "shipping_behind": true,
+          "shipping_segments": 0,
+          "syncs": 136,
+          "unshipped_extents": 0,
+          "up_ms": 9912,
+          "write_errors": 107
+        },
+        "daemon_log": "{\"dir\":\"/data\",\"fpac\":\"mounted\",\"misses\":0,\"ms\":41.668637000000004,\"pack_waits\":0,\"waited_at\":[]}\n{\"bound_bytes\":4395565056,\"fpac\":\"cache-room\",\"free_bytes\":0,\"ms\":3009.1097090000003}\n{\"at_ms\":1795192665451,\"fpac\":\"no-space\",\"refused_writes\":1,\"why\":\"No space left on device (os error 28)\"}\n",
+        "fill": "dd: error writing '/var/lib/ballast-1': No space left on device\ndd: error writing '/var/lib/ballast-2': No space left on device\ndd: error writing '/var/lib/ballast-3': No space left on device\nfree-blocks 4096\nfallocate: fallocate failed: No space left on device\n",
+        "free_bytes": 19613085696,
+        "kernel": "[    0.209159] can: broadcast manager protocol\n[    0.209160] can: netlink gateway - max_hops=1\n[    0.209195] NET: Registered PF_VSOCK protocol family\n[    0.210782] NET: Registered PF_TSI protocol family\n[    0.210785] NET: Registered PF_TSI6 protocol family\n[    0.210786] NET: Registered PF_TSIU protocol family\n[    0.210827] IPI shorthand broadcast: enabled\n[    0.213694] sched_clock: Marking stable (208004960, 1708727)->(255618098, -45904411)\n[    0.217109] registered taskstats version 1\n[    0.222923] Btrfs loaded, zoned=no, fsverity=no\n[    0.223066] Key type encrypted registered\n[    0.223123] ALSA device list:\n[    0.223141]   No soundcards found.\n[    0.223764] EXT4-fs (vda): mounted filesystem cd714478-0d1f-4bfd-8cbc-6e7f427dca4c ro without journal. Quota mode: disabled.\n[    0.223782] VFS: Mounted root (ext4 filesystem) readonly on device 254:0.\n[    0.223851] devtmpfs: mounted\n[    0.227065] Freeing unused kernel image (initmem) memory: 1972K\n[    0.227071] Write protecting the kernel read-only data: 20480k\n[    0.227941] Freeing unused kernel image (rodata/data gap) memory: 488K\n[    0.227948] Run /init as init process\n[    0.227949]   with arguments:\n[    0.227949]     /init\n[    0.227950]   with environment:\n[    0.227950]     HOME=/\n[    0.227950]     TERM=linux\n[    0.283600] EXT4-fs (vdb): mounted filesystem 28212033-dc79-4b72-bf39-ca6289700621 ro without journal. Quota mode: disabled.\n[    0.475061] EXT4-fs (vdc): mounted filesystem 2eb1fedb-049d-4e2f-abe1-58b5ebd4cfea r/w without journal. Quota mode: disabled.\n[    0.480341] overlayfs: \"xino\" feature enabled using 32 upper inode bits.\n[    0.558630] loop0: detected capacity change from 0 to 40960000\n[    0.590789] EXT4-fs (loop0): mounted filesystem 14b7fde6-23bd-4255-9d73-751671ed0286 r/w with ordered data mode. Quota mode: disabled.\n[    9.352571] critical space allocation error, dev loop0, sector 278528 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.352776] critical space allocation error, dev loop0, sector 279552 op 0x1:(WRITE) flags 0x800 phys_seg 128 prio class 2\n[    9.352859] critical space allocation error, dev loop0, sector 280576 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.352958] critical space allocation error, dev loop0, sector 281600 op 0x1:(WRITE) flags 0x800 phys_seg 128 prio class 2\n[    9.352960] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 35200)\n[    9.353045] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 34944)\n[    9.353141] critical space allocation error, dev loop0, sector 282624 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.353367] critical space allocation error, dev loop0, sector 284672 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.353572] critical space allocation error, dev loop0, sector 285696 op 0x1:(WRITE) flags 0x800 phys_seg 128 prio class 2\n[    9.353652] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 35712)\n[    9.353798] critical space allocation error, dev loop0, sector 286720 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.354020] critical space allocation error, dev loop0, sector 287744 op 0x1:(WRITE) flags 0x800 phys_seg 128 prio class 2\n[    9.355064] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 35968)\n[    9.355200] critical space allocation error, dev loop0, sector 288768 op 0x1:(WRITE) flags 0x4800 phys_seg 128 prio class 2\n[    9.356468] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 36224)\n[    9.356473] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 36480)\n[    9.357717] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 36736)\n[    9.357876] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 36992)\n[    9.358012] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 35456)\n[    9.358150] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.358837] EXT4-fs warning (device loop0): ext4_end_bio:353: I/O error 3 writing to inode 14 starting block 37248)\n[    9.359675] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.360634] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.362031] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.363303] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.364565] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.365911] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[    9.366961] EXT4-fs (loop0): failed to convert unwritten extents to written extents -- potential data loss!  (inode 14, error -5)\n[   10.990068] Aborting journal on device loop0-8.\n[   10.990512] JBD2: I/O error when updating journal superblock for loop0-8.\n",
+        "log": "{\"at_ms\":1795192665451,\"fpac\":\"no-space\",\"refused_writes\":1,\"why\":\"No space left on device (os error 28)\"}\n",
+        "mount": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13178437632,
+            "fpac": "cache",
+            "ms": 8.436614
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 9.269153
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 9.525253
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 40.421288
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 41.668637,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 8.306434,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": true,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          }
+        },
+        "new_write": "dd: fsync failed for '/data/new': No space left on device\nexit=1\n",
+        "reread_while_full": "acked-readable\n",
+        "sleep": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13178437632,
+            "fpac": "cache",
+            "ms": 8.436614
+          },
+          "cache-room": {
+            "bound_bytes": 4395565056,
+            "fpac": "cache-room",
+            "free_bytes": 0,
+            "ms": 3009.1097090000003
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 14619.088437
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 10979.823705,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 145,
+              "ms": 3638,
+              "pack_bytes": 100618216,
+              "segments": 1
+            },
+            "ms": 14618.658017
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 9.269153
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 9.525253
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 40.421288
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 41.668637,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "no-space": {
+            "at_ms": 1795192665451,
+            "fpac": "no-space",
+            "refused_writes": 1,
+            "why": "No space left on device (os error 28)"
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 8.306434,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": true,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 10965.865946999998,
+            "signal": 15
+          },
+          "sleep_ms": 3671
+        },
+        "start": {
+          "engine_ready_us": 614521,
+          "start_ms": 614.88823
+        },
+        "uptime_acked": "3.13\n",
+        "uptime_full": "9.16\n"
+      },
+      "life2": {
+        "check": "acked-ok\n",
+        "mount": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13178437632,
+            "fpac": "cache",
+            "ms": 199.70663
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 212.934279
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 214.05353799999995
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 7,
+            "ms": 976.222975,
+            "pack_waits": 13,
+            "waited_at": [
+              114,
+              570,
+              570,
+              570,
+              570,
+              1150,
+              1150,
+              1150,
+              1150,
+              1279,
+              1279,
+              1279,
+              1279
+            ]
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 2,
+            "extents_mapped": 4251,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 199.54037,
+            "new": false,
+            "pages": 19,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 19,
+                "failed": 0,
+                "ms": 104.654205
+              }
+            ],
+            "sealed": true,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack": {
+            "bytes": 100556768,
+            "extents": 1534,
+            "fetch_ms_summed": 2625.495,
+            "fpac": "pack",
+            "from": 64,
+            "install_ms_summed": 602.15,
+            "installed": 1470,
+            "ms": 648.584779,
+            "waited_at": [
+              114,
+              570,
+              570,
+              570,
+              570,
+              1150,
+              1150,
+              1150,
+              1150,
+              1279,
+              1279,
+              1279,
+              1279
+            ]
+          },
+          "pack-header": {
+            "extents": 1534,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 11.78484,
+            "head_installed": 64,
+            "ms": 211.85175,
+            "sealed": true
+          }
+        },
+        "sleep": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13178437632,
+            "fpac": "cache",
+            "ms": 199.70663
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 9523.594107
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 2302.973007,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 3384,
+              "ms": 7219,
+              "pack_bytes": 100618216,
+              "segments": 1
+            },
+            "ms": 9523.251427
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 212.934279
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 214.05353799999995
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 7,
+            "ms": 976.222975,
+            "pack_waits": 13,
+            "waited_at": [
+              114,
+              570,
+              570,
+              570,
+              570,
+              1150,
+              1150,
+              1150,
+              1150,
+              1279,
+              1279,
+              1279,
+              1279
+            ]
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 2,
+            "extents_mapped": 4251,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 199.54037,
+            "new": false,
+            "pages": 19,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 19,
+                "failed": 0,
+                "ms": 104.654205
+              }
+            ],
+            "sealed": true,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack": {
+            "bytes": 100556768,
+            "extents": 1534,
+            "fetch_ms_summed": 2625.495,
+            "fpac": "pack",
+            "from": 64,
+            "install_ms_summed": 602.15,
+            "installed": 1470,
+            "ms": 648.584779,
+            "waited_at": [
+              114,
+              570,
+              570,
+              570,
+              570,
+              1150,
+              1150,
+              1150,
+              1150,
+              1279,
+              1279,
+              1279,
+              1279
+            ]
+          },
+          "pack-header": {
+            "extents": 1534,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 11.78484,
+            "head_installed": 64,
+            "ms": 211.85175,
+            "sealed": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 2296.4593529999997,
+            "signal": 15
+          },
+          "sleep_ms": 7325
+        },
+        "start": {
+          "engine_ready_us": 393966,
+          "start_ms": 394.265672
+        }
+      },
+      "measured_at_ms": 1795192681461,
+      "objects_at_end": {
+        "bytes": 481583136,
+        "objects": 64
+      },
+      "ok": true,
+      "sealed": true,
+      "typed": true,
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's), puts sharing 50 MB/s (the rate a Cloudflare container sustained to R2): a STAND-IN for the route and for R2"
     }
   }
