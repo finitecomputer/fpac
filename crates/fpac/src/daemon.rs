@@ -62,9 +62,12 @@ fn event(t0: Instant, what: &str, extra: Value) {
     eprintln!("{v}");
 }
 
-/// A disk's data key from its file: 64 hex digits, a newline allowed.
+/// A disk's data key from its file: 64 hex digits, a newline allowed. The
+/// file is removed once read: the key lives in the daemon's (locked)
+/// memory alone.
 fn read_key(p: &Path) -> Result<[u8; 32], String> {
     let s = std::fs::read_to_string(p).map_err(|e| format!("the key file: {e}"))?;
+    std::fs::remove_file(p).map_err(|e| format!("the key file, removed once read: {e}"))?;
     fpac_remote::unhex32(s.trim_end_matches('\n')).ok_or_else(|| "the key file holds no key (64 lowercase hex digits)".to_string())
 }
 
