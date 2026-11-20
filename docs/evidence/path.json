@@ -271,6 +271,311 @@
         "what": "the guest in a Cloudflare container -> its intercept -> the stand-in Worker's handler on the container's machine -> an R2 binding"
       }
     },
+    "cloudflare-items": {
+      "bulk_data": {
+        "deleted": {
+          "deleted": 44,
+          "pages": 1
+        },
+        "left": {
+          "bytes": 0,
+          "objects": 0
+        },
+        "written": {
+          "bytes": 138446496,
+          "objects": 44
+        }
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "105d0732eeea"
+      },
+      "conformance": {
+        "cases": [
+          {
+            "case": "open names the disk, this life's epoch, the volume and the head",
+            "detail": "Ok(Open { disk: \"spike-path\", epoch: 1795141629459, volume_bytes: 20971520000, head: None })",
+            "pass": true
+          },
+          {
+            "case": "a put of a new name is created",
+            "detail": "Ok(Created)",
+            "pass": true
+          },
+          {
+            "case": "the same put again is the same (a lost answer, replayed)",
+            "detail": "Ok(Same)",
+            "pass": true
+          },
+          {
+            "case": "other bytes at that name conflict, naming the stored checksum",
+            "detail": "Ok(Conflict { sha256: [9, 139, 255, 79, 66, 14, 184, 50, 17, 104, 80, 186, 57, 31, 3, 236, 67, 118, 184, 242, 65, 75, 65, 16, 51, 238, 120, 202, 56, 31, 141, 105] })",
+            "pass": true
+          },
+          {
+            "case": "a get streams the whole object, its checksum checked",
+            "detail": "Ok(Some(100000))",
+            "pass": true
+          },
+          {
+            "case": "a ranged get answers exactly the range",
+            "detail": "Ok(Some(4096))",
+            "pass": true
+          },
+          {
+            "case": "a range past the end answers the tail",
+            "detail": "Ok(Some(2000))",
+            "pass": true
+          },
+          {
+            "case": "a range starting past the end is refused",
+            "detail": "Err(Refused { status: 416, detail: \"the range: get: The requested range is not satisfiable (10039)\\n\" })",
+            "pass": true
+          },
+          {
+            "case": "an absent name reads as absent",
+            "detail": "Ok(None)",
+            "pass": true
+          },
+          {
+            "case": "an absent name streams as absent",
+            "detail": "Ok(None)",
+            "pass": true
+          },
+          {
+            "case": "a put into another life's epoch is refused",
+            "detail": "Err(Refused { status: 403, detail: \"a put names another life's epoch\\n\" })",
+            "pass": true
+          },
+          {
+            "case": "an empty object round-trips",
+            "detail": "Ok(Created) Ok(Some(0))",
+            "pass": true
+          },
+          {
+            "case": "this life's head is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "the same head again is the same (a lost answer, replayed)",
+            "detail": "Ok(Same)",
+            "pass": true
+          },
+          {
+            "case": "a later checkpoint of this life is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "the same checkpoint with another body is refused",
+            "detail": "Err(Refused { status: 409, detail: \"the same checkpoint with another body\\n\" })",
+            "pass": true
+          },
+          {
+            "case": "the same checkpoint marked clean (a sleep) is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "a clean head never loses its mark",
+            "detail": "Err(Refused { status: 409, detail: \"a clean head loses its mark\\n\" })",
+            "pass": true
+          },
+          {
+            "case": "a head from a life that isn't running is refused",
+            "detail": "Err(Refused { status: 409, detail: \"only the running life posts a head\\n\" })",
+            "pass": true
+          }
+        ],
+        "evidence": "conformance",
+        "exec_ms": 1879,
+        "failed": 0,
+        "passed": 19,
+        "remote": "fpac.fragment.internal:80"
+      },
+      "measured_at_ms": 1795141685703,
+      "path": {
+        "connections_opened": 1,
+        "disk": "spike-path",
+        "epoch": 1795141629459,
+        "errors": [],
+        "evidence": "path",
+        "exec_ms": 52091,
+        "intercept_null_64k": {
+          "first_byte_ms": {
+            "max": 5.663,
+            "mean": 2.727,
+            "min": 1.978,
+            "n": 100,
+            "p50": 2.599,
+            "p99": 3.931
+          },
+          "handler_colo": "unknown"
+        },
+        "open_ms": 13.463352,
+        "put_50m": {
+          "mbs": 52.3,
+          "ms": 1002.220894
+        },
+        "put_64k_ms": {
+          "max": 452.718,
+          "mean": 332.348,
+          "min": 258.762,
+          "n": 30,
+          "p50": 336.797,
+          "p99": 452.718
+        },
+        "put_64k_store_ms": {
+          "max": 449.0,
+          "mean": 328.833,
+          "min": 256.0,
+          "n": 30,
+          "p50": 333.0,
+          "p99": 449.0
+        },
+        "put_8m_mbs": {
+          "max": 21.8,
+          "mean": 17.82,
+          "min": 15.7,
+          "n": 10,
+          "p50": 17.9,
+          "p99": 21.8
+        },
+        "put_8m_ms": {
+          "max": 534.387,
+          "mean": 474.703,
+          "min": 385.011,
+          "n": 10,
+          "p50": 487.785,
+          "p99": 534.387
+        },
+        "put_8m_store_ms": {
+          "max": 526.0,
+          "mean": 466.4,
+          "min": 377.0,
+          "n": 10,
+          "p50": 480.0,
+          "p99": 526.0
+        },
+        "put_if_absent": {
+          "conflict": "Ok(Conflict { sha256: [197, 194, 68, 160, 39, 180, 76, 48, 130, 13, 231, 138, 123, 18, 196, 243, 90, 55, 62, 71, 123, 87, 43, 46, 29, 127, 34, 144, 50, 182, 39, 182] })",
+          "created": "Ok(Created)",
+          "same": "Ok(Same)"
+        },
+        "ranged_1m_first_byte_ms": {
+          "max": 188.065,
+          "mean": 97.744,
+          "min": 72.655,
+          "n": 100,
+          "p50": 94.812,
+          "p99": 140.646
+        },
+        "ranged_1m_ms": {
+          "max": 220.554,
+          "mean": 107.049,
+          "min": 79.532,
+          "n": 100,
+          "p50": 104.138,
+          "p99": 154.328
+        },
+        "ranged_64k_first_byte_ms": {
+          "max": 163.916,
+          "mean": 98.159,
+          "min": 70.795,
+          "n": 200,
+          "p50": 96.852,
+          "p99": 130.312
+        },
+        "ranged_64k_ms": {
+          "max": 164.267,
+          "mean": 98.633,
+          "min": 71.437,
+          "n": 200,
+          "p50": 97.331,
+          "p99": 130.815
+        },
+        "ranged_64k_store_ms": {
+          "max": 160.0,
+          "mean": 94.275,
+          "min": 67.0,
+          "n": 200,
+          "p50": 93.0,
+          "p99": 127.0
+        },
+        "remote": "fpac.fragment.internal:80",
+        "stream_50m": [
+          {
+            "first_byte_ms": 208.829208,
+            "mbs": 69.1,
+            "ms": 758.949097
+          },
+          {
+            "first_byte_ms": 187.39314,
+            "mbs": 41.7,
+            "ms": 1258.011142
+          },
+          {
+            "first_byte_ms": 108.582573,
+            "mbs": 104.6,
+            "ms": 501.085547
+          },
+          {
+            "first_byte_ms": 108.604552,
+            "mbs": 129.3,
+            "ms": 405.451985
+          },
+          {
+            "first_byte_ms": 88.31194500000001,
+            "mbs": 144.9,
+            "ms": 361.825708
+          }
+        ],
+        "stream_50m_parallel4": [
+          {
+            "mbs": 126.5,
+            "ms": 414.618384,
+            "ok": true
+          },
+          {
+            "mbs": 124.9,
+            "ms": 419.753438,
+            "ok": true
+          },
+          {
+            "mbs": 93.9,
+            "ms": 558.1995159999999,
+            "ok": true
+          }
+        ]
+      },
+      "place": {
+        "bucket_location": "WNAM",
+        "name": "cloudflare",
+        "start": {
+          "disk": "spike-path",
+          "driver_colo": "DFW",
+          "epoch": 1795141629459,
+          "image": "tiny",
+          "image_digest": "sha256:891a06688201c48f4c4d6b7980effad591fd2150287575f6cd6cf5851df9dddd",
+          "instance": {
+            "diskMb": 20000,
+            "memoryMib": 6144,
+            "vcpu": 2
+          },
+          "intercept": "before the start",
+          "object_colo": "DFW",
+          "ready": {
+            "ms": 234,
+            "ok": true,
+            "tries": 1
+          },
+          "start_call_ms": 1,
+          "version": "e7f0dbda-9ce2-417a-922a-8619f0b35397"
+        },
+        "what": "the guest in a Cloudflare container -> its intercept -> the stand-in Worker's handler on the container's machine -> an R2 binding"
+      }
+    },
     "cloudflare-p5": {
       "bulk_data": {
         "deleted": {

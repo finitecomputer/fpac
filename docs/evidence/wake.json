@@ -511,10 +511,10 @@
           "start": {
             "object_colo": "DFW",
             "ready_ms": 334,
-            "start_ms": 453.84659700000003,
+            "start_ms": 453.846597,
             "version": "6ced511a-abe6-4864-a4fe-ee410e06f0c1"
           },
-          "wake_to_boot_read_ms": 12724.621747000001
+          "wake_to_boot_read_ms": 12724.621747
         },
         {
           "boot_read_ms": 760,
@@ -2538,6 +2538,313 @@
       ],
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's): a STAND-IN for the route and for R2"
     },
+    "krun-10gb-of-120gib-object-90ms": {
+      "asleep_s_before_the_first_wake": 0,
+      "bulk_data_deleted": "the folder removed",
+      "commit": {
+        "dirty": false,
+        "fpac": "105d0732eeea"
+      },
+      "first": {
+        "fill_df": "/dev/loop0     126227120128 10772119552 115438223360   9% /data",
+        "fill_ms": 95063,
+        "mount": {
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 2.886877
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 3.0398069999999997
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 51.572238
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 53.081707,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 2.029748,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          }
+        },
+        "sleep": {
+          "exit": {
+            "fpac": "exit",
+            "ms": 134864.982109
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 95778.45664,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 36236,
+              "ms": 37850,
+              "pack_bytes": 100659216,
+              "segments": 406
+            },
+            "ms": 134864.46432899998
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 2.886877
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 3.0398069999999997
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 51.572238
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 53.081707,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 2.029748,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 95447.197687,
+            "signal": 15
+          },
+          "sleep_ms": 39417
+        },
+        "start": {
+          "engine_ready_us": 389198,
+          "start_ms": 389.39393
+        }
+      },
+      "gb": 10,
+      "measured_at_ms": 1795141772541,
+      "objects_at_end": {
+        "bytes": 11021496616,
+        "objects": 1514
+      },
+      "wakes": [
+        {
+          "boot_read_ms": 133,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "241",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 199.14258,
+            "loop": 199.40376,
+            "mounted": 380.027405,
+            "opened": 191.121567,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 380.027405,
+            "pack_waits": 1,
+            "waited_at": [
+              145
+            ]
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 2,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 191.121567,
+            "new": false,
+            "pages": 107,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 96.352273
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 197.058882
+          },
+          "sleep_ms": 1122,
+          "start": {
+            "engine_ready_us": 2006490,
+            "start_ms": 2006.776206
+          },
+          "wake_to_boot_read_ms": 2626.4656240000004
+        },
+        {
+          "boot_read_ms": 186,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "4",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 201.610027,
+            "loop": 201.870947,
+            "mounted": 245.438082,
+            "opened": 190.725426,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 245.438082,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 3,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 190.725426,
+            "new": false,
+            "pages": 107,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 97.399841
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 558,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 200.737798
+          },
+          "sleep_ms": 814,
+          "start": {
+            "engine_ready_us": 193460,
+            "start_ms": 193.666303
+          },
+          "wake_to_boot_read_ms": 656.052974
+        },
+        {
+          "boot_read_ms": 201,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "3",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 205.661675,
+            "loop": 206.421084,
+            "mounted": 247.394331,
+            "opened": 193.674294,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 247.394331,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 4,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 193.674294,
+            "new": false,
+            "pages": 107,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 100.42146
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 558,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 203.968816
+          },
+          "sleep_ms": 916,
+          "start": {
+            "engine_ready_us": 287666,
+            "start_ms": 287.873333
+          },
+          "wake_to_boot_read_ms": 757.701995
+        }
+      ],
+      "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's): a STAND-IN for the route and for R2"
+    },
     "krun-10gb-pages-one-at-a-time": {
       "asleep_s_before_the_first_wake": 0,
       "bulk_data_deleted": "the folder removed",
@@ -3384,6 +3691,313 @@
             "start_ms": 127.55326
           },
           "wake_to_boot_read_ms": 521.5737929999999
+        }
+      ],
+      "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's): a STAND-IN for the route and for R2"
+    },
+    "krun-1gb-of-120gib-object-90ms": {
+      "asleep_s_before_the_first_wake": 0,
+      "bulk_data_deleted": "the folder removed",
+      "commit": {
+        "dirty": false,
+        "fpac": "105d0732eeea"
+      },
+      "first": {
+        "fill_df": "/dev/loop0     126227120128 1108406272 125101936640   1% /data",
+        "fill_ms": 10008,
+        "mount": {
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 3.134337
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 3.264517
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 54.005046
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 55.586085,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 2.208468,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          }
+        },
+        "sleep": {
+          "exit": {
+            "fpac": "exit",
+            "ms": 12277.73016
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 10358.343225,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 94,
+              "ms": 1497,
+              "pack_bytes": 100659216,
+              "segments": 1
+            },
+            "ms": 12277.346371
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 3.134337
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 3.264517
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 54.005046
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 55.586085,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 1,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 2.208468,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 10314.3185,
+            "signal": 15
+          },
+          "sleep_ms": 2037
+        },
+        "start": {
+          "engine_ready_us": 568879,
+          "start_ms": 569.089362
+        }
+      },
+      "gb": 1,
+      "measured_at_ms": 1795141623597,
+      "objects_at_end": {
+        "bytes": 1336725952,
+        "objects": 239
+      },
+      "wakes": [
+        {
+          "boot_read_ms": 266,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "185",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 205.592005,
+            "loop": 205.727925,
+            "mounted": 404.875375,
+            "opened": 193.551475,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 404.875375,
+            "pack_waits": 1,
+            "waited_at": [
+              145
+            ]
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 2,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 193.551475,
+            "new": false,
+            "pages": 75,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 100.816419
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 203.944106
+          },
+          "sleep_ms": 817,
+          "start": {
+            "engine_ready_us": 679241,
+            "start_ms": 679.4658810000001
+          },
+          "wake_to_boot_read_ms": 1416.7174659999998
+        },
+        {
+          "boot_read_ms": 205,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "3",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 205.572975,
+            "loop": 205.696185,
+            "mounted": 249.1573,
+            "opened": 194.425914,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 249.1573,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 3,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 194.425914,
+            "new": false,
+            "pages": 75,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 101.675298
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 618,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 204.669895
+          },
+          "sleep_ms": 816,
+          "start": {
+            "engine_ready_us": 319816,
+            "start_ms": 320.019899
+          },
+          "wake_to_boot_read_ms": 793.198033
+        },
+        {
+          "boot_read_ms": 198,
+          "boot_read_ok": true,
+          "far_1mib_read_ms": "3",
+          "misses_after_boot_read": 0,
+          "mount_events_ms": {
+            "fuse": 204.596625,
+            "loop": 205.431905,
+            "mounted": 248.3892,
+            "opened": 192.934065,
+            "pack": null
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 248.3892,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "disk",
+            "epoch": 4,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 192.934065,
+            "new": false,
+            "pages": 75,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 1,
+                "failed": 0,
+                "ms": 100.179629
+              }
+            ],
+            "volume_bytes": 128849018880,
+            "writeback_set": true
+          },
+          "pack": null,
+          "pack_header": {
+            "extents": 558,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_installed": 64,
+            "ms": 203.224747
+          },
+          "sleep_ms": 915,
+          "start": {
+            "engine_ready_us": 353736,
+            "start_ms": 354.00611100000003
+          },
+          "wake_to_boot_read_ms": 819.731899
         }
       ],
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's): a STAND-IN for the route and for R2"
