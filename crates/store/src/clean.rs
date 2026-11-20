@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 use fpac_format::limits::{EXTENT_BYTES, SEGMENT_FIXED_BYTES};
 use fpac_format::{self as format, SegId};
 
+use fpac_remote::RemoteError;
+
 use crate::{ship, Head, MemCache, OpenInfo, RemoteGate, Store, StoreError};
 
 /// A segment is compacted when its live extents are under this share of
@@ -111,7 +113,21 @@ pub fn compact(remote: &mut dyn RemoteGate, info: &OpenInfo, sizes: &BTreeMap<Se
     // write each live extent again: the next cuts carry it to new segments
     let mut buf = vec![0u8; EXTENT_BYTES as usize];
     let mut since_cut = 0;
-    for (_, ext) in &take {
+    for (seg, ext) in &take {
+        // each segment's live extents in one ranged get; one that fails its
+        // check, or a get the store could not answer, is read on its own
+        // below as any read is
+        if let Some(f) = s.segment_fetch(*seg, ext) {
+            let mut window = vec![0u8; f.len];
+            match remote.get_range(&f.name, f.offset, &mut window) {
+                Ok(Some(n)) => {
+                    s.install(&mut cache, &f, &window[..n], &mut buf)?;
+                }
+                Ok(None) => return Err(StoreError::Corrupt(format!("{} is gone, and the map names it", f.name))),
+                Err(RemoteError::Unavailable(_)) => {}
+                Err(e) => return Err(crate::from_remote(e)),
+            }
+        }
         for &e in ext {
             s.read(remote, &mut cache, e, &mut buf)?;
             s.write(remote, &mut cache, e, 0, &buf)?;

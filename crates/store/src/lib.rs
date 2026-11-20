@@ -524,6 +524,20 @@ impl Store {
         out
     }
 
+    /// One ranged get of segment `seg` covering each of `extents` the
+    /// cache does not hold and the map places there, from the first to
+    /// the last (the dead images between come along, unused): how
+    /// compaction reads a mostly dead segment in one round trip rather
+    /// than one per run of live extents. None when none needs fetching.
+    pub fn segment_fetch(&self, seg: SegId, extents: &[u64]) -> Option<Fetch> {
+        let mut run: Vec<(u64, Loc)> = extents.iter().filter(|e| !self.local.contains_key(e)).filter_map(|e| self.map.get(e).copied().filter(|l| !l.is_zero() && l.seg == seg).map(|l| (*e, l))).collect();
+        run.sort_by_key(|(_, l)| l.offset);
+        let (first, last) = (run.first()?.1, run.last()?.1);
+        let len = u64::from(last.offset - first.offset + self.stride());
+        assert!(len <= SEGMENT_BYTES_MAX, "a fetch within one segment");
+        Some(Fetch { name: format::segment_name(seg), offset: u64::from(first.offset), len: len as usize, extent: run[0].0, run, stride: self.stride() })
+    }
+
     /// The pages an open loads before its head: those its replay changed,
     /// which the head's checkpoint rewrites. Every page only when that
     /// checkpoint's list (the last one's and the segments replayed) could
@@ -908,13 +922,15 @@ impl Store {
     /// extent whose bytes match its sum64, and that the map still places
     /// there and the cache does not hold by now, goes to the cache as
     /// clean. Answers whether the extent asked for is in `buf`; false when
-    /// its bytes were wrong (the caller fetches it again).
+    /// its bytes were wrong (the caller fetches it again). Each extent is
+    /// at its own place in the window (a segment's fetch has gaps).
     pub fn install(&mut self, cache: &mut dyn CacheGate, f: &Fetch, window: &[u8], buf: &mut [u8]) -> Result<bool, StoreError> {
         let stride = f.stride as usize;
         let mut asked = false;
         let mut plain = vec![0u8; EXTENT_BYTES as usize];
-        for (i, (e, l)) in f.run.iter().enumerate() {
-            let Some(got) = window.get(i * stride..(i + 1) * stride) else { break };
+        for (e, l) in &f.run {
+            let at = usize::try_from(u64::from(l.offset) - f.offset).expect("within a segment");
+            let Some(got) = window.get(at..at + stride) else { break };
             let placed = self.map.get(e) == Some(l);
             let held = self.local.contains_key(e);
             if *e == f.extent && held {

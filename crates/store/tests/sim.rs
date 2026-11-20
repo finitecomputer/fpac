@@ -761,6 +761,8 @@ fn compaction_keeps_every_byte_and_lets_the_dead_go() {
 struct Stopping<'a> {
     inner: &'a mut SimRemote,
     left: u64,
+    /// Ranged gets made.
+    ranged: u64,
 }
 
 impl Stopping<'_> {
@@ -776,6 +778,7 @@ impl Stopping<'_> {
 impl RemoteGate for Stopping<'_> {
     fn get_range(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<Option<usize>, RemoteError> {
         self.take()?;
+        self.ranged += 1;
         self.inner.get_range(name, offset, buf)
     }
     fn get(&mut self, name: &str, sink: &mut dyn FnMut(&[u8])) -> Result<Option<u64>, RemoteError> {
@@ -785,6 +788,30 @@ impl RemoteGate for Stopping<'_> {
     fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError> {
         self.take()?;
         self.inner.put(name, body)
+    }
+}
+
+// Goal: compaction reads each segment it moves in one ranged get, not one
+// per run of live extents (a round trip to R2 each). Method: a disk whose
+// old segments are a tenth live, every tenth extent, so no two live
+// extents lie side by side; compaction's ranged gets counted, then a life
+// that reads all 400 extents.
+#[test]
+fn compaction_reads_each_segment_it_moves_once() {
+    let mut remote = SimRemote::new(19, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let exp = disk_with_garbage(&mut remote, &mut platform);
+    let sizes = segment_sizes(&remote);
+    platform.running = 2;
+    let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
+    let mut gate = Stopping { inner: &mut remote, left: u64::MAX, ranged: 0 };
+    let c = fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
+    assert!(c.segments_compacted >= 2 && c.extents_moved >= 20, "{c:?}");
+    assert_eq!(gate.ranged, c.segments_compacted as u64, "one ranged get per segment moved: {c:?}");
+    platform.running = 3;
+    let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+    for e in 0..400 {
+        life.read_check(e).unwrap();
     }
 }
 
@@ -802,11 +829,11 @@ fn a_cleaner_stopped_anywhere_leaves_a_disk_that_opens() {
         let sizes = segment_sizes(&remote);
         platform.running = 2;
         let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
-        let mut gate = Stopping { inner: &mut remote, left: u64::MAX };
+        let mut gate = Stopping { inner: &mut remote, left: u64::MAX, ranged: 0 };
         fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
         u64::MAX - gate.left
     };
-    assert!(calls > 10);
+    assert!(calls > 5, "a compaction of several calls: {calls}");
     for stop in (0..calls).step_by(((calls / 60) as usize).max(1)) {
         let mut remote = SimRemote::new(18, CALM);
         let mut platform = Platform { head: None, running: 0 };
@@ -814,7 +841,7 @@ fn a_cleaner_stopped_anywhere_leaves_a_disk_that_opens() {
         let sizes = segment_sizes(&remote);
         platform.running = 2;
         let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
-        let mut gate = Stopping { inner: &mut remote, left: stop };
+        let mut gate = Stopping { inner: &mut remote, left: stop, ranged: 0 };
         let r = fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h));
         assert!(r.is_err(), "stopped after {stop} of {calls} calls");
         platform.running = 3;
