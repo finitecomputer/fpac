@@ -939,7 +939,7 @@ impl Store {
     /// Installs what a fetch brought (`window`, possibly short): each
     /// extent whose bytes match its sum64, and that the map still places
     /// there and the cache does not hold by now, goes to the cache as
-    /// clean. Answers whether the extent asked for is in `buf`; false when
+    /// clean (unless the cache's disk is full: then it is only answered). Answers whether the extent asked for is in `buf`; false when
     /// its bytes were wrong (the caller fetches it again). Each extent is
     /// at its own place in the window (a segment's fetch has gaps).
     pub fn install(&mut self, cache: &mut dyn CacheGate, f: &Fetch, window: &[u8], buf: &mut [u8]) -> Result<bool, StoreError> {
@@ -966,8 +966,13 @@ impl Store {
                 None => continue,
             };
             if placed && !held {
-                cache.write(*e, image)?;
-                self.set_local(*e, Some(Local::Clean));
+                match cache.write(*e, image) {
+                    Ok(()) => self.set_local(*e, Some(Local::Clean)),
+                    // the cache's disk is full: the extent is answered, not
+                    // kept (its next read fetches it again), so reads go on
+                    Err(err) if err.kind() == std::io::ErrorKind::StorageFull => {}
+                    Err(err) => return Err(err.into()),
+                }
                 if *e == f.extent {
                     buf.copy_from_slice(image);
                     asked = true;
@@ -1457,9 +1462,16 @@ impl Store {
                 None => continue,
             };
             self.map.entry(e).or_insert(loc);
-            cache.write(e, image)?;
-            self.set_local(e, Some(Local::Clean));
-            installed += 1;
+            match cache.write(e, image) {
+                Ok(()) => {
+                    self.set_local(e, Some(Local::Clean));
+                    installed += 1;
+                }
+                // the cache's disk is full: not kept; a read of it fetches
+                // it (`install`), and the rest of the pack goes on
+                Err(err) if err.kind() == std::io::ErrorKind::StorageFull => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         Ok(installed)
     }

@@ -875,6 +875,46 @@ fn a_write_with_no_room_fails_typed_and_loses_nothing() {
     life.read_check(100).unwrap();
 }
 
+// Goal: while the cache's disk is full, a read of an extent the cache
+// does not hold is answered (fetched, not kept), so reads go on; once
+// there is room, a read keeps what it fetched again. Method: a disk
+// written and slept; the next life, its cache with no room, reads every
+// extent twice (right bytes, nothing kept, fetched both times), then with
+// room once more.
+#[test]
+fn reads_go_on_while_the_disk_is_full() {
+    let mut remote = SimRemote::new(22, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in 0..40u64 {
+        let b = content(e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.sleep(&mut Rng(10)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    platform.running = 2;
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    let mut cache = NoRoom { inner: std::mem::take(&mut life.cache), shadows_fit: false, cow: false };
+    let held = cache.inner.extents.len();
+    let mut buf = vec![0u8; EXT];
+    for round in 0..2 {
+        let gets = life.remote.gets;
+        for e in 0..40u64 {
+            life.store.read(life.remote, &mut cache, e, &mut buf).unwrap_or_else(|err| panic!("round {round}, extent {e}: {err}"));
+            assert_eq!(buf, content(e), "round {round}, extent {e}");
+        }
+        assert!(life.remote.gets > gets, "round {round}: fetched from the store");
+        assert_eq!(cache.inner.extents.len(), held, "round {round}: nothing kept with no room");
+    }
+    life.cache = cache.inner;
+    for e in 0..40u64 {
+        life.read_check(e).unwrap();
+    }
+    assert!(life.cache.extents.len() > held, "with room, what is fetched is kept");
+}
+
 /// A gate that stops answering after `left` calls: the cleaner's crash.
 struct Stopping<'a> {
     inner: &'a mut SimRemote,
