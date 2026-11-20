@@ -32,10 +32,36 @@ fn noise(n: usize, seed: u64) -> Vec<u8> {
     fpac_testkit::conformance::noise(n, seed)
 }
 
-/// A sequential write of 4 GiB with an fsync, then a cold read: MB/s.
+/// What FPAC's daemon has written and not yet landed, from its status
+/// file; None where no daemon runs.
+fn unshipped() -> Option<u64> {
+    let s = fs::read_to_string("/run/fpac/status.json").ok()?;
+    serde_json::from_str::<Value>(&s).ok()?["unshipped_extents"].as_u64()
+}
+
+/// Waits until the daemon has landed everything (at most ten minutes):
+/// how long it took, in ms.
+fn wait_shipped() -> Option<u128> {
+    let t = Instant::now();
+    // Bounded: ten minutes of 100 ms polls.
+    for _ in 0..6000 {
+        match unshipped() {
+            None => return None,
+            Some(0) => return Some(t.elapsed().as_millis()),
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    None
+}
+
+/// A sequential write of 4 GiB with an fsync, then a cold read: MB/s. On
+/// its own, as section 10's row is: it starts once FPAC's daemon has
+/// landed what the earlier rows wrote, and it reports how fast the 4 GiB
+/// shipped behind it (the row's other half).
 fn sequential(dir: &Path) -> std::io::Result<Value> {
     let p = dir.join("seq.bin");
     let chunk = noise(1 << 20, 1);
+    let waited_ms = wait_shipped();
     let t = Instant::now();
     let mut f = File::create(&p)?;
     for _ in 0..SEQ_BYTES / chunk.len() {
@@ -43,6 +69,7 @@ fn sequential(dir: &Path) -> std::io::Result<Value> {
     }
     f.sync_all()?;
     let w = t.elapsed().as_secs_f64();
+    let shipped_behind = wait_shipped().map(|_| (SEQ_BYTES as f64 / 1e6 / t.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     drop(f);
     let cold = drop_caches();
     let t = Instant::now();
@@ -53,7 +80,7 @@ fn sequential(dir: &Path) -> std::io::Result<Value> {
     let r = t.elapsed().as_secs_f64();
     fs::remove_file(&p)?;
     let mbs = |s: f64| (SEQ_BYTES as f64 / 1e6 / s * 10.0).round() / 10.0;
-    Ok(json!({ "write_fsync_mbs": mbs(w), "read_cold_mbs": mbs(r), "page_cache_dropped": cold }))
+    Ok(json!({ "write_fsync_mbs": mbs(w), "read_cold_mbs": mbs(r), "page_cache_dropped": cold, "waited_for_earlier_rows_ms": waited_ms, "landed_behind_it_mbs": shipped_behind }))
 }
 
 /// 4 KiB writes at random offsets of a 256 MiB file for 10 s, then an

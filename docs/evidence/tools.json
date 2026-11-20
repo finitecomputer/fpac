@@ -190,7 +190,7 @@
       "start": {
         "object_colo": "DFW",
         "ready_ms": 277,
-        "start_ms": 362.71328400000004,
+        "start_ms": 362.713284,
         "version": "6ced511a-abe6-4864-a4fe-ee410e06f0c1"
       },
       "what": "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
@@ -383,6 +383,200 @@
         "start_ms": 153.61245000000002
       },
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine: a STAND-IN for the route and for R2"
+    },
+    "krun-r2-modelled": {
+      "bulk_data_deleted": "the folder removed",
+      "commit": {
+        "dirty": false,
+        "fpac": "4bf92daae4e3"
+      },
+      "daemon": {
+        "bytes_shipped": 5580211496,
+        "cached_extents": 70157,
+        "checkpoints": 9,
+        "cuts": 45,
+        "dirty_extents": 0,
+        "durable_ms": 1795138231037,
+        "epoch": 1,
+        "evictions": 0,
+        "fenced": false,
+        "fetch_retries": 0,
+        "full_waits": 330,
+        "head_posted": true,
+        "misses": 0,
+        "now_ms": 1795138260195,
+        "pack_waits": 0,
+        "planned_segments": 0,
+        "read_errors": 0,
+        "segments": 1278,
+        "shipping_segments": 0,
+        "syncs": 13464,
+        "unshipped_extents": 0,
+        "up_ms": 250410,
+        "write_errors": 0
+      },
+      "measured_at_ms": 1795138262411,
+      "mount": {
+        "dir": "/data",
+        "fpac": "mounted",
+        "misses": 0,
+        "ms": 9.444102,
+        "pack_waits": 0,
+        "waited_at": []
+      },
+      "npm": "not run: the guests have no internet (enableInternet is off), and npm ci needs its registry",
+      "objects_at_end": {
+        "bytes": 5592922548,
+        "objects": 1377
+      },
+      "results": {
+        "fpac": {
+          "dir": "/data",
+          "fs": {
+            "dir": "/data",
+            "dir_30k": {
+              "entries": 30000,
+              "list_cold_ms": 9.062112,
+              "list_warm_ms": 3.996897
+            },
+            "evidence": "fsbench",
+            "random_4k_write_10s": {
+              "iops": 1103008.0,
+              "writes": 14317411
+            },
+            "saves": {
+              "office_save_ms": {
+                "max": 5.179,
+                "mean": 0.369,
+                "min": 0.21,
+                "n": 500,
+                "p50": 0.341,
+                "p99": 0.596
+              },
+              "scratch_file_ms": {
+                "max": 0.168,
+                "mean": 0.032,
+                "min": 0.025,
+                "n": 500,
+                "p50": 0.028,
+                "p99": 0.06
+              }
+            },
+            "sequential_4gib": {
+              "page_cache_dropped": true,
+              "read_cold_mbs": 167.8,
+              "write_fsync_mbs": 119.7
+            },
+            "small_files": {
+              "create_write_close_ms_each": 0.007,
+              "delete_all_ms": 93.930215,
+              "files": 10000,
+              "read_cold_ms_each": 0.079,
+              "stat_cold_ms_each": 0.002,
+              "stat_warm_ms_each": 0.001
+            },
+            "write_4k_osync_ms": {
+              "max": 52.048,
+              "mean": 0.204,
+              "min": 0.077,
+              "n": 1000,
+              "p50": 0.084,
+              "p99": 0.432
+            }
+          },
+          "tools": {
+            "find_cold": 26,
+            "git_checkout_7260_changed": 196,
+            "git_clone_7260_files": 1284,
+            "git_status_cold": 484,
+            "git_status_warm": 28,
+            "grep_rl_cold": 519,
+            "grep_rl_warm": 11,
+            "journal_mode": "wal",
+            "rm_rf_checkout": 67,
+            "sqlite_100k_point_reads_warm": 11,
+            "sqlite_10k_txns_full": 1539,
+            "sqlite_10k_txns_normal": 48,
+            "sqlite_1m_rows_one_txn": 355
+          }
+        },
+        "local": {
+          "dir": "/var/tmp/local",
+          "fs": {
+            "dir": "/var/tmp/local",
+            "dir_30k": {
+              "entries": 30000,
+              "list_cold_ms": 23.285492,
+              "list_warm_ms": 4.131596
+            },
+            "evidence": "fsbench",
+            "random_4k_write_10s": {
+              "iops": 672041.0,
+              "writes": 9117629
+            },
+            "saves": {
+              "office_save_ms": {
+                "max": 27.261,
+                "mean": 3.818,
+                "min": 2.217,
+                "n": 500,
+                "p50": 3.66,
+                "p99": 10.529
+              },
+              "scratch_file_ms": {
+                "max": 0.541,
+                "mean": 0.104,
+                "min": 0.035,
+                "n": 500,
+                "p50": 0.098,
+                "p99": 0.225
+              }
+            },
+            "sequential_4gib": {
+              "page_cache_dropped": true,
+              "read_cold_mbs": 417.4,
+              "write_fsync_mbs": 346.8
+            },
+            "small_files": {
+              "create_write_close_ms_each": 0.092,
+              "delete_all_ms": 112.35694,
+              "files": 10000,
+              "read_cold_ms_each": 0.055,
+              "stat_cold_ms_each": 0.006,
+              "stat_warm_ms_each": 0.001
+            },
+            "write_4k_osync_ms": {
+              "max": 660.44,
+              "mean": 6.575,
+              "min": 2.123,
+              "n": 1000,
+              "p50": 4.369,
+              "p99": 24.937
+            }
+          },
+          "tools": {
+            "find_cold": 72,
+            "git_checkout_7260_changed": 210,
+            "git_clone_7260_files": 6444,
+            "git_status_cold": 695,
+            "git_status_warm": 43,
+            "grep_rl_cold": 3334,
+            "grep_rl_warm": 16,
+            "journal_mode": "wal",
+            "rm_rf_checkout": 209,
+            "sqlite_100k_point_reads_warm": 13,
+            "sqlite_10k_txns_full": 93731,
+            "sqlite_10k_txns_normal": 445,
+            "sqlite_1m_rows_one_txn": 1680
+          }
+        }
+      },
+      "sleep_ms": 714,
+      "start": {
+        "engine_ready_us": 143293,
+        "start_ms": 143.52924000000002
+      },
+      "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's), puts sharing 50 MB/s (the rate a Cloudflare container sustained to R2): a STAND-IN for the route and for R2"
     }
   }
 }
