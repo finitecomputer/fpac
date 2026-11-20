@@ -342,6 +342,8 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
+        // the cache gives room back (docs/design.md, The cache)
+        "room" => disk::room(p.as_mut(), flag(args, "--ceiling-gib").and_then(|g| g.parse::<u64>().ok()).unwrap_or(6) << 30),
         // what sealing costs on this place's CPU (docs/encryption.md)
         "aead" => (|| {
             p.start()?;
@@ -774,7 +776,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead" | "clean")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead" | "clean" | "room")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -858,7 +860,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead", "clean"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead", "clean", "room"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two

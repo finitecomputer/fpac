@@ -10,12 +10,12 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use fpac_device::serve::{Backing, BackingError};
-use fpac_format::limits::{AHEAD_EXTENTS_MAX, AHEAD_PIECE_EXTENTS, DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
+use fpac_format::limits::{AHEAD_EXTENTS_MAX, AHEAD_PIECE_EXTENTS, DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX, PACK_BYTES_MAX, UNSHIPPED_BYTES_MAX};
 use fpac_remote::Remote;
 use fpac_format::{PageRef, Place, Sealer};
 use fpac_store::evict::{Evictor, Taken, Verdict};
@@ -43,6 +43,30 @@ const STREAM_GAP_EXTENTS: u64 = 8;
 /// once across every scan.
 const AHEAD_FETCHES: usize = 8;
 const AHEAD_WINDOWS_MAX: usize = 4;
+
+/// What the cache's disk keeps free beyond the shadow's worst case, for
+/// everything else on it (local scratch, the guest's own files).
+pub const CACHE_DISK_HEADROOM_BYTES: u64 = 2 << 30;
+/// The cache's bound never falls under this while it gives room back:
+/// the unshipped budget (unshipped extents cannot leave) and the next
+/// pack's extents (the boot's, kept for the next wake).
+pub const CACHE_FLOOR_BYTES: u64 = UNSHIPPED_BYTES_MAX + PACK_BYTES_MAX;
+/// Extents dropped under one hold of the lock while giving room back, so
+/// writes beside it wait at most one batch's punches.
+const ROOM_DROP_BATCH: usize = 1024;
+
+/// The cache's bound, in extents, for the room its disk has now
+/// (docs/design.md, The cache): what the cache holds plus what is free,
+/// less what the shadow file may still take (the unshipped budget less
+/// what it holds) and CACHE_DISK_HEADROOM_BYTES; never under the floor
+/// (CACHE_FLOOR_BYTES), never over `ceiling`, the bound the mount set.
+/// At the mount (nothing cached) this is the mount's own rule.
+pub fn room_bound(free_bytes: u64, cached_extents: u64, shadow_bytes: u64, ceiling: u64) -> u64 {
+    let e = u64::from(EXTENT_BYTES);
+    let floor = (CACHE_FLOOR_BYTES / e).min(ceiling);
+    let reserve = UNSHIPPED_BYTES_MAX.saturating_sub(shadow_bytes) + CACHE_DISK_HEADROOM_BYTES;
+    ((cached_extents * e).saturating_add(free_bytes).saturating_sub(reserve) / e).clamp(floor, ceiling)
+}
 
 /// The cache file: one sparse file of the volume's size on the container's
 /// own disk, an extent at `extent * EXTENT_BYTES`; and beside it the
@@ -124,6 +148,11 @@ impl FileCache {
     /// A second handle on the cache file, for reads outside the lock.
     pub fn reader(&self) -> std::io::Result<File> {
         self.file.try_clone()
+    }
+
+    /// What the shadow file holds now, in bytes.
+    pub fn shadow_bytes(&self) -> u64 {
+        self.slots.len() as u64 * u64::from(EXTENT_BYTES)
     }
 }
 
@@ -207,8 +236,10 @@ pub struct Stats {
     pub syncs: AtomicU64,
     /// Reads that waited for the pack to bring their extent.
     pub pack_waits: AtomicU64,
-    /// Clean extents dropped to keep the cache within `--cache-max`.
+    /// Clean extents dropped to keep the cache within its bound, and of
+    /// those, the ones dropped because its disk was short of room.
     pub evictions: AtomicU64,
+    pub room_evictions: AtomicU64,
     /// Writes answered with an error (the kernel sees EIO).
     pub write_errors: AtomicU64,
     /// Map pages fetched (lazy pages).
@@ -273,8 +304,11 @@ pub struct Disk {
     pub waited: Mutex<Vec<usize>>,
     /// The cache's bound, in extents (docs/design.md, The cache): past it,
     /// clean extents leave as `evict` chooses (S3-FIFO); never one that is
-    /// unshipped or that a write is reading.
-    cache_max: usize,
+    /// unshipped or that a write is reading. It falls while the cache's
+    /// disk is short of room (`give_room`), and rises again to
+    /// `cache_ceiling`, the mount's.
+    cache_max: AtomicUsize,
+    cache_ceiling: usize,
     evict: Mutex<Evictor>,
     /// The sequential reads being followed (`ahead`), and read-ahead
     /// windows in flight.
@@ -296,7 +330,7 @@ impl Disk {
         let cache_max = usize::try_from(cache_max_bytes / EXTENT_BYTES as u64).expect("bounded by the volume");
         let reader = cache.reader()?;
         let reader_key = cache.key();
-        Ok(Disk { inner: Mutex::new(Inner { store, cache }), reader, reader_key, cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, evict: Mutex::new(Evictor::new(cache_max)), streams: Mutex::new(Vec::new()), windows: AtomicU64::new(0), me: std::sync::OnceLock::new(), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) })
+        Ok(Disk { inner: Mutex::new(Inner { store, cache }), reader, reader_key, cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max: AtomicUsize::new(cache_max), cache_ceiling: cache_max, evict: Mutex::new(Evictor::new(cache_max)), streams: Mutex::new(Vec::new()), windows: AtomicU64::new(0), me: std::sync::OnceLock::new(), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) })
     }
 
     /// Extents' bytes from the cache file, without the lock: a write
@@ -372,7 +406,7 @@ impl Disk {
         let pinned = self.pinned.lock().unwrap();
         // Bounded: each drop lowers the count, and the policy answers None
         // once nothing it holds may go.
-        while inner.store.cached_extents() > self.cache_max {
+        while inner.store.cached_extents() > self.cache_max.load(Ordering::Relaxed) {
             let store = &inner.store;
             let verdict = |x: u64| match () {
                 _ if !store.is_cached(x) => Verdict::Gone,
@@ -387,6 +421,49 @@ impl Disk {
             }
         }
         Ok(())
+    }
+
+    /// Sets the cache's bound for the room its disk has (`room_bound`,
+    /// with `free_bytes` from its statvfs) and drops clean extents down to
+    /// it at once, ROOM_DROP_BATCH under each hold of the lock: their
+    /// holes are punched, so whatever else writes to that disk gets the
+    /// room back. The bound rises again as room comes back. Answers the
+    /// bound, in extents.
+    pub fn give_room(&self, free_bytes: u64) -> Result<usize, StoreError> {
+        let (cached, shadow) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.store.cached_extents(), inner.cache.shadow_bytes())
+        };
+        let ceiling = self.cache_ceiling as u64;
+        let bound = usize::try_from(room_bound(free_bytes, cached as u64, shadow, ceiling)).expect("at most the ceiling");
+        let mut now = cached;
+        // Bounded: each turn drops a batch, or ends when none can go.
+        while now > bound {
+            let step = bound.max(now - ROOM_DROP_BATCH.min(now));
+            self.cache_max.store(step, Ordering::Relaxed);
+            let mut inner = self.inner.lock().unwrap();
+            let before = self.stats.evictions.load(Ordering::Relaxed);
+            self.took_each(&mut inner, std::iter::empty())?;
+            self.stats.room_evictions.fetch_add(self.stats.evictions.load(Ordering::Relaxed) - before, Ordering::Relaxed);
+            let after = inner.store.cached_extents();
+            if after >= now {
+                // nothing more may go (unshipped, pinned, the pack's)
+                break;
+            }
+            now = after;
+        }
+        self.cache_max.store(bound, Ordering::Relaxed);
+        Ok(bound)
+    }
+
+    /// The cache's bound now, in extents.
+    pub fn cache_bound(&self) -> usize {
+        self.cache_max.load(Ordering::Relaxed)
+    }
+
+    /// Whether the mount is ending (the flusher was told to stop).
+    pub fn stopping(&self) -> bool {
+        self.wake.0.lock().unwrap().stop
     }
 
     /// Gives the disk its own handle, once it is shared: the read-ahead's
@@ -788,6 +865,33 @@ pub fn pool<T: Send, R: Send>(jobs: Vec<T>, workers: usize, f: impl Fn(T) -> R +
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cache_gives_room_back_down_to_its_floor_and_takes_it_again() {
+        use super::{room_bound, CACHE_DISK_HEADROOM_BYTES, CACHE_FLOOR_BYTES};
+        use fpac_format::limits::{EXTENT_BYTES, UNSHIPPED_BYTES_MAX};
+        let e = u64::from(EXTENT_BYTES);
+        let gib = 1u64 << 30;
+        let reserve = UNSHIPPED_BYTES_MAX + CACHE_DISK_HEADROOM_BYTES;
+        let ceiling = 10 * gib / e;
+        // at the mount, nothing cached: the mount's rule (free less the
+        // shadow's worst case and the headroom), at most the ceiling
+        assert_eq!(room_bound(12 * gib, 0, 0, ceiling), (12 * gib - reserve) / e);
+        assert_eq!(room_bound(40 * gib, 0, 0, ceiling), ceiling);
+        // a full cache with its reserve free keeps its bound
+        assert_eq!(room_bound(reserve, ceiling, 0, ceiling), ceiling);
+        // a writer beside it takes 3 GiB: the cache gives 3 GiB back
+        assert_eq!(room_bound(reserve - 3 * gib, ceiling, 0, ceiling), ceiling - 3 * gib / e);
+        // and never goes under its floor, however little is free
+        assert_eq!(room_bound(0, ceiling, 0, ceiling), CACHE_FLOOR_BYTES / e);
+        // a floor above a lower ceiling (`--cache-max`) is the ceiling
+        assert_eq!(room_bound(0, gib / e, 0, gib / e), gib / e);
+        // what the shadow holds is already off the free room
+        assert_eq!(room_bound(reserve - gib, ceiling, gib, ceiling), ceiling);
+        // the room back: the bound rises again, to the ceiling at most
+        assert_eq!(room_bound(reserve + gib, ceiling - 3 * gib / e, 0, ceiling), ceiling - 2 * gib / e);
+        assert_eq!(room_bound(u64::MAX, ceiling, 0, ceiling), ceiling);
+    }
+
     use super::*;
 
     // Goal: a sealed cache file holds only ciphertext, and hands back

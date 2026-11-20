@@ -619,6 +619,77 @@ pub fn clean(p: &mut Cloudflare, kill_after: Duration) -> Result<Value, String> 
     Ok(r)
 }
 
+/// The free room, in bytes, of the guest's disk that holds the cache.
+fn guest_free(p: &dyn Place) -> Result<u64, String> {
+    let (_, out) = p.sh("df -B1 --output=avail /var/lib/fpac | tail -n 1")?;
+    out.trim().parse().map_err(|e| format!("df: {e}: {out}"))
+}
+
+/// Giving room back (docs/design.md, The cache): the cache full at its
+/// bound (`ceiling` bytes, `--cache-max`) with every extent shipped, then
+/// a writer beside the daemon takes all but a GiB of its disk's free room
+/// and writes 2 GiB more, while a writer on the disk syncs 256 MiB of new
+/// files. The writer beside it must succeed (only the cache's giving room
+/// back makes that room), the daemon must answer no write with an error,
+/// and the next life must find every file the disk took.
+pub fn room(p: &mut dyn Place, ceiling: u64) -> Result<Value, String> {
+    let st = p.start()?;
+    let m = mount_with(p, &format!("--cache-max {ceiling}"))?;
+    let files = ceiling / (64 << 20);
+    let t0 = Instant::now();
+    let (code, out) = p.sh(&format!("set -e; mkdir -p /data/fill; for i in $(seq 1 {files}); do head -c 67108864 /dev/urandom > /data/fill/f$i; done; sync; sha256sum /data/fill/* > /data/fill.sha256; sync; echo filled"))?;
+    if code != 0 || !out.contains("filled") {
+        return Err(format!("the fill: {out}"));
+    }
+    let fill_ms = t0.elapsed().as_millis() as u64;
+    // Bounded: 900 s. The cache full of shipped (clean) extents.
+    let full = loop {
+        let s = status(p);
+        if s["unshipped_extents"] == 0 && s["dirty_extents"] == 0 {
+            break s;
+        }
+        if t0.elapsed() > Duration::from_secs(900) {
+            return Err(format!("not shipped in 900 s: {s}"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let free_full = guest_free(p)?;
+    let (code, out) = p.sh("setsid nohup sh -c 'set -e; mkdir -p /data/during; for i in $(seq 1 64); do head -c 4194304 /dev/urandom > /data/during/d$i; sync; done; sha256sum /data/during/* > /data/during.sha256; sync; echo done > /tmp/during.done' > /tmp/during.log 2>&1 < /dev/null & echo started")?;
+    if code != 0 || !out.contains("started") {
+        return Err(format!("the writer on the disk: {out}"));
+    }
+    let ballast = free_full.saturating_sub(1 << 30);
+    let t1 = Instant::now();
+    let (local_code, local) = p.sh(&format!("fallocate -l {ballast} /var/lib/ballast && dd if=/dev/urandom of=/var/lib/local.fill bs=1M count=2048 conv=fsync status=none && echo local-ok; df -B1 --output=avail /var/lib/fpac | tail -n 1"))?;
+    let local_ms = t1.elapsed().as_millis() as u64;
+    // Bounded: 300 s.
+    let during = loop {
+        let (_, d) = p.sh("cat /tmp/during.done 2>/dev/null; cat /tmp/during.log")?;
+        if d.contains("done") || t1.elapsed() > Duration::from_secs(300) {
+            break d;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let after = status(p);
+    let (_, log) = p.sh("grep cache-room /run/fpac/log | head -n 20")?;
+    p.sh("rm -f /var/lib/ballast /var/lib/local.fill")?;
+    let s1 = sleep(p)?;
+    p.kill()?;
+    let st2 = p.start()?;
+    let m2 = mount(p)?;
+    let (_, check) = p.sh("sha256sum -c --quiet /data/fill.sha256 && echo fill-ok; sha256sum -c --quiet /data/during.sha256 && echo during-ok")?;
+    let s2 = sleep(p)?;
+    p.kill()?;
+    let ok = local.contains("local-ok") && during.contains("done") && check.contains("fill-ok") && check.contains("during-ok") && after["write_errors"] == 0 && after["fenced"] == false;
+    Ok(json!({
+        "what": p.what(), "ceiling_bytes": ceiling, "ok": ok,
+        "life1": { "start": st, "mount": m, "fill_bytes": files << 26, "fill_ms": fill_ms, "full": full, "free_when_full_bytes": free_full,
+            "local": { "ballast_bytes": ballast, "then_written_bytes": 2u64 << 30, "exit": local_code, "out": local, "ms": local_ms },
+            "during": during, "after": after, "room_events": log, "sleep": s1 },
+        "life2": { "start": st2, "mount": m2, "check": check, "sleep": s2 },
+    }))
+}
+
 /// Rounds of a guest killed mid-write, each next life checked.
 pub fn crash(p: &mut dyn Place, rounds: u32) -> Result<Value, String> {
     let mut required: u64 = 0;

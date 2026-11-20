@@ -24,7 +24,7 @@ use fpac_store::evict::Taken;
 use fpac_store::{Ask, OpenInfo, PackView, Store, StoreError};
 use serde_json::{json, Value};
 
-use crate::disk::{self, pool, Disk, FileCache};
+use crate::disk::{self, pool, Disk, FileCache, CACHE_DISK_HEADROOM_BYTES};
 use crate::flush::{self, Progress};
 
 /// The intercepted host the guest reaches the remote by.
@@ -41,9 +41,9 @@ const OPEN_MS_MAX: u64 = 60_000;
 /// consistent with files still open (a sleep's caller stops its programs
 /// first; this is the guard if one is left).
 const UMOUNT_MS_MAX: u64 = 2_000;
-/// Room the cache leaves on its disk for everything else there (the
-/// image's own files, logs, a program's scratch).
-const CACHE_DISK_HEADROOM_BYTES: u64 = 2 << 30;
+/// How often the cache's disk's free room is read (statvfs) while
+/// mounted, so the cache gives room back to a writer beside it.
+const ROOM_MS: u64 = 1000;
 /// The kernel's writeback in the guest (docs/contract.md, the loss
 /// window): a page only written goes to the device within 5 s, not
 /// Linux's default 30 s, and the flusher wakes every second.
@@ -516,7 +516,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "shipping_behind": p.behind.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "ahead_windows": disk.stats.ahead_windows.load(Ordering::Relaxed), "ahead_extents": disk.stats.ahead_extents.load(Ordering::Relaxed), "ahead_waits": disk.stats.ahead_waits.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "ahead_windows": disk.stats.ahead_windows.load(Ordering::Relaxed), "ahead_extents": disk.stats.ahead_extents.load(Ordering::Relaxed), "ahead_waits": disk.stats.ahead_waits.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "room_evictions": disk.stats.room_evictions.load(Ordering::Relaxed), "cache_bound_extents": disk.cache_bound(), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed), "cpu_ms": cpu_ms(),
             "lock_waits_over_1ms": disk.stats.lock_waits_over_1ms.load(Ordering::Relaxed), "lock_wait_max_us": disk.stats.lock_wait_max_us.load(Ordering::Relaxed),
@@ -537,19 +537,47 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
 /// could fill it.
 fn cache_bound(cache_path: &Path, volume: u64, asked: Option<u64>) -> Result<u64, String> {
     use fpac_format::limits::UNSHIPPED_BYTES_MAX;
-    let dir = cache_path.parent().unwrap_or(Path::new("/"));
-    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    // SAFETY: statvfs fills the struct it is given, for a NUL-ended path.
-    let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut v) } != 0 {
-        return Err(format!("the cache's disk: {}", std::io::Error::last_os_error()));
-    }
-    let free = v.f_bavail.saturating_mul(v.f_frsize);
+    let free = disk_free(cache_path).map_err(|e| format!("the cache's disk: {e}"))?;
     let bound = free.saturating_sub(UNSHIPPED_BYTES_MAX + CACHE_DISK_HEADROOM_BYTES).min(volume);
     if bound < 2 * UNSHIPPED_BYTES_MAX && asked.is_none() {
         return Err(format!("the cache's disk has {free} bytes free: the cache needs {} at least", 3 * UNSHIPPED_BYTES_MAX + CACHE_DISK_HEADROOM_BYTES));
     }
     Ok(asked.map_or(bound, |a| a.min(bound)) / EXTENT_BYTES as u64 * EXTENT_BYTES as u64)
+}
+
+/// The free room, in bytes, of the disk that holds `file` (statvfs: what
+/// an unprivileged writer may still take).
+fn disk_free(file: &Path) -> std::io::Result<u64> {
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: statvfs fills the struct it is given, for a NUL-ended path.
+    let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut v) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(v.f_bavail.saturating_mul(v.f_frsize))
+}
+
+/// Gives room back (docs/design.md, The cache): each ROOM_MS, the cache's
+/// disk's free room sets the cache's bound (`Disk::give_room`), until the
+/// mount ends. An error reading the room or dropping an extent is
+/// logged, and the bound stays.
+fn room_watcher(disk: Arc<Disk>, cache_path: PathBuf, t0: Instant) {
+    let mut last = disk.cache_bound();
+    // Unbounded on purpose: the life of the mount, until a stop.
+    while !disk.stopping() {
+        std::thread::sleep(Duration::from_millis(ROOM_MS));
+        let r = disk_free(&cache_path).map_err(|e| e.to_string()).and_then(|free| disk.give_room(free).map(|b| (free, b)).map_err(|e| e.to_string()));
+        match r {
+            // a change of a GiB or more, logged
+            Ok((free, bound)) if bound.abs_diff(last) >= (1 << 30) / EXTENT_BYTES as usize => {
+                event(t0, "cache-room", json!({ "free_bytes": free, "bound_bytes": bound as u64 * EXTENT_BYTES as u64 }));
+                last = bound;
+            }
+            Ok(_) => {}
+            Err(e) => event(t0, "cache-room", json!({ "error": e })),
+        }
+    }
 }
 
 fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cache_max: Option<u64>, key: Option<[u8; 32]>) -> Result<(), String> {
@@ -596,6 +624,10 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
         let (d, p, w) = (disk.clone(), progress.clone(), status_writer(state.to_path_buf(), t0));
         std::thread::spawn(move || flush::run(d, p, w))
     };
+    {
+        let (d, c) = (disk.clone(), cache_path.to_path_buf());
+        std::thread::spawn(move || room_watcher(d, c, t0));
+    }
     {
         let d = disk.clone();
         std::thread::spawn(move || {
