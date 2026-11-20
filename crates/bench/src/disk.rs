@@ -637,9 +637,22 @@ pub fn room(p: &mut dyn Place, ceiling: u64) -> Result<Value, String> {
     let m = mount_with(p, &format!("--cache-max {ceiling}"))?;
     let files = ceiling / (64 << 20);
     let t0 = Instant::now();
-    let (code, out) = p.sh(&format!("set -e; mkdir -p /data/fill; for i in $(seq 1 {files}); do head -c 67108864 /dev/urandom > /data/fill/f$i; done; sync; sha256sum /data/fill/* > /data/fill.sha256; sync; echo filled"))?;
-    if code != 0 || !out.contains("filled") {
+    // in the background: past the unshipped budget it goes at the
+    // shipping's pace, longer than one exec may take
+    let (code, out) = p.sh(&format!("setsid nohup sh -c 'set -e; mkdir -p /data/fill; for i in $(seq 1 {files}); do head -c 67108864 /dev/urandom > /data/fill/f$i; done; sync; sha256sum /data/fill/* > /data/fill.sha256; sync; echo filled > /tmp/fill.done' > /tmp/fill.log 2>&1 < /dev/null & echo started"))?;
+    if code != 0 || !out.contains("started") {
         return Err(format!("the fill: {out}"));
+    }
+    // Bounded: 1800 s.
+    loop {
+        let (_, d) = p.sh("cat /tmp/fill.done 2>/dev/null; cat /tmp/fill.log")?;
+        if d.contains("filled") {
+            break;
+        }
+        if t0.elapsed() > Duration::from_secs(1800) {
+            return Err(format!("the fill: not done in 1800 s: {d} {}", status(p)));
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
     let fill_ms = t0.elapsed().as_millis() as u64;
     // Bounded: 900 s. The cache full of shipped (clean) extents.
