@@ -165,9 +165,19 @@ punched, ROOM_DROP_BATCH under each hold of the lock. When room comes
 back, the bound rises again, up to the mount's. It never falls under
 CACHE_FLOOR_BYTES, the unshipped budget and the next pack: unshipped
 extents cannot leave, and the boot's are the next wake's. Under that
-floor, the other writer meets a full disk, as it would on any disk. The
-daemon's own unshipped extents are already in the file, so they are not
-lost; only a new write could fail, and that one fails loudly.
+floor, the other writer meets a full disk, as it would on any disk.
+
+**A full disk.** The daemon's acknowledged extents are already in the
+cache file, so a full disk loses none of them, shipped or not. A write
+that needs new room fails typed (`StoreError::NoSpace`): the kernel is
+answered ENOSPC, so the program above sees "No space left on device"
+(ext4 then stops its journal, as it does on any failing disk), and the
+daemon counts it (`no_space_errors`) and says it in its log at most every
+10 s. Nothing the write touched changes, and the same write made again
+once room is back lands (a copy-on-write disk refuses even an overwrite;
+the copy a frozen extent keeps apart is kept once). The daemon's own
+state (`/run/fpac`: its log and status) must not be on the disk it may
+fill, or both stop when it fills: a tmpfs.
 
 Measured on Cloudflare (`room.json`): with the cache full at 6 GiB, a
 writer beside the daemon took all but a GiB of the disk's free room and

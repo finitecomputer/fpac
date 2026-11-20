@@ -396,6 +396,38 @@ The simulator runs the plain disk's compaction and delete pass sealed,
 after a keyless cleaner it refuses; it failed before the change ("a
 sealed disk is compacted by its guest"). **Passes.**
 
+### Leftover 4. A write when the disk is full (`full.json`, krun)
+
+A life syncs 256 MiB of files (each acknowledged; 3,475 extents still
+unshipped when the disk fills), then a writer beside the daemon takes
+every byte of the guest's 20 GB disk, past the cache's floor, and the
+life writes 64 MiB more with an fsync. On krun with R2's costs modelled:
+
+| | Before (`72bfd33`) | After (`7989471`) |
+| -- | -- | -- |
+| The new write | fsync: **Input/output error** | fsync: **No space left on device** |
+| The daemon | 107 write errors, untyped; nothing in its log | 108 refused as no-space (`no_space_errors`); one `no-space` line in its log; not fenced |
+| The acknowledged files, while the disk is full | read back | read back |
+| The sleep | flushed, no error | flushed, no error |
+| The next life | every acknowledged file found | every acknowledged file found |
+
+So nothing acknowledged was lost before either; what failed was the
+error: an I/O error, with nothing to say it was a full disk. Now the
+store's error is typed, the FUSE server answers ENOSPC, and the loop
+device carries it up (the kernel logs status 3, no space, not 10).
+ext4 still stops its journal on the failed write, as on any failing
+disk. Two more tests: the simulator's three writes with no room (a new
+extent, a frozen one whose copy cannot be kept apart, and one on a
+copy-on-write disk whose overwrite is refused) each fail NoSpace and
+lose nothing; and the old code panicked in it (a frozen extent's copy
+kept apart twice when a refused write is made again), which would have
+taken the daemon down with unshipped writes in its cache. A FUSE test:
+ENOSPC, not EIO. **Passes.**
+
+The test also showed that the daemon's state (`/run/fpac`) was on the
+disk it filled, so its log and status stopped with it; the test puts it
+on a tmpfs, and the platform's image should too.
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -430,6 +462,12 @@ sealed disk is compacted by its guest"). **Passes.**
   absolute FPAC times hold.
 - Hermes' first reply crosses the relay twice per call (STAND-INS for the
   API and the model); fragment's real API and model would differ.
+- A full disk (leftover 4): a read of an extent the cache does not hold
+  still fails while the disk is full (its install needs room); it could
+  be answered without being kept. A sealed cache on a copy-on-write disk
+  whose overwrite fails partway leaves that extent's seal broken: one
+  extent of acknowledged bytes. Both untested on Cloudflare, whose
+  container disk's file system is not known here.
 
 ## Decided (the owner, 2026-11-20)
 
