@@ -24,7 +24,9 @@ a memory tier are not worth building for now.
 The cache file's bound is what the container's disk has free at the
 mount, less 4 GiB for unshipped writes' copies and 2 GiB of headroom
 (design.md, The cache). On a 20 GB container with Hermes' image that is
-about 10 to 12 GB. Past it, clean extents leave by S3-FIFO: a one-pass
+about 10 to 12 GB. It gives that room back as local scratch takes it,
+down to a floor of 4 GiB and the next pack, and takes it again when
+scratch is deleted. Past it, clean extents leave by S3-FIFO: a one-pass
 scan goes through a small queue and out, and what is used again stays.
 Never dropped: what is unshipped, what a write is reading, and the next
 pack's boot extents. Scans are followed, 64 MiB fetched ahead on eight

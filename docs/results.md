@@ -5,7 +5,8 @@ it, item by item, and every line of design.md's "Benchmarks to match"
 (section 10 of the plan) as it stands now: pass or fail, where, and from
 which evidence file. Then the items added after item 7: C and D, A
 (sealed disks, docs/encryption.md) and B (fuzzing, fuzz/README.md); then
-6 (the cleaner) and 8 (the release binary).
+6 (the cleaner), 8 (the release binary) and 9 (the cache gives room
+back).
 
 **What ran where.** Cloudflare: the stand-in Worker `fpac-spike`'s
 containers (2 vCPU, 6 GiB, 20 GB) and R2, items 1 to 5 and 7 on commit
@@ -327,6 +328,28 @@ tag (none made).
 | The same build on a Mac (arm64, same toolchain) | other bytes: the same strings, the code laid out differently, the size 8 bytes apart. Rust's output differs across host platforms, so the release is built on Linux |
 
 **Passes.**
+
+### 9. The cache gives room back (`room.json`)
+
+Local-only scratch shares the container's 20 GB disk with the cache,
+whose bound was fixed at the mount. Now the daemon reads the disk's free
+room each second and lowers the bound while it is short, dropping clean
+extents at once, never under the unshipped budget and the next pack; it
+raises the bound again as room comes back (design.md, The cache). On
+Cloudflare, the cache full at 6 GiB, then a writer beside the daemon took
+all but a GiB of the free room (`fallocate`) and wrote 2 GiB more (`dd`),
+while a writer on the disk synced 256 MiB of new files:
+
+| | Before (the daemon at 09105d8) | After |
+| -- | -- | -- |
+| The writer beside it | **No space left on device** | done, 1.6 GB left free |
+| The cache's bound | 6 GiB, fixed | 6 → 4.09 GiB (its floor); 1.6 GiB of clean extents dropped for room |
+| The daemon's writes | 0 errors | 0 errors, not fenced |
+| The next life | every file found | every file found, those written during the fill too |
+
+A unit test holds `room_bound` to its rules (the mount's rule with
+nothing cached, the floor, the ceiling, the room taken back). One PR, as
+sized. **Passes.**
 
 ## Leftovers, as PRs (FPAC's repo unless named)
 

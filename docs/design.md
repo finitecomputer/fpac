@@ -141,7 +141,8 @@ landing. What it costs:
 The cache file is bounded (`fpac/src/daemon.rs`, `cache_bound`): what its
 disk has free at the mount, less the shadow file's worst case
 (UNSHIPPED_BYTES_MAX) and CACHE_DISK_HEADROOM_BYTES for everything else
-on that disk, at most the volume. A disk with less room than twice the
+on that disk, at most the volume; then it follows that disk's room
+(Giving room back, below). A disk with less room than twice the
 unshipped budget is refused at the mount. Past the bound, clean extents
 leave, chosen by **S3-FIFO** (`store/src/evict.rs`): an extent's first
 taking goes into a small queue, and only one used again there moves to
@@ -151,6 +152,29 @@ An extent read ahead counts its first read as its taking. Never dropped:
 what is unshipped (the cache is its only copy), what a partial write is
 reading (it was fetched for that write), and what the next pack takes
 from the cache (the boot's extents, at most PACK_EXTENTS_MAX).
+
+**Giving room back.** The cache's disk is shared: local-only scratch
+(`target/`, `~/.cache`, `/tmp`, `node_modules`) lives there too. So the
+bound is not fixed at the mount. Each ROOM_MS (a second) the daemon reads
+the disk's free room (statvfs) and sets the bound to what the cache holds
+plus what is free, less what the shadow file may still take and
+CACHE_DISK_HEADROOM_BYTES (`fpac/src/disk.rs`, `room_bound`). At the
+mount that is the mount's own rule. When another writer takes room, the
+bound falls by as much, and clean extents leave at once, their holes
+punched, ROOM_DROP_BATCH under each hold of the lock. When room comes
+back, the bound rises again, up to the mount's. It never falls under
+CACHE_FLOOR_BYTES, the unshipped budget and the next pack: unshipped
+extents cannot leave, and the boot's are the next wake's. Under that
+floor, the other writer meets a full disk, as it would on any disk. The
+daemon's own unshipped extents are already in the file, so they are not
+lost; only a new write could fail, and that one fails loudly.
+
+Measured on Cloudflare (`room.json`): with the cache full at 6 GiB, a
+writer beside the daemon took all but a GiB of the disk's free room and
+wrote 2 GiB more. Before this, it ran out of room; now the bound fell to
+its floor (4.09 GiB), 1.6 GiB of clean extents left, the writer
+finished with 1.6 GB to spare, and the next life found every file the
+disk took, those written during the fill too.
 
 **Read-ahead.** The daemon follows up to STREAMS_MAX sequential reads of
 the device. From a scan's second read it keeps AHEAD_EXTENTS_MAX (64 MiB)
@@ -287,7 +311,8 @@ them together. Those already in code are marked with their file.
 | `SEGMENT_BYTES_TARGET`, `SEGMENT_BYTES_MAX` | 8 MiB, 64 MiB | A put costs about the same to 8 MiB; a bigger cut is a group of segments |
 | `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut: one cut's size. A cut takes all of it at one instant (a subset would reorder ext4's writes), naming it only; past it a write asks for a cut at once |
 | `UNSHIPPED_BYTES_MAX` | 4 GiB | Written and not yet landed, held in the cache file: a burst this large goes at the local disk's speed. Section 10's 4 GiB line; it bounds a crash's loss during a burst and a sleep's flush (The sleep, above) |
-| The cache's bound | the disk's free room at the mount, less 4 GiB and 2 GiB | Past it, clean extents leave (S3-FIFO); `CACHE_DISK_HEADROOM_BYTES` (2 GiB) is left for everything else on the container's disk (`fpac/src/daemon.rs`) |
+| The cache's bound | the disk's free room at the mount, less 4 GiB and 2 GiB; then what it holds plus what is free, less the same | Past it, clean extents leave (S3-FIFO); `CACHE_DISK_HEADROOM_BYTES` (2 GiB) is left for everything else on the container's disk, read each `ROOM_MS` (1 s) (`fpac/src/disk.rs`, `room_bound`) |
+| `CACHE_FLOOR_BYTES` | 4 GiB and 96 MiB | The bound never falls under the unshipped budget and the next pack (`fpac/src/disk.rs`) |
 | `AHEAD_EXTENTS_MAX`, `AHEAD_PIECE_EXTENTS` | 64 MiB, 4 MiB | A sequential read's window and one get of it; four parallel gets of 50 MiB reached 176-194 MB/s on Cloudflare in P5 (`format/limits.rs`) |
 | `STREAMS_MAX`, `AHEAD_FETCHES`, `AHEAD_WINDOWS_MAX` | 8, 8, 4 | Scans followed, connections per window, windows in flight (`fpac/src/disk.rs`) |
 | `CRASH_PACK_EXTENTS` | 128 (8 MiB) | A periodic checkpoint's crash pack: about $0.0024 an hour of activity in egress (`store/src/lib.rs`) |

@@ -1,0 +1,862 @@
+{
+  "evidence": "room",
+  "note": "Cloudflare, one fpac-spike container per life against R2. cloudflare-before is the same scenario against the daemon before this change (its daemon sources as at 09105d8, the scenario as here; commit 6206d38, a control branch not merged); cloudflare-after is the change. Each run's fill went at its machine's pace (150 and 342 s for 6 GiB).",
+  "places": {
+    "cloudflare-after": {
+      "bulk_data_deleted": {
+        "deleted": 1304,
+        "pages": 3
+      },
+      "ceiling_bytes": 6442450944,
+      "commit": {
+        "dirty": false,
+        "fpac": "79659e8595ac"
+      },
+      "life1": {
+        "after": {
+          "ahead_extents": 41232,
+          "ahead_waits": 1044,
+          "ahead_windows": 91,
+          "bytes_shipped": 6743891232,
+          "cache_bound_extents": 67071,
+          "cached_extents": 67071,
+          "checkpoints": 9,
+          "cpu_ms": {
+            "system": 61614.556,
+            "user": 21188.17
+          },
+          "cuts": 114,
+          "dirty_extents": 0,
+          "durable_ms": 1795187892591,
+          "epoch": 1795187539217,
+          "evictions": 93367,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 1284,
+          "head_posted": true,
+          "lock_wait_max_us": 118261,
+          "lock_waits_over_1ms": 4691,
+          "misses": 2088,
+          "now_ms": 1795187897441,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 0,
+          "read_errors": 0,
+          "room_evictions": 25600,
+          "segments": 1191,
+          "shipping_behind": true,
+          "shipping_segments": 0,
+          "syncs": 404,
+          "unshipped_extents": 0,
+          "up_ms": 355317,
+          "write_errors": 0
+        },
+        "during": "done\n",
+        "fill_bytes": 6442450944,
+        "fill_ms": 342432,
+        "free_when_full_bytes": 10645344256,
+        "full": {
+          "ahead_extents": 41232,
+          "ahead_waits": 1044,
+          "ahead_windows": 91,
+          "bytes_shipped": 6470762280,
+          "cache_bound_extents": 98304,
+          "cached_extents": 98304,
+          "checkpoints": 9,
+          "cpu_ms": {
+            "system": 60050.442,
+            "user": 20652.154
+          },
+          "cuts": 109,
+          "dirty_extents": 0,
+          "durable_ms": 1795187885026,
+          "epoch": 1795187539217,
+          "evictions": 57939,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 1284,
+          "head_posted": true,
+          "lock_wait_max_us": 118261,
+          "lock_waits_over_1ms": 4383,
+          "misses": 2088,
+          "now_ms": 1795187886543,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 0,
+          "read_errors": 0,
+          "room_evictions": 0,
+          "segments": 1156,
+          "shipping_behind": true,
+          "shipping_segments": 0,
+          "syncs": 212,
+          "unshipped_extents": 0,
+          "up_ms": 344418,
+          "write_errors": 0
+        },
+        "local": {
+          "ballast_bytes": 9571602432,
+          "exit": 0,
+          "ms": 10756,
+          "out": "local-ok\n1641750528\n",
+          "then_written_bytes": 2147483648
+        },
+        "mount": {
+          "cache": {
+            "asked_bytes": 6442450944,
+            "bound_bytes": 6442450944,
+            "fpac": "cache",
+            "ms": 10.88313
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 12.107351
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 12.558671
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 61.167392
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 62.959914000000005,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "room-1795187539122",
+            "epoch": 1795187539217,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 10.667689,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          }
+        },
+        "room_events": "{\"bound_bytes\":4395565056,\"fpac\":\"cache-room\",\"free_bytes\":984027136,\"ms\":346049.784094}\n",
+        "sleep": {
+          "cache": {
+            "asked_bytes": 6442450944,
+            "bound_bytes": 6442450944,
+            "fpac": "cache",
+            "ms": 10.88313
+          },
+          "cache-room": {
+            "bound_bytes": 4395565056,
+            "fpac": "cache-room",
+            "free_bytes": 984027136,
+            "ms": 346049.784094
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 361090.812674
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 357084.97776000004,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 420,
+              "ms": 4003,
+              "pack_bytes": 100659216,
+              "segments": 1
+            },
+            "ms": 361089.003403
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 12.107351
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 12.558671
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 61.167392
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 62.959914000000005,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "room-1795187539122",
+            "epoch": 1795187539217,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 10.667689,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 356725.182663,
+            "signal": 15
+          },
+          "sleep_ms": 4414
+        },
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 2660,
+          "start_ms": 2758.887832,
+          "version": "6d2d64c9-ef7d-4ffa-bdaf-65f7ff0b1a93"
+        }
+      },
+      "life2": {
+        "check": "fill-ok\nduring-ok\n",
+        "mount": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13312000000,
+            "fpac": "cache",
+            "ms": 672.249433
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 684.693393
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 685.401795
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 1507.66476,
+            "pack_waits": 1,
+            "waited_at": [
+              114
+            ]
+          },
+          "opened": {
+            "disk": "room-1795187539122",
+            "epoch": 1795187904759,
+            "extents_mapped": 104135,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 671.906243,
+            "new": false,
+            "pages": 37,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 36,
+                "failed": 0,
+                "ms": 446.654529
+              }
+            ],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack-header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 9.923686,
+            "head_installed": 64,
+            "ms": 682.66761,
+            "sealed": false
+          }
+        },
+        "sleep": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13312000000,
+            "fpac": "cache",
+            "ms": 672.249433
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 88730.045029
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 85337.40677900001,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 405,
+              "ms": 3391,
+              "pack_bytes": 100659216,
+              "segments": 1
+            },
+            "ms": 88729.391468
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 684.693393
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 685.401795
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 1507.66476,
+            "pack_waits": 1,
+            "waited_at": [
+              114
+            ]
+          },
+          "opened": {
+            "disk": "room-1795187539122",
+            "epoch": 1795187904759,
+            "extents_mapped": 104135,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 671.906243,
+            "new": false,
+            "pages": 37,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 36,
+                "failed": 0,
+                "ms": 446.654529
+              }
+            ],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack": {
+            "bytes": 100597760,
+            "extents": 1535,
+            "fetch_ms_summed": 11040.501,
+            "fpac": "pack",
+            "from": 64,
+            "install_ms_summed": 278.152,
+            "installed": 1471,
+            "ms": 2286.375736,
+            "waited_at": [
+              114
+            ]
+          },
+          "pack-header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 9.923686,
+            "head_installed": 64,
+            "ms": 682.66761,
+            "sealed": false
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 85302.189862,
+            "signal": 15
+          },
+          "sleep_ms": 3555
+        },
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 196,
+          "start_ms": 301.05992399999997,
+          "version": "6d2d64c9-ef7d-4ffa-bdaf-65f7ff0b1a93"
+        }
+      },
+      "measured_at_ms": 1795188019781,
+      "objects_at_end": {
+        "bytes": 6957930696,
+        "objects": 1304
+      },
+      "ok": true,
+      "sealed": false,
+      "what": "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
+    },
+    "cloudflare-before": {
+      "bulk_data_deleted": {
+        "deleted": 952,
+        "pages": 2
+      },
+      "ceiling_bytes": 6442450944,
+      "commit": {
+        "dirty": false,
+        "fpac": "6206d382ff19"
+      },
+      "life1": {
+        "after": {
+          "ahead_extents": 769,
+          "ahead_waits": 12,
+          "ahead_windows": 4,
+          "bytes_shipped": 6705673112,
+          "cached_extents": 98304,
+          "checkpoints": 6,
+          "cpu_ms": {
+            "system": 38656.19,
+            "user": 15305.999
+          },
+          "cuts": 61,
+          "dirty_extents": 0,
+          "durable_ms": 1795187380097,
+          "epoch": 1795187222429,
+          "evictions": 10678,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 138,
+          "head_posted": true,
+          "lock_wait_max_us": 190434,
+          "lock_waits_over_1ms": 4405,
+          "misses": 612,
+          "now_ms": 1795187381713,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 0,
+          "read_errors": 0,
+          "segments": 840,
+          "shipping_behind": true,
+          "shipping_segments": 5,
+          "syncs": 339,
+          "unshipped_extents": 600,
+          "up_ms": 157892,
+          "write_errors": 0
+        },
+        "during": "done\n",
+        "fill_bytes": 6442450944,
+        "fill_ms": 150373,
+        "free_when_full_bytes": 13238231040,
+        "full": {
+          "ahead_extents": 769,
+          "ahead_waits": 12,
+          "ahead_windows": 4,
+          "bytes_shipped": 6463883864,
+          "cached_extents": 98304,
+          "checkpoints": 6,
+          "cpu_ms": {
+            "system": 37400.835,
+            "user": 14899.229
+          },
+          "cuts": 57,
+          "dirty_extents": 0,
+          "durable_ms": 1795187375013,
+          "epoch": 1795187222429,
+          "evictions": 6548,
+          "fenced": false,
+          "fetch_retries": 0,
+          "full_waits": 138,
+          "head_posted": true,
+          "lock_wait_max_us": 190434,
+          "lock_waits_over_1ms": 4151,
+          "misses": 612,
+          "now_ms": 1795187376316,
+          "pack_waits": 0,
+          "page_loads": 0,
+          "pages_unloaded": 0,
+          "planned_segments": 0,
+          "read_errors": 0,
+          "segments": 809,
+          "shipping_behind": true,
+          "shipping_segments": 0,
+          "syncs": 146,
+          "unshipped_extents": 0,
+          "up_ms": 152495,
+          "write_errors": 0
+        },
+        "local": {
+          "ballast_bytes": 12164489216,
+          "exit": 0,
+          "ms": 5090,
+          "out": "    0\ndd: error writing '/var/lib/local.fill': No space left on device\n",
+          "then_written_bytes": 2147483648
+        },
+        "mount": {
+          "cache": {
+            "asked_bytes": 6442450944,
+            "bound_bytes": 6442450944,
+            "fpac": "cache",
+            "ms": 20.113503
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 21.225564
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 21.608865
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 70.075013
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 71.726566,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "room-1795187222329",
+            "epoch": 1795187222429,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 19.798052,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          }
+        },
+        "room_events": "",
+        "sleep": {
+          "cache": {
+            "asked_bytes": 6442450944,
+            "bound_bytes": 6442450944,
+            "fpac": "cache",
+            "ms": 20.113503
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 162562.14569900002
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 159141.153944,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 286,
+              "ms": 3419,
+              "pack_bytes": 100659216,
+              "segments": 1
+            },
+            "ms": 162560.96363699998
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 21.225564
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 21.608865
+          },
+          "mkfs": {
+            "fpac": "mkfs",
+            "ms": 70.075013
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 71.726566,
+            "pack_waits": 0,
+            "waited_at": []
+          },
+          "opened": {
+            "disk": "room-1795187222329",
+            "epoch": 1795187222429,
+            "extents_mapped": 0,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 19.798052,
+            "new": true,
+            "pages": 0,
+            "replayed": 0,
+            "rounds": [],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 158796.808139,
+            "signal": 15
+          },
+          "sleep_ms": 3886
+        },
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 1177,
+          "start_ms": 1275.979025,
+          "version": "23e09c23-a314-47bd-a02d-2cc0bb6fbff8"
+        }
+      },
+      "life2": {
+        "check": "fill-ok\nduring-ok\n",
+        "mount": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13312065536,
+            "fpac": "cache",
+            "ms": 636.721253
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 649.007824
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 649.590154
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 1012.353223,
+            "pack_waits": 1,
+            "waited_at": [
+              114
+            ]
+          },
+          "opened": {
+            "disk": "room-1795187222329",
+            "epoch": 1795187388070,
+            "extents_mapped": 100607,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 636.421163,
+            "new": false,
+            "pages": 37,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 37,
+                "failed": 0,
+                "ms": 414.543973
+              }
+            ],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack-header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 9.917398,
+            "head_installed": 64,
+            "ms": 647.116172,
+            "sealed": false
+          }
+        },
+        "sleep": {
+          "cache": {
+            "asked_bytes": null,
+            "bound_bytes": 13312065536,
+            "fpac": "cache",
+            "ms": 636.721253
+          },
+          "exit": {
+            "fpac": "exit",
+            "ms": 123208.890007
+          },
+          "ext4-unmounted": {
+            "error": null,
+            "fpac": "ext4-unmounted",
+            "ms": 120422.085942,
+            "ok": true
+          },
+          "flushed": {
+            "error": null,
+            "fpac": "flushed",
+            "last": {
+              "flushed_ms": 288,
+              "ms": 2784,
+              "pack_bytes": 100659216,
+              "segments": 1
+            },
+            "ms": 123207.785076
+          },
+          "fuse": {
+            "fpac": "fuse",
+            "io_flusher": [
+              true,
+              true,
+              true,
+              true
+            ],
+            "ms": 649.007824
+          },
+          "loop": {
+            "device": "/dev/loop0",
+            "direct_io": true,
+            "fpac": "loop",
+            "ms": 649.590154
+          },
+          "mounted": {
+            "dir": "/data",
+            "fpac": "mounted",
+            "misses": 0,
+            "ms": 1012.353223,
+            "pack_waits": 1,
+            "waited_at": [
+              114
+            ]
+          },
+          "opened": {
+            "disk": "room-1795187222329",
+            "epoch": 1795187388070,
+            "extents_mapped": 100607,
+            "fpac": "opened",
+            "memory_locked": true,
+            "ms": 636.421163,
+            "new": false,
+            "pages": 37,
+            "replayed": 0,
+            "rounds": [
+              {
+                "asks": 37,
+                "failed": 0,
+                "ms": 414.543973
+              }
+            ],
+            "sealed": false,
+            "volume_bytes": 20971520000,
+            "writeback_set": true
+          },
+          "pack": {
+            "bytes": 100597760,
+            "extents": 1535,
+            "fetch_ms_summed": 7371.103,
+            "fpac": "pack",
+            "from": 64,
+            "install_ms_summed": 259.902,
+            "installed": 1471,
+            "ms": 1819.167621,
+            "waited_at": [
+              114
+            ]
+          },
+          "pack-header": {
+            "extents": 1535,
+            "fpac": "pack-header",
+            "head_extents": 64,
+            "head_install_ms": 9.917398,
+            "head_installed": 64,
+            "ms": 647.116172,
+            "sealed": false
+          },
+          "signal": {
+            "fpac": "signal",
+            "ms": 120391.200955,
+            "signal": 15
+          },
+          "sleep_ms": 3025
+        },
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 210,
+          "start_ms": 307.548781,
+          "version": "23e09c23-a314-47bd-a02d-2cc0bb6fbff8"
+        }
+      },
+      "measured_at_ms": 1795187520774,
+      "objects_at_end": {
+        "bytes": 6948939080,
+        "objects": 952
+      },
+      "ok": false,
+      "sealed": false,
+      "what": "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
+    }
+  }
+}
