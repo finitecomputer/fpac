@@ -75,18 +75,23 @@ pub fn run(remote: &mut Remote, tag: &str) -> Vec<Case> {
     // The head's rules, on a disk this suite owns (a new one, or one whose
     // head is older than this life).
     let base = open.as_ref().ok().and_then(|o| o.head);
-    let mine = Head { epoch, checkpoint: base.and_then(|h| h.checkpoint) };
+    let mine = Head { epoch, checkpoint: base.and_then(|h| h.checkpoint), clean: false };
     let r = remote.post_head(&mine);
     out.push(case("this life's head is taken", matches!(r, Ok(HeadAnswer::Taken)), format!("{r:?}")));
     let r = remote.post_head(&mine);
     out.push(case("the same head again is the same (a lost answer, replayed)", matches!(r, Ok(HeadAnswer::Same)), format!("{r:?}")));
-    let later = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(tag.as_bytes()) }) };
+    let later = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(tag.as_bytes()) }), clean: false };
     let r = remote.post_head(&later);
     out.push(case("a later checkpoint of this life is taken", matches!(r, Ok(HeadAnswer::Taken)), format!("{r:?}")));
-    let conflicting = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(b"another body") }) };
+    let conflicting = Head { epoch, checkpoint: Some(CheckpointRef { epoch, seq: 1, sum: sha256(b"another body") }), clean: false };
     let r = remote.post_head(&conflicting);
     out.push(case("the same checkpoint with another body is refused", matches!(r, Err(RemoteError::Refused { status: 409, .. })), format!("{r:?}")));
-    let other = Head { epoch: epoch + 1, checkpoint: None };
+    let clean = Head { clean: true, ..later };
+    let r = remote.post_head(&clean);
+    out.push(case("the same checkpoint marked clean (a sleep) is taken", matches!(r, Ok(HeadAnswer::Taken)), format!("{r:?}")));
+    let r = remote.post_head(&later);
+    out.push(case("a clean head never loses its mark", matches!(r, Err(RemoteError::Refused { status: 409, .. })), format!("{r:?}")));
+    let other = Head { epoch: epoch + 1, checkpoint: None, clean: false };
     let r = remote.post_head(&other);
     out.push(case("a head from a life that isn't running is refused", matches!(r, Err(RemoteError::Refused { status: 409, .. })), format!("{r:?}")));
     out

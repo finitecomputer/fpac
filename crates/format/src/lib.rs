@@ -177,8 +177,11 @@ impl<'a> R<'a> {
 
 const SEGMENT_MAGIC: &[u8; 8] = b"FPACSEG1";
 const PAGE_MAGIC: &[u8; 8] = b"FPACMAP1";
-const CHECKPOINT_MAGIC: &[u8; 8] = b"FPACCKP1";
-const PACK_MAGIC: &[u8; 8] = b"FPACPAK1";
+/// The second checkpoint format: a crash pack beside the boot pack.
+const CHECKPOINT_MAGIC: &[u8; 8] = b"FPACCKP2";
+/// The second pack format: each entry names its extent's place (P5's lazy
+/// map pages: a pack's extents need no page).
+const PACK_MAGIC: &[u8; 8] = b"FPACPAK2";
 const VERSION: u32 = 1;
 const LAST_OF_CUT: u32 = 1;
 
@@ -419,7 +422,12 @@ pub struct Checkpoint {
     /// The chain's end it covers: a life's next segment follows this.
     pub end: Link,
     pub volume_bytes: u64,
+    /// The boot pack: what the last sleep's boot read and its life wrote.
     pub pack: Option<PackRef>,
+    /// A periodic checkpoint's crash pack: the extents its life rewrote,
+    /// newest first (ext4's journal and metadata, a database's pages),
+    /// what a wake after a crash reads. None after a clean sleep.
+    pub crash_pack: Option<PackRef>,
     /// Every page that has an entry, ascending.
     pub pages: Vec<PageRef>,
     /// Every segment the map refers to, ascending, with its object's
@@ -435,17 +443,19 @@ pub fn encode_checkpoint(c: &Checkpoint) -> Vec<u8> {
     let mut w = W(Vec::new());
     w.bytes(CHECKPOINT_MAGIC);
     w.u32(VERSION);
-    w.u32(u32::from(c.pack.is_some()));
+    w.u32(u32::from(c.pack.is_some()) | u32::from(c.crash_pack.is_some()) << 1);
     w.u64(c.epoch);
     w.u64(c.seq);
     w.u64(c.end.epoch);
     w.u64(c.end.seq);
     w.bytes(&c.end.sum);
     w.u64(c.volume_bytes);
-    let p = c.pack.unwrap_or(PackRef { epoch: 0, seq: 0, header_sum: [0; 32] });
-    w.u64(p.epoch);
-    w.u64(p.seq);
-    w.bytes(&p.header_sum);
+    for p in [c.pack, c.crash_pack] {
+        let p = p.unwrap_or(PackRef { epoch: 0, seq: 0, header_sum: [0; 32] });
+        w.u64(p.epoch);
+        w.u64(p.seq);
+        w.bytes(&p.header_sum);
+    }
     w.u32(u32::try_from(c.pages.len()).expect("bounded"));
     w.u32(u32::try_from(c.segments.len()).expect("bounded"));
     for pr in &c.pages {
@@ -472,13 +482,14 @@ pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {
     let mut r = R { b, at: 0, what: "a checkpoint" };
     r.magic(CHECKPOINT_MAGIC, VERSION)?;
     let flags = r.u32()?;
-    if flags > 1 {
+    if flags > 3 {
         return Err(FormatError::Layout("a checkpoint's flags"));
     }
     let (epoch, seq) = (r.u64()?, r.u64()?);
     let end = Link { epoch: r.u64()?, seq: r.u64()?, sum: r.sum()? };
     let volume_bytes = r.u64()?;
     let pack = PackRef { epoch: r.u64()?, seq: r.u64()?, header_sum: r.sum()? };
+    let crash_pack = PackRef { epoch: r.u64()?, seq: r.u64()?, header_sum: r.sum()? };
     let (pages_n, segs_n) = (r.u32()?, r.u32()?);
     if epoch == 0 || seq == 0 || volume_bytes == 0 || volume_bytes > VOLUME_BYTES_MAX || volume_bytes % EXTENT_BYTES as u64 != 0 {
         return Err(FormatError::Layout("a checkpoint's identity or volume"));
@@ -515,8 +526,9 @@ pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {
     if r.at != b.len() {
         return Err(FormatError::Layout("bytes past a checkpoint"));
     }
-    let pack = if flags == 1 { Some(pack) } else { None };
-    Ok(Checkpoint { epoch, seq, end, volume_bytes, pack, pages, segments })
+    let pack = if flags & 1 == 1 { Some(pack) } else { None };
+    let crash_pack = if flags & 2 == 2 { Some(crash_pack) } else { None };
+    Ok(Checkpoint { epoch, seq, end, volume_bytes, pack, crash_pack, pages, segments })
 }
 
 /// A pack's header: its extents in the order they will be read, each with
@@ -525,7 +537,9 @@ pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {
 /// as a miss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackHeader {
-    pub entries: Vec<(u64, u64)>,
+    /// Each extent and where the map placed it when the pack was made
+    /// (its sum is its bytes'), in the pack's order.
+    pub entries: Vec<(u64, Loc)>,
 }
 
 impl PackHeader {
@@ -541,8 +555,9 @@ pub fn pack_header_len(count: usize) -> usize {
     PACK_FIXED_BYTES as usize + count * PACK_ENTRY_BYTES as usize + 32
 }
 
-/// A pack's object: its header, then each extent's bytes in order.
-pub fn encode_pack(extents: &[(u64, &[u8])]) -> Vec<u8> {
+/// A pack's object: its header (each extent and its place in the map),
+/// then each extent's bytes in order. Each place's sum is its bytes'.
+pub fn encode_pack(extents: &[(u64, Loc, &[u8])]) -> Vec<u8> {
     assert!(!extents.is_empty() && extents.len() <= PACK_EXTENTS_MAX as usize);
     let mut w = W(Vec::with_capacity(pack_header_len(extents.len()) + extents.len() * EXTENT_BYTES as usize));
     w.bytes(PACK_MAGIC);
@@ -550,13 +565,17 @@ pub fn encode_pack(extents: &[(u64, &[u8])]) -> Vec<u8> {
     w.u32(0);
     w.u32(u32::try_from(extents.len()).expect("bounded"));
     w.u32(0);
-    for (e, b) in extents {
-        assert!(*e < EXTENTS_MAX);
+    for (e, l, b) in extents {
+        assert!(*e < EXTENTS_MAX && !l.is_zero() && l.sum == sum64(b));
         w.u64(*e);
-        w.u64(sum64(b));
+        w.u32(l.len);
+        w.u64(l.seg.epoch);
+        w.u64(l.seg.seq);
+        w.u32(l.offset);
+        w.u64(l.sum);
     }
     w.seal();
-    for (_, b) in extents {
+    for (_, _, b) in extents {
         w.bytes(b);
     }
     w.0
@@ -574,11 +593,18 @@ pub fn decode_pack_header(b: &[u8]) -> Result<PackHeader, FormatError> {
     }
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let (e, s) = (r.u64()?, r.u64()?);
+        let e = r.u64()?;
+        let len = r.u32()?;
+        let seg = SegId { epoch: r.u64()?, seq: r.u64()? };
+        let offset = r.u32()?;
+        let sum = r.u64()?;
         if e >= EXTENTS_MAX {
             return Err(FormatError::Limit("an extent's number"));
         }
-        entries.push((e, s));
+        if len == 0 || len > EXTENT_BYTES {
+            return Err(FormatError::Limit("a packed extent's length"));
+        }
+        entries.push((e, Loc { seg, offset, len, sum }));
     }
     r.sealed()?;
     Ok(PackHeader { entries })

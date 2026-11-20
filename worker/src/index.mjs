@@ -413,14 +413,16 @@ export class FpacSpike extends DurableObject {
 }
 
 // A head's line: "<epoch> <checkpoint epoch> <checkpoint seq> <sha256>",
-// or "<epoch> - - -" (crates/remote/src/lib.rs, Head).
+// or "<epoch> - - -", and " clean" after it for a clean sleep
+// (crates/remote/src/lib.rs, Head).
 function parseHead(line) {
   const p = String(line).split(" ");
-  if (p.length !== 4 || !/^[1-9][0-9]{0,19}$/.test(p[0])) return null;
+  const clean = p.length === 5 && p[4] === "clean";
+  if ((p.length !== 4 && !clean) || !/^[1-9][0-9]{0,19}$/.test(p[0])) return null;
   const epoch = Number(p[0]);
-  if (p[1] === "-" && p[2] === "-" && p[3] === "-") return { epoch, ck: null };
+  if (p[1] === "-" && p[2] === "-" && p[3] === "-") return { epoch, ck: null, clean };
   if (!/^[1-9][0-9]{0,19}$/.test(p[1]) || !/^[1-9][0-9]{0,19}$/.test(p[2]) || !SHA256_HEX.test(p[3])) return null;
-  return { epoch, ck: { epoch: Number(p[1]), seq: Number(p[2]), sum: p[3] } };
+  return { epoch, ck: { epoch: Number(p[1]), seq: Number(p[2]), sum: p[3] }, clean };
 }
 
 const sameCk = (a, b) => a.epoch === b.epoch && a.seq === b.seq && a.sum === b.sum;
@@ -430,12 +432,14 @@ function decide(cur, running, p) {
   if (p.epoch !== running) return "only the running life posts a head";
   if (p.ck && p.ck.epoch > p.epoch) return "a checkpoint from a later life";
   if (!cur) return "take";
-  if (cur.epoch === p.epoch && ((cur.ck === null && p.ck === null) || (cur.ck && p.ck && sameCk(cur.ck, p.ck)))) return "same";
+  if (cur.epoch === p.epoch && cur.clean === p.clean && ((cur.ck === null && p.ck === null) || (cur.ck && p.ck && sameCk(cur.ck, p.ck)))) return "same";
   if (cur.epoch > p.epoch) return "an earlier life's head";
   if (cur.epoch < p.epoch) return "take";
+  if (!cur.ck && !p.ck && p.clean) return "take";
   if (!p.ck) return "a life's head loses its checkpoint";
   if (!cur.ck) return p.ck.epoch === p.epoch ? "take" : "a life's head goes back to another life's checkpoint";
   if (p.ck.epoch !== p.epoch && !sameCk(p.ck, cur.ck)) return "a life's head goes back to another life's checkpoint";
+  if (sameCk(p.ck, cur.ck)) return p.clean ? "take" : "a clean head loses its mark";
   if (p.ck.epoch === cur.ck.epoch && p.ck.seq === cur.ck.seq) return "the same checkpoint with another body";
   if (p.ck.epoch === cur.ck.epoch && p.ck.seq < cur.ck.seq) return "a checkpoint older than the head's";
   return "take";

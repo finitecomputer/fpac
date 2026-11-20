@@ -92,13 +92,33 @@ pub enum Kind {
     Page,
     Checkpoint(CheckpointRef),
     Pack(PackRef),
+    CrashPack(PackRef),
 }
+
+/// A periodic checkpoint's crash pack, at most: the extents a life
+/// rewrote, newest first. ext4's journal, which a wake after a crash
+/// replays, is rewritten commit by commit; 8 MiB every five minutes of
+/// activity is about $0.0024 an hour of container egress (docs/costs.md).
+pub const CRASH_PACK_EXTENTS: usize = 128;
 
 /// What a read needs: nothing more, or a fetch the caller makes.
 #[derive(Debug)]
 pub enum Read {
     Done,
     Fetch(Fetch),
+    /// The map page that places the extent is not loaded yet: fetch it
+    /// (`page_name`), `install_page` it, and read again.
+    Page(PageRef),
+}
+
+/// What a write needs first.
+#[derive(Debug)]
+pub enum Need {
+    /// The extent's bytes (a partial write to an extent the cache does
+    /// not hold).
+    Fetch(Fetch),
+    /// The map page that places it.
+    Page(PageRef),
 }
 
 /// One ranged get of a segment: the extent asked for and the read-ahead
@@ -166,6 +186,7 @@ pub struct Opened {
     /// Map pages the checkpoint named.
     pub pages: u32,
     pub pack: Option<PackRef>,
+    pub crash_pack: Option<PackRef>,
 }
 
 pub struct Store {
@@ -198,7 +219,15 @@ pub struct Store {
     checkpoint: Option<Checkpoint>,
     checkpoint_ref: Option<CheckpointRef>,
     pages_dirty: BTreeSet<u32>,
+    /// The checkpoint's map pages not loaded yet (docs/design.md, lazy
+    /// pages): an extent of one is placed only once its page is fetched,
+    /// on its first read, a partial write to it, or a checkpoint that
+    /// rewrites the page. The map holds every other placement.
+    unloaded: BTreeMap<u32, PageRef>,
+    /// Segments applied since the last checkpoint (the live list's growth).
+    segments_landed_since: usize,
     pack: Option<PackRef>,
+    crash_pack: Option<PackRef>,
     head_posted: bool,
     fenced: bool,
     boot: Vec<u64>,
@@ -207,8 +236,20 @@ pub struct Store {
     /// what the next boot is likely to read that this boot did not (a
     /// database's pages, a log's tail).
     written: std::collections::VecDeque<u64>,
+    /// Extents this life's cuts carried more than once, the most recent
+    /// last (each once): the crash pack's.
+    rewritten: std::collections::VecDeque<u64>,
+    /// A new disk's first life: the boot's writes are noted for the next
+    /// wake's pack too (the files its first boot made are what its next
+    /// boot reads).
+    fresh: bool,
     recording: bool,
     opened: Opened,
+}
+
+/// A map page's object name.
+pub fn page_name(pr: &PageRef) -> String {
+    format::page_name(pr.epoch, pr.seq, pr.page)
 }
 
 fn page_of(extent: u64) -> u32 {
@@ -245,14 +286,19 @@ impl Store {
             checkpoint: None,
             checkpoint_ref: None,
             pages_dirty: BTreeSet::new(),
+            unloaded: BTreeMap::new(),
+            segments_landed_since: 0,
             pack: None,
+            crash_pack: None,
             head_posted: false,
             fenced: false,
             boot: Vec::new(),
             boot_seen: BTreeSet::new(),
             written: std::collections::VecDeque::new(),
+            rewritten: std::collections::VecDeque::new(),
+            fresh: info.head.is_none(),
             recording: false,
-            opened: Opened { replayed: 0, extents_mapped: 0, pages: 0, pack: None },
+            opened: Opened { replayed: 0, extents_mapped: 0, pages: 0, pack: None, crash_pack: None },
         };
         let Some(head) = info.head else {
             return Ok(s);
@@ -269,17 +315,31 @@ impl Store {
             if c.end.epoch == head.epoch {
                 first_seq = c.end.seq + 1;
             }
-            remote.prefetch(&Self::open_asks(&c, head.epoch, first_seq));
-            s.load_pages(remote, &c, cr)?;
+            remote.prefetch(&Self::open_asks(&c, head.epoch, if head.clean { None } else { Some(first_seq) }));
+            s.unloaded = c.pages.iter().map(|p| (p.page, *p)).collect();
+            s.segments = c.segments.iter().copied().collect();
             s.chain_end = c.end;
             s.applied_end = c.end;
             s.pack = c.pack;
+            s.crash_pack = c.crash_pack;
             s.checkpoint = Some(c);
             s.checkpoint_ref = Some(cr);
         }
-        s.replay(remote, head.epoch, first_seq)?;
+        // a clean sleep's checkpoint covers everything its life shipped
+        if !head.clean {
+            s.replay(remote, head.epoch, first_seq)?;
+        }
+        // the pages a replay changed are loaded now: the head's preparation
+        // checkpoints them (a wake after a crash)
+        let need = s.checkpoint_needs();
+        if !need.is_empty() {
+            remote.prefetch(&need.iter().map(|p| Ask::Whole(page_name(p))).collect::<Vec<_>>());
+            for pr in need {
+                s.load_page(remote, pr)?;
+            }
+        }
         let pages = s.checkpoint.as_ref().map_or(0, |c| c.pages.len() as u32);
-        s.opened = Opened { replayed: s.opened.replayed, extents_mapped: s.map.len() as u64, pages, pack: s.pack };
+        s.opened = Opened { replayed: s.opened.replayed, extents_mapped: s.map.len() as u64, pages, pack: s.pack, crash_pack: s.crash_pack };
         assert_eq!(s.chain_end, s.applied_end, "nothing of this life is shipping yet");
         Ok(s)
     }
@@ -297,46 +357,77 @@ impl Store {
         Ok(c)
     }
 
-    /// What an open reads after its checkpoint, asked for at once: every
-    /// map page, the first OPEN_SEGMENT_HEADERS segment headers a replay
-    /// may read, and the pack's head (its header and first extents,
-    /// `PACK_HEAD_FETCH_BYTES`).
-    pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: u64) -> Vec<Ask> {
-        let mut asks: Vec<Ask> = c.pages.iter().map(|p| Ask::Whole(format::page_name(p.epoch, p.seq, p.page))).collect();
+    /// What an open reads after its checkpoint, asked for at once: the
+    /// first OPEN_SEGMENT_HEADERS segment headers a replay may read, and
+    /// the pack's head (its header and first extents,
+    /// `PACK_HEAD_FETCH_BYTES`). No map page: each comes when first needed.
+    pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: Option<u64>) -> Vec<Ask> {
+        let mut asks: Vec<Ask> = Vec::new();
+        let heads: Vec<Ask> = [c.pack, c.crash_pack].into_iter().flatten().map(|pr| Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES }).collect();
+        let Some(first_seq) = first_seq else { return heads };
         asks.extend((first_seq..first_seq + u64::from(OPEN_SEGMENT_HEADERS)).map(|seq| Ask::Range { name: format::segment_name(SegId { epoch, seq }), offset: 0, len: SEGMENT_HEADER_BYTES_MAX as usize }));
-        if let Some(pr) = c.pack {
-            asks.push(Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES });
-        }
+        asks.extend(heads);
         asks
     }
 
-    fn load_pages(&mut self, remote: &mut dyn RemoteGate, c: &Checkpoint, cr: CheckpointRef) -> Result<(), StoreError> {
-        let name = format::checkpoint_name(cr.epoch, cr.seq);
-        let live: BTreeMap<SegId, Sum> = c.segments.iter().copied().collect();
-        // Bounded: at most PAGES_MAX pages.
-        for p in &c.pages {
-            let pname = format::page_name(p.epoch, p.seq, p.page);
-            let body = whole(remote, &pname, PAGE_BYTES_MAX)?;
-            if format::sha256(&body) != p.sum {
-                return Err(StoreError::Corrupt(format!("{pname} is not the page {name} names")));
-            }
-            let (page, entries) = format::decode_page(&body).map_err(|e| StoreError::Corrupt(format!("{pname}: {e}")))?;
-            if page != p.page {
-                return Err(StoreError::Corrupt(format!("{pname} is page {page}")));
-            }
-            for (i, loc) in entries {
-                if !loc.is_zero() && !live.contains_key(&loc.seg) {
-                    return Err(StoreError::Corrupt(format!("{pname} names a segment {name} does not list")));
-                }
-                let extent = u64::from(page) * PAGE_EXTENTS as u64 + u64::from(i);
-                if extent >= c.volume_bytes / EXTENT_BYTES as u64 {
-                    return Err(StoreError::Corrupt(format!("{pname} maps an extent past the volume")));
-                }
-                self.map.insert(extent, loc);
-            }
+    /// A map page fetched (`Read::Page`, `Need::Page`, `checkpoint_needs`):
+    /// its placements join the map where the map has none (anything there
+    /// is newer: a replay, a landing, the pack). A second install of the
+    /// same page is a no-op.
+    pub fn install_page(&mut self, pr: PageRef, body: &[u8]) -> Result<(), StoreError> {
+        if self.unloaded.get(&pr.page) != Some(&pr) {
+            return Ok(());
         }
-        self.segments = live;
+        let pname = page_name(&pr);
+        if format::sha256(body) != pr.sum {
+            return Err(StoreError::Corrupt(format!("{pname} is not the page its checkpoint names")));
+        }
+        let (page, entries) = format::decode_page(body).map_err(|e| StoreError::Corrupt(format!("{pname}: {e}")))?;
+        if page != pr.page {
+            return Err(StoreError::Corrupt(format!("{pname} is page {page}")));
+        }
+        for (i, loc) in entries {
+            if !loc.is_zero() && !self.segments.contains_key(&loc.seg) {
+                return Err(StoreError::Corrupt(format!("{pname} names a segment its checkpoint does not list")));
+            }
+            let extent = u64::from(page) * PAGE_EXTENTS as u64 + u64::from(i);
+            if extent >= self.extents() {
+                return Err(StoreError::Corrupt(format!("{pname} maps an extent past the volume")));
+            }
+            self.map.entry(extent).or_insert(loc);
+        }
+        self.unloaded.remove(&pr.page);
         Ok(())
+    }
+
+    /// Fetches and installs a page.
+    fn load_page(&mut self, remote: &mut dyn RemoteGate, pr: PageRef) -> Result<(), StoreError> {
+        let body = whole(remote, &page_name(&pr), PAGE_BYTES_MAX)?;
+        self.install_page(pr, &body)
+    }
+
+    /// The pages a checkpoint would rewrite that are not loaded: fetch and
+    /// install each before `checkpoint`.
+    /// When the live list (a superset while pages are unloaded) passes
+    /// half its limit, every page: the checkpoint then lists exactly the
+    /// segments the map names.
+    pub fn checkpoint_needs(&self) -> Vec<PageRef> {
+        let superset = self.checkpoint.as_ref().map_or(0, |c| c.segments.len()) + self.segments_landed_since;
+        if !self.unloaded.is_empty() && superset > LIVE_SEGMENTS_MAX as usize / 2 {
+            return self.unloaded.values().copied().collect();
+        }
+        self.pages_dirty.iter().filter_map(|p| self.unloaded.get(p).copied()).collect()
+    }
+
+    /// The head a sleep posts when its last checkpoint covers everything
+    /// it shipped (nothing new to checkpoint): the same, marked clean.
+    pub fn clean_head(&self) -> Head {
+        Head { epoch: self.epoch, checkpoint: self.checkpoint_ref, clean: true }
+    }
+
+    /// Map pages not loaded yet.
+    pub fn pages_unloaded(&self) -> usize {
+        self.unloaded.len()
     }
 
     /// Applies life `epoch`'s segments from `first`, each following the
@@ -486,9 +577,9 @@ impl Store {
                 Some(Kind::Checkpoint(cr)) => cr,
                 _ => unreachable!("a replay leaves pages to write"),
             };
-            return (out, Head { epoch: self.epoch, checkpoint: Some(cr) });
+            return (out, Head { epoch: self.epoch, checkpoint: Some(cr), clean: false });
         }
-        (Vec::new(), Head { epoch: self.epoch, checkpoint: self.checkpoint_ref })
+        (Vec::new(), Head { epoch: self.epoch, checkpoint: self.checkpoint_ref, clean: false })
     }
 
     /// The head is posted: this life may ship.
@@ -518,10 +609,15 @@ impl Store {
     /// which a caller that must not hold its lock across the network calls
     /// apart.
     pub fn read(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, extent: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        match self.read_local(cache, extent, buf)? {
-            Read::Done => Ok(()),
-            Read::Fetch(f) => self.fetch(remote, cache, f, buf),
+        // Bounded: a page, then the extent.
+        for _ in 0..3 {
+            match self.read_local(cache, extent, buf)? {
+                Read::Done => return Ok(()),
+                Read::Fetch(f) => return self.fetch(remote, cache, f, buf),
+                Read::Page(pr) => self.load_page(remote, pr)?,
+            }
         }
+        unreachable!("a loaded page places the extent")
     }
 
     fn fetch(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, f: Fetch, buf: &mut [u8]) -> Result<(), StoreError> {
@@ -574,6 +670,7 @@ impl Store {
         }
         match self.map.get(&extent).copied() {
             Some(l) if !l.is_zero() => Ok(Read::Fetch(self.plan(extent, l))),
+            None if self.unloaded.contains_key(&page_of(extent)) => Ok(Read::Page(self.unloaded[&page_of(extent)])),
             _ => {
                 buf.fill(0);
                 Ok(Read::Done)
@@ -638,14 +735,15 @@ impl Store {
     /// Writes `data` at `offset` within extent `extent`. A partial write
     /// to an extent the cache does not hold reads it first.
     pub fn write(&mut self, remote: &mut dyn RemoteGate, cache: &mut dyn CacheGate, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
-        // Bounded: a write needs at most one fetch, then lands.
-        for _ in 0..2 {
+        // Bounded: a write needs at most a page and a fetch, then lands.
+        for _ in 0..3 {
             match self.write_local(cache, extent, offset, data)? {
                 None => return Ok(()),
-                Some(f) => {
+                Some(Need::Fetch(f)) => {
                     let mut buf = vec![0u8; EXTENT_BYTES as usize];
                     self.fetch(remote, cache, f, &mut buf)?;
                 }
+                Some(Need::Page(pr)) => self.load_page(remote, pr)?,
             }
         }
         unreachable!("a fetched extent is held by the cache")
@@ -654,7 +752,7 @@ impl Store {
     /// The local half of a write: done, or the fetch it needs first (a
     /// partial write to an extent the cache does not hold); after that
     /// fetch is installed, call it again.
-    pub fn write_local(&mut self, cache: &mut dyn CacheGate, extent: u64, offset: u32, data: &[u8]) -> Result<Option<Fetch>, StoreError> {
+    pub fn write_local(&mut self, cache: &mut dyn CacheGate, extent: u64, offset: u32, data: &[u8]) -> Result<Option<Need>, StoreError> {
         assert!(extent < self.extents());
         assert!(offset as usize + data.len() <= EXTENT_BYTES as usize && !data.is_empty());
         if self.fenced {
@@ -664,6 +762,9 @@ impl Store {
         if was != Some(Local::Dirty) && self.full() {
             return Err(StoreError::Full(self.dirty));
         }
+        if self.fresh {
+            self.note(extent);
+        }
         let whole_extent = offset == 0 && data.len() == EXTENT_BYTES as usize;
         if whole_extent {
             self.keep_frozen(cache, extent)?;
@@ -672,7 +773,8 @@ impl Store {
             let mut buf = vec![0u8; EXTENT_BYTES as usize];
             match (was, self.map.get(&extent).copied()) {
                 (Some(_), _) => cache.read(extent, &mut buf)?,
-                (None, Some(l)) if !l.is_zero() => return Ok(Some(self.plan(extent, l))),
+                (None, Some(l)) if !l.is_zero() => return Ok(Some(Need::Fetch(self.plan(extent, l)))),
+                (None, None) if self.unloaded.contains_key(&page_of(extent)) => return Ok(Some(Need::Page(self.unloaded[&page_of(extent)]))),
                 (None, _) => {}
             }
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
@@ -809,6 +911,15 @@ impl Store {
                         // list of at most PACK_EXTENTS_MAX)
                         if let Some(i) = self.written.iter().position(|x| x == e) {
                             self.written.remove(i);
+                            // carried again: the crash pack's (the same
+                            // bound and order)
+                            if let Some(j) = self.rewritten.iter().position(|x| x == e) {
+                                self.rewritten.remove(j);
+                            }
+                            if self.rewritten.len() == PACK_EXTENTS_MAX as usize {
+                                self.rewritten.pop_front();
+                            }
+                            self.rewritten.push_back(*e);
                         }
                         if self.written.len() == PACK_EXTENTS_MAX as usize {
                             self.written.pop_front();
@@ -817,6 +928,7 @@ impl Store {
                     }
                 }
                 self.segments.insert(SegId { epoch: self.epoch, seq: q }, s.link.sum);
+                self.segments_landed_since += 1;
                 self.applied_end = s.link;
             }
         }
@@ -829,7 +941,8 @@ impl Store {
 
     /// Whether a checkpoint would write anything.
     pub fn checkpoint_due(&self) -> bool {
-        !self.pages_dirty.is_empty() || self.pack.is_some() && self.checkpoint.as_ref().and_then(|c| c.pack) != self.pack
+        let last = self.checkpoint.as_ref();
+        !self.pages_dirty.is_empty() || self.pack.is_some() && last.and_then(|c| c.pack) != self.pack || last.and_then(|c| c.crash_pack) != self.crash_pack
     }
 
     /// The objects of a checkpoint of what the map holds now (as of the
@@ -846,6 +959,7 @@ impl Store {
         self.next_checkpoint += 1;
         let mut pages: BTreeMap<u32, PageRef> = self.checkpoint.as_ref().map(|c| c.pages.iter().map(|p| (p.page, *p)).collect()).unwrap_or_default();
         let mut out = Vec::new();
+        assert!(self.pages_dirty.iter().all(|p| !self.unloaded.contains_key(p)), "a page is loaded before a checkpoint rewrites it");
         for &p in &self.pages_dirty {
             let lo = u64::from(p) * PAGE_EXTENTS as u64;
             let entries: Vec<(u32, Loc)> = self.map.range(lo..lo + PAGE_EXTENTS as u64).map(|(e, l)| (u32::try_from(e - lo).expect("in the page"), *l)).collect();
@@ -853,10 +967,18 @@ impl Store {
             pages.insert(p, PageRef { page: p, epoch: self.epoch, seq, sum: format::sha256(&body) });
             out.push(Outgoing { name: format::page_name(self.epoch, seq, p), body, kind: Kind::Page });
         }
-        let live: BTreeSet<SegId> = self.map.values().filter(|l| !l.is_zero()).map(|l| l.seg).collect();
+        let mut live: BTreeSet<SegId> = self.map.values().filter(|l| !l.is_zero()).map(|l| l.seg).collect();
+        // pages not loaded may name any segment the last checkpoint listed:
+        // the list is a superset until every page is loaded (the cleaner,
+        // which reads every page, keeps it exact)
+        if !self.unloaded.is_empty() {
+            if let Some(c) = &self.checkpoint {
+                live.extend(c.segments.iter().map(|(id, _)| *id));
+            }
+        }
         let segments: Vec<(SegId, Sum)> = live.iter().map(|id| (*id, *self.segments.get(id).expect("every mapped segment's seal is known"))).collect();
         assert!(segments.len() <= LIVE_SEGMENTS_MAX as usize, "live segments past their limit: the cleaner's compaction is P5's");
-        let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, pages: pages.into_values().collect(), segments };
+        let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, crash_pack: self.crash_pack, pages: pages.into_values().collect(), segments };
         let body = format::encode_checkpoint(&c);
         let cr = CheckpointRef { epoch: self.epoch, seq, sum: format::sha256(&body) };
         out.push(Outgoing { name: format::checkpoint_name(self.epoch, seq), body, kind: Kind::Checkpoint(cr) });
@@ -870,6 +992,7 @@ impl Store {
         let c = format::decode_checkpoint(body).expect("a checkpoint we made decodes");
         assert_eq!(c.end, self.applied_end, "a checkpoint lands before anything else is applied");
         self.pages_dirty.clear();
+        self.segments_landed_since = 0;
         self.checkpoint = Some(c);
         self.checkpoint_ref = Some(*cr);
     }
@@ -881,42 +1004,62 @@ impl Store {
     /// the cache (its bytes the map's), up to PACK_EXTENTS_MAX. One object
     /// for the next wake to fetch.
     pub fn pack(&mut self, cache: &mut dyn CacheGate) -> Result<Option<Outgoing>, StoreError> {
-        let seq = self.next_pack;
-        let mut images: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut taken = BTreeSet::new();
         let order: Vec<u64> = self.boot.iter().chain(self.written.iter().rev()).copied().collect();
+        Ok(self.build_pack(cache, order, PACK_EXTENTS_MAX as usize)?.map(|(name, body, pr)| Outgoing { name, body, kind: Kind::Pack(pr) }))
+    }
+
+    /// A periodic checkpoint's crash pack: what this life rewrote, newest
+    /// first, up to CRASH_PACK_EXTENTS; None when it rewrote nothing.
+    pub fn crash_pack(&mut self, cache: &mut dyn CacheGate) -> Result<Option<Outgoing>, StoreError> {
+        let order: Vec<u64> = self.rewritten.iter().rev().copied().collect();
+        Ok(self.build_pack(cache, order, CRASH_PACK_EXTENTS)?.map(|(name, body, pr)| Outgoing { name, body, kind: Kind::CrashPack(pr) }))
+    }
+
+    /// The crash pack landed: the next checkpoint names it.
+    pub fn crash_pack_landed(&mut self, pr: PackRef) {
+        self.crash_pack = Some(pr);
+    }
+
+    /// A pack of `order`'s extents, each once, each clean in the cache
+    /// (its bytes the map's), up to `max`.
+    fn build_pack(&mut self, cache: &mut dyn CacheGate, order: Vec<u64>, max: usize) -> Result<Option<(String, Vec<u8>, PackRef)>, StoreError> {
+        let seq = self.next_pack;
+        let mut images: Vec<(u64, Loc, Vec<u8>)> = Vec::new();
+        let mut taken = BTreeSet::new();
         for e in order {
-            if images.len() == PACK_EXTENTS_MAX as usize || !taken.insert(e) {
+            if images.len() == max || !taken.insert(e) {
                 continue;
             }
             if self.local.get(&e) != Some(&Local::Clean) {
                 continue;
             }
-            let Some(l) = self.map.get(&e) else { continue };
+            let Some(l) = self.map.get(&e).copied() else { continue };
             if l.is_zero() {
                 continue;
             }
             let mut b = vec![0u8; EXTENT_BYTES as usize];
             cache.read(e, &mut b)?;
             if format::sum64(&b) == l.sum {
-                images.push((e, b));
+                images.push((e, l, b));
             }
         }
         if images.is_empty() {
             return Ok(None);
         }
-        let refs: Vec<(u64, &[u8])> = images.iter().map(|(e, b)| (*e, b.as_slice())).collect();
+        let refs: Vec<(u64, Loc, &[u8])> = images.iter().map(|(e, l, b)| (*e, *l, b.as_slice())).collect();
         let body = format::encode_pack(&refs);
         let h = format::decode_pack_header(&body).expect("a pack we made decodes");
         let header_sum = format::sha256(&body[..h.len()]);
         let pr = PackRef { epoch: self.epoch, seq, header_sum };
         self.next_pack += 1;
-        Ok(Some(Outgoing { name: format::pack_name(self.epoch, seq), body, kind: Kind::Pack(pr) }))
+        Ok(Some((format::pack_name(self.epoch, seq), body, pr)))
     }
 
     /// The pack landed: the next checkpoint names it.
     pub fn pack_landed(&mut self, pr: PackRef) {
         self.pack = Some(pr);
+        // a sleep's pack holds what it wrote: no crash pack after it
+        self.crash_pack = None;
     }
 
     /// The pack this life opened with, if any: fetch its header
@@ -924,6 +1067,12 @@ impl Store {
     /// install each with `pack_install`.
     pub fn pack_to_fetch(&self) -> Option<(String, PackRef)> {
         self.opened.pack.map(|p| (format::pack_name(p.epoch, p.seq), p))
+    }
+
+    /// The crash pack this life opened with, if any (a wake after a crash):
+    /// fetched as the pack is.
+    pub fn crash_pack_to_fetch(&self) -> Option<(String, PackRef)> {
+        self.opened.crash_pack.map(|p| (format::pack_name(p.epoch, p.seq), p))
     }
 
     /// The pack's header, checked against the checkpoint's record of it.
@@ -955,9 +1104,17 @@ impl Store {
         let first = ((offset - h.len() as u64) / ext) as usize;
         let mut installed = 0;
         for (i, image) in bytes.chunks_exact(ext as usize).enumerate() {
-            let Some(&(e, sum)) = h.entries.get(first + i) else { break };
-            let wanted = self.map.get(&e).is_some_and(|l| !l.is_zero() && l.sum == sum) && !self.local.contains_key(&e);
-            if wanted && format::sum64(image) == sum {
+            let Some(&(e, loc)) = h.entries.get(first + i) else { break };
+            // the map's placement if it has one (a replay is newer than the
+            // pack); else, where its page is not loaded, the pack's (it is
+            // the checkpoint's, sealed by the header's sum it names)
+            let wanted = !self.local.contains_key(&e)
+                && match self.map.get(&e) {
+                    Some(l) => !l.is_zero() && l.sum == loc.sum,
+                    None => self.unloaded.contains_key(&page_of(e)) && self.segments.contains_key(&loc.seg) && e < self.extents(),
+                };
+            if wanted && format::sum64(image) == loc.sum {
+                self.map.entry(e).or_insert(loc);
                 cache.write(e, image)?;
                 self.set_local(e, Some(Local::Clean));
                 installed += 1;

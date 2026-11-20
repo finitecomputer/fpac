@@ -88,30 +88,42 @@ pub struct CheckpointRef {
 /// The head (docs/design.md, Consistency): which checkpoint a disk opens
 /// from, and which life's segments follow it. On the wire it is one line,
 /// `<epoch> <checkpoint epoch> <checkpoint seq> <sha256 hex>`, or
-/// `<epoch> - - -` for a disk with no checkpoint yet.
+/// `<epoch> - - -` for a disk with no checkpoint yet, and ` clean` after
+/// it when the life slept cleanly: its checkpoint covers everything it
+/// shipped, so the next open replays nothing and asks for no segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
     pub epoch: u64,
     pub checkpoint: Option<CheckpointRef>,
+    pub clean: bool,
 }
 
 impl Head {
     pub fn encode(&self) -> String {
-        match self.checkpoint {
+        let line = match self.checkpoint {
             Some(c) => format!("{} {} {} {}", self.epoch, c.epoch, c.seq, hex(&c.sum)),
             None => format!("{} - - -", self.epoch),
+        };
+        if self.clean {
+            line + " clean"
+        } else {
+            line
         }
     }
 
     pub fn decode(s: &str) -> Option<Head> {
         let p: Vec<&str> = s.split(' ').collect();
-        let [e, ce, cs, sum] = p.as_slice() else { return None };
+        let (e, ce, cs, sum, clean) = match p.as_slice() {
+            [e, ce, cs, sum] => (e, ce, cs, sum, false),
+            [e, ce, cs, sum, "clean"] => (e, ce, cs, sum, true),
+            _ => return None,
+        };
         let epoch: u64 = e.parse().ok().filter(|&e| e > 0)?;
         if *ce == "-" && *cs == "-" && *sum == "-" {
-            return Some(Head { epoch, checkpoint: None });
+            return Some(Head { epoch, checkpoint: None, clean });
         }
         let c = CheckpointRef { epoch: ce.parse().ok().filter(|&e| e > 0)?, seq: cs.parse().ok().filter(|&s| s > 0)?, sum: unhex32(sum)? };
-        Some(Head { epoch, checkpoint: Some(c) })
+        Some(Head { epoch, checkpoint: Some(c), clean })
     }
 }
 
@@ -392,9 +404,13 @@ mod tests {
     // a malformed one is refused. Method: both, then six bad lines.
     #[test]
     fn head_lines() {
-        let h = Head { epoch: 7, checkpoint: Some(CheckpointRef { epoch: 6, seq: 2, sum: sha256(b"c") }) };
+        let h = Head { epoch: 7, checkpoint: Some(CheckpointRef { epoch: 6, seq: 2, sum: sha256(b"c") }), clean: false };
         assert_eq!(Head::decode(&h.encode()), Some(h));
-        let n = Head { epoch: 1, checkpoint: None };
+        let n = Head { epoch: 1, checkpoint: None, clean: false };
+        let c = Head { clean: true, ..h };
+        assert!(c.encode().ends_with(" clean"));
+        assert_eq!(Head::decode(&c.encode()), Some(c));
+        assert_eq!(Head::decode(&format!("{} dirty", h.encode())), None);
         assert_eq!(Head::decode(&n.encode()), Some(n));
         for bad in ["", "7", "0 - - -", "7 6 2", "7 6 0 aa", "7 - 2 -", "x - - -"] {
             assert_eq!(Head::decode(bad), None, "{bad}");

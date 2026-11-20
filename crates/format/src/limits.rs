@@ -61,7 +61,8 @@ pub const PACK_BYTES_MAX: u64 = PACK_EXTENTS_MAX as u64 * EXTENT_BYTES as u64;
 /// A pack's header at most: the fixed part, an entry per extent, its seal.
 pub const PACK_HEADER_BYTES_MAX: u64 = PACK_FIXED_BYTES + PACK_EXTENTS_MAX as u64 * PACK_ENTRY_BYTES + 32;
 pub const PACK_FIXED_BYTES: u64 = 24;
-pub const PACK_ENTRY_BYTES: u64 = 16;
+/// An extent, then its place: length, segment (epoch, seq), offset, sum.
+pub const PACK_ENTRY_BYTES: u64 = 8 + 4 + 16 + 4 + 8;
 /// A pack's whole object at most.
 pub const PACK_OBJECT_BYTES_MAX: u64 = PACK_HEADER_BYTES_MAX + PACK_BYTES_MAX;
 
@@ -82,7 +83,7 @@ pub const SEGMENT_FIXED_BYTES: u32 = 96;
 pub const SEGMENT_ENTRY_BYTES: u32 = 24;
 
 /// A checkpoint object's largest size: its pages and its live segments.
-pub const CHECKPOINT_BYTES_MAX: u64 = 128 + PAGES_MAX as u64 * 56 + LIVE_SEGMENTS_MAX as u64 * 48 + 32;
+pub const CHECKPOINT_BYTES_MAX: u64 = 192 + PAGES_MAX as u64 * 56 + LIVE_SEGMENTS_MAX as u64 * 48 + 32;
 
 const _: () = assert!(SEGMENT_BYTES_TARGET <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_EXTENTS_TARGET <= SEGMENT_EXTENTS_MAX);

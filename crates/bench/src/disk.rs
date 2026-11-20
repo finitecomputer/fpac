@@ -83,7 +83,7 @@ impl Krun {
         }
         let (ce, cs) = newest.ok_or("no checkpoint in the folder")?;
         let body = std::fs::read(disk.join(format!("e{ce}/c{cs}"))).map_err(|e| e.to_string())?;
-        let head = fpac_remote::Head { epoch: ce, checkpoint: Some(fpac_remote::CheckpointRef { epoch: ce, seq: cs, sum: fpac_remote::sha256(&body) }) };
+        let head = fpac_remote::Head { epoch: ce, checkpoint: Some(fpac_remote::CheckpointRef { epoch: ce, seq: cs, sum: fpac_remote::sha256(&body) }), clean: false };
         let dir = root.parent().ok_or("a root has a parent")?.to_path_buf();
         Ok(Krun { image: image.to_string(), dir, root: root.to_path_buf(), volume: 20_000 << 20, epoch: epochs, life: None, head: Some(head), keep: true })
     }
@@ -451,16 +451,16 @@ echo "boot_read_ms: $(( (t1 - t0) / 1000000 ))""#;
 /// `asleep_s`: how long the disk sleeps, its guest gone, before the first
 /// wake (the later wakes come at once), so the store's caches have time
 /// to forget it.
-pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64) -> Result<Value, String> {
+pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64, mount_args: &str) -> Result<Value, String> {
     let st = p.start()?;
-    let m = mount(p)?;
+    let m = mount_with(p, mount_args)?;
     let (code, out) = p.sh(BOOT_SET)?;
     if code != 0 {
         return Err(format!("the boot's files: {out}"));
     }
     let t = Instant::now();
     // the rest of the disk: 1 GiB files of noise (urandom is fast enough)
-    let (code, out) = p.sh(&format!("set -e; mkdir -p /data/fill; for i in $(seq 1 {gb}); do head -c 1073741824 /dev/urandom > /data/fill/g$i; done; sync; df -B1 /data | tail -1"))?;
+    let (code, out) = sh_long(p, &format!("set -e; mkdir -p /data/fill; for i in $(seq 1 {gb}); do head -c 1073741824 /dev/urandom > /data/fill/g$i; done; sync; df -B1 /data | tail -1"), "", "fill")?;
     if code != 0 {
         return Err(format!("the fill: {out}"));
     }
@@ -473,7 +473,7 @@ pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64) -> Result<Val
     for _ in 0..wakes {
         let t0 = Instant::now();
         let st = p.start()?;
-        let m = mount(p)?;
+        let m = mount_with(p, mount_args)?;
         let (code, out) = p.sh(BOOT_READ)?;
         let wake_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let boot_read: u64 = out.lines().find_map(|x| x.strip_prefix("boot_read_ms: ")).and_then(|x| x.trim().parse().ok()).unwrap_or(0);

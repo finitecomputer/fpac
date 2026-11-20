@@ -286,7 +286,11 @@ fn hermes_evidence(args: &[String]) -> Result<Value, String> {
 /// A disk scenario (disk.rs) in a place: a new disk each run, its objects
 /// deleted after (Cloudflare's; krun's folder goes with its run).
 fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, String> {
-    let volume: u64 = 20_000 << 20;
+    // `--volume-gb`: the volume, in GiB (20,000 MiB, a computer's, unless
+    // said); `--cache-max`: the daemon's cache bound, in bytes (a volume
+    // larger than the guest's 20 GB disk needs one)
+    let volume: u64 = flag(args, "--volume-gb").and_then(|g| g.parse::<u64>().ok()).map_or(20_000 << 20, |g| g << 30);
+    let mount_args = flag(args, "--cache-max").map(|b| format!("--cache-max {b}")).unwrap_or_default();
     let mut p: Box<dyn disk::Place> = match place {
         "krun" => Box::new(disk::Krun::new(&krun_image()?.0, &format!("disk-{scenario}"), volume)?),
         _ => Box::new(disk::Cloudflare::new(&format!("{scenario}-{}", now_ms()), volume)?),
@@ -296,7 +300,7 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
         "thrash" => disk::thrash(p.as_mut(), flag(args, "--big-files").and_then(|r| r.parse().ok()).unwrap_or(2560), flag(args, "--cache-max").and_then(|r| r.parse().ok()), !args.iter().any(|a| a == "--no-wake")),
-        _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0)),
+        _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0), &mount_args),
     };
     let objects = p.objects();
     let cleaned = p.cleanup();

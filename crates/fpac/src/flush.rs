@@ -163,10 +163,47 @@ pub fn flush_once(disk: &Disk, p: &Progress) -> Result<u32, StoreError> {
 }
 
 /// A checkpoint of what has landed, then the head names it.
-pub fn checkpoint(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
+/// `clean`: a sleep's, after everything landed; its head says so, and
+/// when nothing changed since the last checkpoint the head is that one,
+/// marked clean.
+pub fn checkpoint(disk: &Disk, p: &Progress, clean: bool) -> Result<(), StoreError> {
+    // a periodic checkpoint's crash pack first: what this life rewrote,
+    // for a wake after a crash (a sleep's pack has landed, and drops it)
+    if !clean && disk.inner.lock().unwrap().store.checkpoint_due() {
+        let crash = {
+            let mut g = disk.inner.lock().unwrap();
+            let Inner { store, cache } = &mut *g;
+            store.crash_pack(cache)?
+        };
+        if let Some(o) = crash {
+            ship_all(disk, std::slice::from_ref(&o))?;
+            let Kind::CrashPack(pr) = o.kind else { unreachable!("a crash pack") };
+            disk.inner.lock().unwrap().store.crash_pack_landed(pr);
+        }
+    }
+    // the pages it rewrites that are not loaded yet (only this thread lands
+    // segments, so none becomes dirty meanwhile)
+    let needs = disk.inner.lock().unwrap().store.checkpoint_needs();
+    for pr in needs {
+        // Bounded: an unavailable remote is retried a few times, then the
+        // checkpoint waits for the next turn.
+        let mut tries = 0;
+        loop {
+            match disk.load_page(pr) {
+                Ok(()) => break,
+                Err(StoreError::Unavailable(_)) if tries < 5 => tries += 1,
+                Err(e) => return Err(e),
+            }
+        }
+    }
     let (objs, epoch) = {
         let mut g = disk.inner.lock().unwrap();
         if !g.store.checkpoint_due() {
+            let head = g.store.clean_head();
+            drop(g);
+            if clean && p.head_posted.load(Ordering::SeqCst) {
+                post_head(disk, &head)?;
+            }
             return Ok(());
         }
         (g.store.checkpoint(), g.store.epoch())
@@ -176,7 +213,7 @@ pub fn checkpoint(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
     ship_all(disk, last)?;
     disk.inner.lock().unwrap().store.checkpoint_landed(&objs);
     let Some(Kind::Checkpoint(cr)) = objs.last().map(|o| o.kind) else { unreachable!("a checkpoint ends its objects") };
-    post_head(disk, &Head { epoch, checkpoint: Some(cr) })?;
+    post_head(disk, &Head { epoch, checkpoint: Some(cr), clean })?;
     p.checkpoints.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -286,7 +323,7 @@ pub fn run(disk: Arc<Disk>, p: Arc<Progress>, status: impl Fn(&Disk, &Progress))
         // the store stays as of its last landing while a checkpoint ships
         // (ended puts wait in the channel)
         if since >= CHECKPOINT_AFTER_SEGMENTS || (since > 0 && last_checkpoint.elapsed() >= Duration::from_millis(CHECKPOINT_MS)) {
-            if let Err(e) = checkpoint(&disk, &p) {
+            if let Err(e) = checkpoint(&disk, &p, false) {
                 fence(&disk, &e);
                 return;
             }
@@ -352,6 +389,6 @@ pub fn last(disk: &Disk, p: &Progress) -> Result<serde_json::Value, StoreError> 
         let Kind::Pack(pr) = o.kind else { unreachable!("a pack") };
         disk.inner.lock().unwrap().store.pack_landed(pr);
     }
-    checkpoint(disk, p)?;
+    checkpoint(disk, p, true)?;
     Ok(json!({ "segments": segments, "flushed_ms": flushed_ms, "pack_bytes": pack_bytes, "ms": t0.elapsed().as_millis() }))
 }

@@ -83,6 +83,7 @@ fn checkpoint() -> Checkpoint {
         end: Link { epoch: 6, seq: 12, sum: [1; 32] },
         volume_bytes: 20 << 30,
         pack: Some(PackRef { epoch: 6, seq: 12, header_sum: [2; 32] }),
+        crash_pack: Some(PackRef { epoch: 6, seq: 13, header_sum: [7; 32] }),
         pages: vec![PageRef { page: 0, epoch: 5, seq: 3, sum: [3; 32] }, PageRef { page: 7, epoch: 6, seq: 12, sum: [4; 32] }],
         segments: vec![(SegId { epoch: 5, seq: 1 }, [5; 32]), (SegId { epoch: 6, seq: 2 }, [6; 32])],
     }
@@ -108,14 +109,16 @@ fn checkpoint_round_trip_and_refusals() {
     }
 }
 
-// Goal: a pack's header round-trips and names each extent's sum.
+// Goal: a pack's header round-trips and names each extent's place.
 // Method: two extents; then the refusals.
 #[test]
 fn pack_round_trip() {
     let (a, b) = (extent(7), extent(8));
-    let obj = encode_pack(&[(40, &a), (2, &b)]);
+    let la = Loc { seg: SegId { epoch: 3, seq: 9 }, offset: 4096, len: EXTENT_BYTES, sum: sum64(&a) };
+    let lb = Loc { seg: SegId { epoch: 2, seq: 1 }, offset: 0, len: EXTENT_BYTES, sum: sum64(&b) };
+    let obj = encode_pack(&[(40, la, &a), (2, lb, &b)]);
     let h = decode_pack_header(&obj).unwrap();
-    assert_eq!(h.entries, vec![(40, sum64(&a)), (2, sum64(&b))]);
+    assert_eq!(h.entries, vec![(40, la), (2, lb)]);
     assert_eq!(&obj[h.len()..h.len() + EXTENT_BYTES as usize], &a[..]);
     for n in 0..h.len() {
         assert!(decode_pack_header(&obj[..n]).is_err());

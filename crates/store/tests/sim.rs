@@ -25,7 +25,7 @@ use fpac_store::head::{decide, Decision};
 use fpac_store::{ship, Ask, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
 
 const EXT: usize = EXTENT_BYTES as usize;
-const VOLUME: u64 = 64 * EXTENT_BYTES as u64 * 64; // 4,096 extents: one page and change of room
+const VOLUME: u64 = 4 * 4096 * EXTENT_BYTES as u64; // 16,384 extents: four map pages
 
 struct Rng(u64);
 
@@ -230,6 +230,8 @@ struct Life<'a> {
     /// Segments cut and not yet landed, from any number of flushes: they
     /// land in any order, as parallel puts do.
     in_flight: Vec<Outgoing>,
+    /// In its last turn: its checkpoint is a sleep's.
+    sleeping: bool,
 }
 
 #[derive(Debug)]
@@ -407,6 +409,30 @@ impl Life<'_> {
         if !self.store.checkpoint_due() || (std::env::var("SIM_NO_INFLIGHT_CKPT").is_ok() && self.store.shipping() > 0) {
             return Ok(());
         }
+        // a periodic checkpoint's crash pack first (a sleep's pack has
+        // already landed, and it drops the crash pack)
+        if !self.sleeping {
+            if let Some(p) = self.store.crash_pack(&mut self.cache).expect("a crash pack") {
+                self.ship_all(std::slice::from_ref(&p))?;
+                let Kind::CrashPack(pr) = p.kind else { unreachable!() };
+                self.store.crash_pack_landed(pr);
+            }
+        }
+        // the pages it rewrites that are not loaded yet
+        for pr in self.store.checkpoint_needs() {
+            self.step()?;
+            let mut body = Vec::new();
+            // Bounded: the faults are a few in a thousand calls.
+            for _ in 0..1000 {
+                body.clear();
+                match self.remote.get(&fpac_store::page_name(&pr), &mut |b| body.extend_from_slice(b)) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => panic!("a page the checkpoint names is gone"),
+                    Err(_) => continue,
+                }
+            }
+            self.store.install_page(pr, &body).expect("the page");
+        }
         let out = self.store.checkpoint();
         self.ship_all(&out)?;
         self.store.checkpoint_landed(&out);
@@ -416,13 +442,14 @@ impl Life<'_> {
             eprintln!("  checkpoint e{}/c{} end {}/{} in flight {}", cr.epoch, cr.seq, c.end.epoch, c.end.seq, self.in_flight.len());
         }
         self.step()?;
-        assert!(self.platform.post(&Head { epoch: self.store.epoch(), checkpoint: Some(cr) }));
+        assert!(self.platform.post(&Head { epoch: self.store.epoch(), checkpoint: Some(cr), clean: false }));
         Ok(())
     }
 
     /// A sleep: everything in flight lands, the last flush, the pack, a
     /// checkpoint naming it, the head.
     fn sleep(&mut self, rng: &mut Rng) -> Result<(), Crash> {
+        self.sleeping = true;
         self.flush()?;
         self.land_all(rng)?;
         self.store.stop_boot();
@@ -431,7 +458,11 @@ impl Life<'_> {
             let Kind::Pack(pr) = p.kind else { unreachable!() };
             self.store.pack_landed(pr);
         }
-        self.checkpoint()
+        self.checkpoint()?;
+        // the head marked clean: the next open replays nothing
+        self.step()?;
+        assert!(self.platform.post(&self.store.clean_head()));
+        Ok(())
     }
 }
 
@@ -460,7 +491,7 @@ fn open_sized<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: 
     let mut store = store.expect("opened");
     store.record_boot();
     let model = Model { live: expected.clone(), opened: expected, head_posted: false, cuts: Vec::new(), landed: BTreeSet::new() };
-    Life { store, cache: MemCache::default(), remote, platform, model, steps: 0, crash_at, in_flight: Vec::new() }
+    Life { store, cache: MemCache::default(), remote, platform, model, steps: 0, crash_at, in_flight: Vec::new(), sleeping: false }
 }
 
 /// One whole run: `lives` lives of random work, each crashing at a random
@@ -646,7 +677,8 @@ fn a_remote_that_always_lies_gives_an_error_not_bytes() {
     life.cache = MemCache::default();
     let r = life.store.read(life.remote, &mut life.cache, 9, &mut buf);
     assert!(matches!(r, Err(StoreError::Corrupt(ref why)) if why.contains("tries")), "{r:?}");
-    assert_eq!(life.remote.gets - gets, u64::from(FETCH_TRIES_MAX));
+    // the extent's map page (loaded on this first read), then its tries
+    assert_eq!(life.remote.gets - gets, 1 + u64::from(FETCH_TRIES_MAX));
 }
 
 // Goal: a cache that returns other bytes for a clean extent is caught by
@@ -791,10 +823,9 @@ fn a_full_pack_fits_one_object() {
 /// made before and after.
 struct Recording<'a> {
     inner: &'a mut SimRemote,
-    asked: Vec<Ask>,
+    /// Each round of asks, and how many reads came before it.
+    rounds: Vec<(usize, Vec<Ask>)>,
     reads: Vec<Ask>,
-    /// Reads made before the one round of asks.
-    before: Option<usize>,
 }
 
 impl RemoteGate for Recording<'_> {
@@ -810,25 +841,21 @@ impl RemoteGate for Recording<'_> {
         self.inner.put(name, body)
     }
     fn prefetch(&mut self, asks: &[Ask]) {
-        assert!(self.before.is_none(), "one round of asks");
-        self.before = Some(self.reads.len());
-        self.asked.extend_from_slice(asks);
+        self.rounds.push((self.reads.len(), asks.to_vec()));
     }
 }
 
-// Goal: an open waits for two rounds of reads, whatever the disk holds:
-// the checkpoint, then everything else at once (its pages, the replay's
-// headers, the pack's head), since each round trip is about 100 ms on R2.
-// Method: a disk with a checkpoint, a pack and a crashed life's segments
-// after it; open it through a gate that records, and check that every
-// read after the checkpoint's was asked for in the one round.
+// Goal: an open reads no map page, however many the disk has, except
+// those its replay changed (a wake after a crash); a page comes when an
+// extent of it is first read. Two rounds after a sleep: the checkpoint,
+// then the replay's headers and the pack's head at once. Method: a disk
+// with pages 0, 1 and 3 and a crashed life's segments on page 0; open it
+// through a gate that records, then read an extent of page 3.
 #[test]
-fn an_open_reads_in_two_rounds() {
+fn an_open_reads_no_page_but_those_its_replay_changed() {
     let mut remote = SimRemote::new(12, CALM);
     let mut platform = Platform { head: None, running: 0 };
-    // four map pages of room
-    let volume = 4 * 4096 * EXTENT_BYTES as u64;
-    let mut life = open_sized(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX, volume);
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
     life.post_head().unwrap();
     // extents across the pages, as ext4's metadata is spread
     for e in [0u64, 1, 2, 4095, 4096, 8191, 12_288] {
@@ -839,7 +866,22 @@ fn an_open_reads_in_two_rounds() {
     life.store.read(life.remote, &mut life.cache, 0, &mut vec![0u8; EXT]).unwrap();
     life.sleep(&mut Rng(3)).unwrap();
     let exp = life.model.after_crash(life.remote);
-    let mut life = open_sized(&mut remote, &mut platform, 2, exp, u64::MAX, volume);
+    // after a sleep: two rounds, no page
+    platform.running = 2;
+    let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head }).unwrap();
+    assert_eq!(s.opened().pages, 3);
+    assert_eq!(s.pages_unloaded(), 3);
+    assert_eq!(gate.rounds.len(), 1, "one round after the checkpoint");
+    assert!(matches!(&gate.reads[..gate.rounds[0].0], [Ask::Whole(n)] if n.starts_with("e1/c")), "{:?}", gate.reads);
+    assert!(!gate.reads.iter().chain(gate.rounds[0].1.iter()).any(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))), "no page: {:?}", gate.rounds);
+    assert!(gate.rounds[0].1.iter().any(|a| matches!(a, Ask::Range { name, len, .. } if name.starts_with("e1/p") && *len == fpac_store::PACK_HEAD_FETCH_BYTES)), "the pack's head");
+    assert!(!gate.reads.iter().chain(gate.rounds[0].1.iter()).any(|a| matches!(a, Ask::Range { name, .. } if name.contains("/s"))), "a clean sleep: no segment asked for: {:?}", gate.rounds);
+    for r in &gate.reads[gate.rounds[0].0..] {
+        assert!(gate.rounds[0].1.contains(r), "{r:?} was not asked for in the round");
+    }
+    drop(gate);
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
     life.post_head().unwrap();
     for i in 0..3u64 {
         let b = content(300 + i);
@@ -848,23 +890,102 @@ fn an_open_reads_in_two_rounds() {
         life.flush().unwrap();
         life.land_all(&mut Rng(3)).unwrap();
     }
-    // a crash: no checkpoint of this life
+    // a crash: no checkpoint of this life; its replay changes page 0 only
     let exp = life.model.after_crash(life.remote);
     platform.running = 3;
-    let mut gate = Recording { inner: &mut remote, asked: Vec::new(), reads: Vec::new(), before: None };
-    let s = Store::open(&mut gate, &OpenInfo { epoch: 3, volume_bytes: volume, head: platform.head }).unwrap();
+    let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 3, volume_bytes: VOLUME, head: platform.head }).unwrap();
     assert_eq!(s.opened().replayed, 3);
-    let before = gate.before.expect("a round of asks");
-    assert!(matches!(&gate.reads[..before], [Ask::Whole(n)] if n.starts_with("e1/c")), "{:?}", &gate.reads[..before]);
-    assert_eq!(gate.asked.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).count(), 3, "the pages written (0, 1, 3): {:?}", gate.asked);
-    assert!(gate.asked.iter().any(|a| matches!(a, Ask::Range { name, len, .. } if name.starts_with("e1/p") && *len == fpac_store::PACK_HEAD_FETCH_BYTES)), "the pack's head");
-    for r in &gate.reads[before..] {
-        assert!(gate.asked.contains(r), "{r:?} was not asked for in the round");
-    }
+    let pages: Vec<&Ask> = gate.reads.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).collect();
+    assert!(pages.len() == 1 && matches!(pages[0], Ask::Whole(n) if n.ends_with("-0")), "page 0 only: {pages:?}");
+    assert_eq!(s.pages_unloaded(), 2);
     drop(gate);
-    let mut life = open_sized(&mut remote, &mut platform, 3, exp, u64::MAX, volume);
+    let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
     life.read_check(1).unwrap();
+    let pages_before = life.store.pages_unloaded();
     life.read_check(12_288).unwrap();
+    assert_eq!(life.store.pages_unloaded(), pages_before - 1, "the read loaded page 3");
+    life.read_check(4096).unwrap();
+    life.read_check(4095).unwrap();
+}
+
+// Goal: a wake after a crash finds what its life rewrote (ext4's journal,
+// a database's pages) in the last periodic checkpoint's crash pack, and
+// a clean sleep drops the crash pack. Method: write one extent several
+// times and others once, checkpoint, crash; then sleep and look again.
+#[test]
+fn a_crash_wake_finds_the_rewritten_in_its_crash_pack() {
+    let mut remote = SimRemote::new(15, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for i in 0..3u64 {
+        // extent 7 rewritten each flush, as a journal is; 100+i once
+        for (e, seed) in [(7u64, 600 + i), (100 + i, 700 + i)] {
+            let b = content(seed);
+            life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+            life.model.live.insert(e, b);
+        }
+        life.flush().unwrap();
+        life.land_all(&mut Rng(9)).unwrap();
+    }
+    life.checkpoint().unwrap();
+    // a crash: the next open's checkpoint names a crash pack
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    let (name, pr) = life.store.crash_pack_to_fetch().expect("a crash pack");
+    let mut head = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
+    let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
+    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
+    assert_eq!(h.entries.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![7], "only what was rewritten");
+    let installed = life.store.pack_install(&mut life.cache, &h, h.len() as u64, &head[h.len()..n - (n - h.len()) % EXT]).unwrap();
+    assert_eq!(installed, 1);
+    let gets = life.remote.gets;
+    life.read_check(7).unwrap();
+    assert_eq!(life.remote.gets, gets, "the rewritten extent came with the crash pack");
+    life.read_check(101).unwrap();
+    // a clean sleep: no crash pack after it
+    life.post_head().unwrap();
+    life.sleep(&mut Rng(9)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+    assert!(life.store.crash_pack_to_fetch().is_none(), "a sleep drops the crash pack");
+}
+
+// Goal: a new disk's first wake has its boot's files in its pack: the
+// first life's boot wrote them, and a big fill after them does not push
+// them out. Method: write the boot's files, then more than a pack holds,
+// sleep, and look at the pack's first entries.
+#[test]
+fn a_new_disks_first_pack_holds_its_boots_files() {
+    let mut remote = SimRemote::new(16, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.store.record_boot();
+    life.post_head().unwrap();
+    let boot_files = [11u64, 12, 13];
+    for e in boot_files {
+        let b = content(800 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    for e in 2000..2000 + fpac_format::limits::PACK_EXTENTS_MAX as u64 + 50 {
+        let b = content(e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+        if e % 1000 == 0 {
+            life.flush().unwrap();
+            life.land_all(&mut Rng(4)).unwrap();
+        }
+    }
+    life.sleep(&mut Rng(4)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    let (name, pr) = life.store.pack_to_fetch().expect("a pack");
+    let mut head = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
+    let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
+    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
+    assert_eq!(h.entries.iter().take(3).map(|(e, _)| *e).collect::<Vec<_>>(), boot_files.to_vec(), "the boot's files first");
 }
 
 // Goal: a bounded cache drops only what the store holds: a clean extent
@@ -972,7 +1093,8 @@ fn a_write_after_its_cut_stays_out_of_that_cut() {
 fn the_heads_rules() {
     use fpac_store::CheckpointRef;
     let ck = |epoch, seq, b| Some(CheckpointRef { epoch, seq, sum: [b; 32] });
-    let h = |epoch, checkpoint| Head { epoch, checkpoint };
+    let h = |epoch, checkpoint| Head { epoch, checkpoint, clean: false };
+    let c = |epoch, checkpoint| Head { epoch, checkpoint, clean: true };
     assert_eq!(decide(None, 1, &h(1, None)), Decision::Take);
     assert_eq!(decide(Some(&h(1, None)), 2, &h(2, None)), Decision::Take, "a new life of a new disk");
     assert_eq!(decide(Some(&h(1, ck(1, 4, 1))), 2, &h(2, ck(1, 4, 1))), Decision::Take, "a new life, nothing replayed");
@@ -984,6 +1106,11 @@ fn the_heads_rules() {
     assert!(matches!(decide(Some(&h(3, None)), 2, &h(2, None)), Decision::Refuse(_)), "an earlier life's");
     assert!(matches!(decide(Some(&h(2, ck(2, 3, 2))), 2, &h(2, None)), Decision::Refuse(_)), "losing the checkpoint");
     assert!(matches!(decide(None, 2, &h(2, ck(3, 1, 1))), Decision::Refuse(_)), "a later life's checkpoint");
+    assert_eq!(decide(Some(&h(2, ck(2, 3, 2))), 2, &c(2, ck(2, 3, 2))), Decision::Take, "a sleep marks its checkpoint clean");
+    assert_eq!(decide(Some(&c(2, ck(2, 3, 2))), 2, &c(2, ck(2, 3, 2))), Decision::Same, "the clean post again");
+    assert!(matches!(decide(Some(&c(2, ck(2, 3, 2))), 2, &h(2, ck(2, 3, 2))), Decision::Refuse(_)), "a clean head loses its mark");
+    assert_eq!(decide(Some(&h(2, None)), 2, &c(2, None)), Decision::Take, "a life that shipped nothing sleeps cleanly");
+    assert_eq!(decide(Some(&c(2, ck(2, 3, 2))), 3, &h(3, ck(2, 3, 2))), Decision::Take, "a new life after a clean sleep");
 }
 
 #[test]

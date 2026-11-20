@@ -248,7 +248,9 @@ struct Opened {
     volume: u64,
     disk: String,
     fresh: bool,
-    pack_head: Option<Vec<u8>>,
+    /// The packs to fetch (the boot pack, and after a crash the crash
+    /// pack), each with the head the open's round fetched, if it did.
+    packs: Vec<(&'static str, String, fpac_format::PackRef, Option<Vec<u8>>)>,
     rounds: Vec<Value>,
 }
 
@@ -265,9 +267,16 @@ fn open_store(host: &str, port: u16) -> Result<Opened, String> {
                 let mut gate = Prefetching { remote: &mut r, host: host.to_string(), port, fetched: Default::default(), rounds: Vec::new() };
                 match Store::open(&mut gate, &info) {
                     Ok(store) => {
-                        let pack_head = store.pack_to_fetch().and_then(|(name, _)| gate.fetched.remove(&Ask::Range { name, offset: 0, len: fpac_store::PACK_HEAD_FETCH_BYTES })).flatten();
+                        let packs = [("pack", store.pack_to_fetch()), ("crash-pack", store.crash_pack_to_fetch())]
+                            .into_iter()
+                            .filter_map(|(kind, p)| p.map(|(name, pr)| (kind, name, pr)))
+                            .map(|(kind, name, pr)| {
+                                let head = gate.fetched.remove(&Ask::Range { name: name.clone(), offset: 0, len: fpac_store::PACK_HEAD_FETCH_BYTES }).flatten();
+                                (kind, name, pr, head)
+                            })
+                            .collect();
                         let rounds = std::mem::take(&mut gate.rounds);
-                        return Ok(Opened { store, volume: info.volume_bytes, disk: o.disk, fresh, pack_head, rounds });
+                        return Ok(Opened { store, volume: info.volume_bytes, disk: o.disk, fresh, packs, rounds });
                     }
                     Err(StoreError::Unavailable(e)) => last = e,
                     Err(e) => return Err(format!("the disk does not open: {e}")),
@@ -286,8 +295,7 @@ fn open_store(host: &str, port: u16) -> Result<Opened, String> {
 /// read of one waits for it rather than fetching it twice. Answers the
 /// pack's name, header and how many extents the head held; None when
 /// there is no pack.
-fn pack_header(disk: &Disk, t0: Instant, head: Option<Vec<u8>>) -> Option<(String, fpac_format::PackHeader, u64)> {
-    let (name, pr) = disk.inner.lock().unwrap().store.pack_to_fetch()?;
+fn pack_header(disk: &Disk, t0: Instant, kind: &str, name: String, pr: fpac_format::PackRef, head: Option<Vec<u8>>) -> Option<(String, fpac_format::PackHeader, u64)> {
     let head = head.or_else(|| {
         let mut r = disk.remote();
         let mut b = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
@@ -316,12 +324,12 @@ fn pack_header(disk: &Disk, t0: Instant, head: Option<Vec<u8>>) -> Option<(Strin
                 let _ = disk.took(&mut g, h.entries.iter().take(held).map(|(e, _)| *e));
                 k
             };
-            event(t0, "pack-header", json!({ "extents": h.entries.len(), "head_extents": held, "head_installed": installed }));
+            event(t0, &format!("{kind}-header"), json!({ "extents": h.entries.len(), "head_extents": held, "head_installed": installed }));
             Some((name, h, held as u64))
         }
         (r, _) => {
             let why = r.err().map(|e| e.to_string()).unwrap_or_default();
-            event(t0, "pack-skipped", json!({ "why": why }));
+            event(t0, &format!("{kind}-skipped"), json!({ "why": why }));
             None
         }
     }
@@ -330,7 +338,7 @@ fn pack_header(disk: &Disk, t0: Instant, head: Option<Vec<u8>>) -> Option<(Strin
 /// Fetches the rest of the pack, from extent `from`, in ranges on
 /// PACK_FETCHES connections at once, installing each range as it arrives;
 /// whatever did not arrive stops being waited for at the end.
-fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader, from: u64) {
+fn fetch_pack(disk: &Disk, t0: Instant, kind: &str, name: String, h: fpac_format::PackHeader, from: u64) {
     let ranges = Store::pack_ranges(&h, from, PACK_RANGE_BYTES);
     let installed = std::sync::atomic::AtomicU32::new(0);
     pool(ranges, PACK_FETCHES, |(off, len)| {
@@ -355,7 +363,7 @@ fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader
         disk.arrived(h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
     });
     disk.arrived(h.entries.iter().map(|(e, _)| *e));
-    event(t0, "pack", json!({ "extents": h.entries.len(), "from": from, "waited_at": *disk.waited.lock().unwrap(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
+    event(t0, kind, json!({ "extents": h.entries.len(), "from": from, "waited_at": *disk.waited.lock().unwrap(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
 }
 
 fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
@@ -368,7 +376,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
@@ -393,16 +401,18 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let Opened { mut store, volume, disk: disk_name, fresh, pack_head, rounds } = open_store(host, port)?;
+    let Opened { mut store, volume, disk: disk_name, fresh, packs, rounds } = open_store(host, port)?;
     event(t0, "opened", json!({ "disk": disk_name, "epoch": store.epoch(), "volume_bytes": volume, "new": fresh, "replayed": store.opened().replayed, "extents_mapped": store.opened().extents_mapped, "pages": store.opened().pages, "rounds": rounds, "memory_locked": locked, "writeback_set": writeback }));
     store.record_boot();
     let cache = FileCache::create(cache_path, volume).map_err(|e| format!("the cache file: {e}"))?;
     let disk = Arc::new(Disk::new(store, cache, host, port, cache_max));
     let progress = Arc::new(Progress::default());
     // the pack's head before the mount; the rest of it beside the mount
-    if let Some((name, h, from)) = pack_header(&disk, t0, pack_head) {
-        let d = disk.clone();
-        std::thread::spawn(move || fetch_pack(&d, t0, name, h, from));
+    for (kind, name, pr, head) in packs {
+        if let Some((name, h, from)) = pack_header(&disk, t0, kind, name, pr, head) {
+            let d = disk.clone();
+            std::thread::spawn(move || fetch_pack(&d, t0, kind, name, h, from));
+        }
     }
     let flusher = {
         let (d, p, w) = (disk.clone(), progress.clone(), status_writer(state.to_path_buf(), t0));

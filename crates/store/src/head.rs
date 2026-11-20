@@ -15,7 +15,8 @@ pub enum Decision {
 
 /// Whether the platform takes `proposed` over `current`, from the life
 /// `running` (the start generation it minted). Only the running life may
-/// move the head; within a life the checkpoint only moves forward; a
+/// move the head; within a life the checkpoint only moves forward, and the
+/// same checkpoint may gain the clean mark of a sleep but never lose it; a
 /// new life may name any checkpoint (it opened from the old head, and is
 /// the only writer).
 pub fn decide(current: Option<&Head>, running: u64, proposed: &Head) -> Decision {
@@ -37,6 +38,8 @@ pub fn decide(current: Option<&Head>, running: u64, proposed: &Head) -> Decision
     }
     // The same life: a later checkpoint of its own, only.
     match (cur.checkpoint, proposed.checkpoint) {
+        // a life that shipped nothing sleeps cleanly
+        (None, None) if proposed.clean => Decision::Take,
         (_, None) => Decision::Refuse("a life's head loses its checkpoint"),
         (None, Some(p)) => {
             if p.epoch == proposed.epoch {
@@ -48,6 +51,13 @@ pub fn decide(current: Option<&Head>, running: u64, proposed: &Head) -> Decision
         (Some(c), Some(p)) => {
             if p.epoch != proposed.epoch && p != c {
                 Decision::Refuse("a life's head goes back to another life's checkpoint")
+            } else if p == c {
+                // the same checkpoint: only the clean mark changed
+                if proposed.clean {
+                    Decision::Take
+                } else {
+                    Decision::Refuse("a clean head loses its mark")
+                }
             } else if p.epoch == c.epoch && p.seq == c.seq {
                 Decision::Refuse("the same checkpoint with another body")
             } else if p.epoch == c.epoch && p.seq < c.seq {

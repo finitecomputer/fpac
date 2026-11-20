@@ -15,7 +15,8 @@ use std::time::Duration;
 use fpac_device::serve::{Backing, BackingError};
 use fpac_format::limits::{DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
 use fpac_remote::Remote;
-use fpac_store::{CacheGate, Fetch, Read, Store, StoreError};
+use fpac_format::PageRef;
+use fpac_store::{page_name, CacheGate, Fetch, Need, Read, Store, StoreError};
 
 /// Connections kept to the remote, at most: the FUSE threads' and the
 /// flusher's.
@@ -115,6 +116,8 @@ pub struct Stats {
     pub evictions: AtomicU64,
     /// Writes answered with an error (the kernel sees EIO).
     pub write_errors: AtomicU64,
+    /// Map pages fetched (lazy pages).
+    pub page_loads: AtomicU64,
 }
 
 /// The first extents a read waited for the pack to bring, kept for the
@@ -287,6 +290,23 @@ impl Disk {
         }
     }
 
+    /// A map page, fetched without the lock and installed under it
+    /// (lazy pages: docs/design.md).
+    pub fn load_page(&self, pr: PageRef) -> Result<(), StoreError> {
+        let mut r = self.remote();
+        let mut body = Vec::new();
+        let got = r.get(&page_name(&pr), &mut |b| body.extend_from_slice(b));
+        self.give_back(r);
+        match got {
+            Ok(Some(_)) => {
+                self.stats.page_loads.fetch_add(1, Ordering::Relaxed);
+                self.inner.lock().unwrap().store.install_page(pr, &body)
+            }
+            Ok(None) => Err(StoreError::Corrupt(format!("{} is gone, and a checkpoint names it", page_name(&pr)))),
+            Err(e) => Err(StoreError::Unavailable(e.to_string())),
+        }
+    }
+
     /// Fetches and installs until the extent asked for is in `buf`.
     fn fetch(&self, f: Fetch, buf: &mut [u8]) -> Result<(), StoreError> {
         let mut f = f;
@@ -330,6 +350,11 @@ impl Disk {
                 Read::Fetch(f) => match self.fetch(f, buf) {
                     Ok(()) => return Ok(()),
                     // the extent moved while it was fetched: plan again
+                    Err(e @ StoreError::Unavailable(_)) => last = Some(e),
+                    Err(e) => return Err(e),
+                },
+                Read::Page(pr) => match self.load_page(pr) {
+                    Ok(()) => {}
                     Err(e @ StoreError::Unavailable(_)) => last = Some(e),
                     Err(e) => return Err(e),
                 },
@@ -379,13 +404,16 @@ impl Disk {
             };
             match need {
                 None => return Ok(()),
-                Some(f) => {
+                Some(n) => {
                     fetches += 1;
                     if fetches > OP_TRIES_MAX {
                         return Err(StoreError::Unavailable("a write's read".into()));
                     }
-                    let mut buf = vec![0u8; EXTENT_BYTES as usize];
-                    match self.fetch(f, &mut buf) {
+                    let got = match n {
+                        Need::Fetch(f) => self.fetch(f, &mut vec![0u8; EXTENT_BYTES as usize]),
+                        Need::Page(pr) => self.load_page(pr),
+                    };
+                    match got {
                         Ok(()) | Err(StoreError::Unavailable(_)) => {}
                         Err(e) => return Err(e),
                     }
