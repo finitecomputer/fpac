@@ -231,7 +231,15 @@ fn hermes_evidence(args: &[String]) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     for place in ["fpac", "local"] {
         let mine: Vec<&Value> = rows.iter().filter(|r| r["place"] == json!(place)).collect();
-        let later: Vec<&&Value> = mine.iter().filter(|r| r["wake"].as_u64().unwrap_or(0) >= 1).collect();
+        // ordinary wakes after the first; Cloudflare's rows name their kind
+        // (`wake-<n>`, `after-asleep`, `crashed`, `after-a-crash`)
+        let ordinary = |r: &&&Value| r["kind"].as_str().is_none_or(|k| k.starts_with("wake-"));
+        let later: Vec<&&Value> = mine.iter().filter(|r| r["wake"].as_u64().unwrap_or(0) >= 1).filter(ordinary).collect();
+        let special: Vec<Value> = mine
+            .iter()
+            .filter(|r| !ordinary(r))
+            .map(|r| json!({ "kind": r["kind"], "first_reply_ms": r["first_reply_ms"], "ready_ms": r["ready_ms"], "follow_ms": r["follow_ms"], "warm_reply_ms": r["warm_reply_ms"], "misses_before_first_reply": r["status_after_first_reply"]["misses"], "page_loads": r["status_after_first_reply"]["page_loads"], "sleep_ms": r["fpac_sleep_ms"] }))
+            .collect();
         let f = |k: &str| later.iter().filter_map(|r| r[k].as_f64()).collect::<Vec<_>>();
         let syncs_boot: Vec<f64> = later.iter().filter_map(|r| r["status_after_first_reply"]["syncs"].as_f64()).collect();
         let syncs_turn: Vec<f64> = later.iter().filter_map(|r| Some(r["status_after_warm_turn"]["syncs"].as_f64()? - r["status_after_first_reply"]["syncs"].as_f64()?)).collect();
@@ -254,6 +262,7 @@ fn hermes_evidence(args: &[String]) -> Result<Value, String> {
                 "warm_reply_ms_after_the_first_wake": stat(f("warm_reply_ms")),
                 "ready_ms_after_the_first_wake": stat(f("ready_ms")),
                 "misses_before_first_reply_after_the_first_wake": later.iter().map(|r| r["status_after_first_reply"]["misses"].clone()).collect::<Vec<_>>(),
+                "special_wakes": special,
                 "fsyncs_per_boot": stat(syncs_boot),
                 "fsyncs_per_warm_turn": stat(syncs_turn),
                 "file_system": mine.first().map(|r| r["mountinfo"].clone()),
@@ -277,7 +286,11 @@ fn hermes_evidence(args: &[String]) -> Result<Value, String> {
     scrubbed.push_str(rest);
     let out: Value = serde_json::from_str(&scrubbed).map_err(|e| e.to_string())?;
     Ok(json!({
-        "what": "the real Hermes image (fragment's at bc00639ba) in krun microVMs, 2 vCPU, 6 GiB; the Docker lane's fake fragment API and instant scripted model behind the engine's intercepts (STAND-INS); on FPAC: /data mounted by fpac before the image's own entrypoint (the binary fetched over the intercepted host), the folder remote on this machine (a STAND-IN for the route and for R2), the disk made once from the tiny image; on local: the engine's own data disk, emptied first. fsyncs are the kernel's fsyncs of the FUSE file (ext4's journal commits and the programs' syncs as they reach the device); misses are counted 1.1 s after the reply",
+        "what": if flag(args, "--place").is_some_and(|p| p.starts_with("cloudflare")) {
+            "the real Hermes image (fragment's, image id 24b575cde4a2) in Cloudflare containers of the spike's Worker, 2 vCPU, 6 GiB, 20 GB; its calls to fragment's API and the model go through the relay (the Worker's Durable Object, then one WebSocket from this machine) to the Docker lane's fake fragment API and instant scripted model on this machine (STAND-INS: their answers cross the internet twice); on FPAC: /data mounted by fpac before the image's own entrypoint, the stand-in Worker's route and R2 behind it, the disk made once from the tiny image with the fill named; on its own disk: the container's root disk, fresh at each start (a Cloudflare container keeps nothing between starts). fsyncs are the kernel's fsyncs of the FUSE file; misses are counted 1.1 s after the reply"
+        } else {
+            "the real Hermes image (fragment's at bc00639ba) in krun microVMs, 2 vCPU, 6 GiB; the Docker lane's fake fragment API and instant scripted model behind the engine's intercepts (STAND-INS); on FPAC: /data mounted by fpac before the image's own entrypoint (the binary fetched over the intercepted host), the folder remote on this machine (a STAND-IN for the route and for R2), the disk made once from the tiny image; on local: the engine's own data disk, emptied first. fsyncs are the kernel's fsyncs of the FUSE file (ext4's journal commits and the programs' syncs as they reach the device); misses are counted 1.1 s after the reply"
+        },
         "harness": "a scratch test in a copy of fragment's images workspace, outside this repository (it needs fragment's fake API); its rows are read here as they are",
         "places": out,
     }))
@@ -492,9 +505,39 @@ fn stage_worker(c: &Config, key: &net::Key, image_ctx: &Path) -> Result<PathBuf,
         cfg = cfg.replace(&format!("${{{k}}}"), &v);
     }
     assert!(!cfg.contains("${"), "every placeholder filled");
+    // `FPAC_HERMES_IMAGE`: a second image of the class, Hermes with fpac
+    // mounting /data before its own entrypoint (docs/results.md)
+    if let Ok(base) = std::env::var("FPAC_HERMES_IMAGE") {
+        let ctx = stage_hermes(&base, image_ctx)?;
+        let entry = format!("\"hermes\": {{ \"dockerfile\": \"{}\", \"build_context\": \"{}\" }},\n        \"tiny\":", ctx.join("Dockerfile").display(), ctx.display());
+        assert!(cfg.contains("\"tiny\":"), "the images map");
+        cfg = cfg.replacen("\"tiny\":", &entry, 1);
+    }
     std::fs::write(dir.join("wrangler.jsonc"), cfg).map_err(|e| e.to_string())?;
     Ok(dir)
 }
+
+/// The Hermes image's build context: `base` with the fpac binary (from the
+/// tiny image's context) and a boot that mounts /data with it before
+/// Hermes' own entrypoint; FPAC_OFF=1 in the env skips the mount (the
+/// container's own disk).
+fn stage_hermes(base: &str, tiny_ctx: &Path) -> Result<PathBuf, String> {
+    let ctx = work_dir().join("hermes-image");
+    std::fs::create_dir_all(&ctx).map_err(|e| e.to_string())?;
+    std::fs::copy(tiny_ctx.join("fpac"), ctx.join("fpac")).map_err(|e| format!("the fpac binary: {e}"))?;
+    std::fs::write(ctx.join("fpac-boot"), HERMES_BOOT).map_err(|e| e.to_string())?;
+    let dockerfile = format!("FROM {base}\nCOPY fpac /usr/local/bin/fpac\nCOPY fpac-boot /usr/local/bin/fpac-boot\nLABEL fpac.spike.deployed_at_ms=\"{}\"\nENTRYPOINT [\"/bin/sh\", \"/usr/local/bin/fpac-boot\"]\nCMD []\n", now_ms());
+    std::fs::write(ctx.join("Dockerfile"), dockerfile).map_err(|e| e.to_string())?;
+    Ok(ctx)
+}
+
+const HERMES_BOOT: &str = r#"if [ -z "$FPAC_OFF" ]; then
+mkdir -p /run/fpac /data
+/usr/local/bin/fpac mount --dir /data > /run/fpac/log 2>&1 &
+i=0; while ! grep -q '"mounted"' /run/fpac/log 2>/dev/null; do i=$((i+1)); [ $i -gt 2400 ] && break; sleep 0.025; done
+fi
+exec /opt/fragment/bin/hermes-boot pre-init
+"#;
 
 /// wrangler, on the pinned Node, with the token in its environment only.
 fn wrangler(c: &Config, dir: &Path, args: &[&str], log: &Path) -> Result<String, String> {
@@ -665,6 +708,28 @@ fn main() {
             net::worker(c.host(), &key, "POST", "/exec", &json!({ "argv": argv, "ms": 60_000 }), Duration::from_secs(120))
         }),
         (Some("destroy"), _) => Config::load().and_then(|c| net::worker(c.host(), &net::Key::load_or_make(&c.driver_key_file), "POST", "/destroy", &json!({}), Duration::from_secs(60))),
+        // The Hermes harness's calls (docs/results.md): a container of an
+        // image, its env and the relay; a shell script in it; a signed
+        // header for one request (the relay's WebSocket).
+        (Some("cf-start"), _) => Config::load().and_then(|c| {
+            let key = net::Key::load_or_make(&c.driver_key_file);
+            let _ = net::worker(c.host(), &key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
+            let env: serde_json::Map<String, Value> = args.windows(2).filter(|w| w[0] == "--env").filter_map(|w| w[1].split_once('=')).map(|(k, v)| (k.to_string(), json!(v))).collect();
+            let volume = flag(&args, "--volume-gb").and_then(|g| g.parse::<u64>().ok()).map(|g| g << 30);
+            let body = json!({ "disk": flag(&args, "--disk").ok_or("--disk")?, "image": flag(&args, "--image").unwrap_or("tiny".into()), "epoch": now_ms(), "env": env, "relay": args.iter().any(|a| a == "--relay"), "volume": volume });
+            net::worker(c.host(), &key, "POST", "/start", &body, Duration::from_secs(300))
+        }),
+        (Some("cf-sh"), _) => Config::load().and_then(|c| {
+            let key = net::Key::load_or_make(&c.driver_key_file);
+            let script = args.get(2).ok_or("a script")?;
+            let ms: u64 = flag(&args, "--ms").and_then(|m| m.parse().ok()).unwrap_or(600_000);
+            net::worker(c.host(), &key, "POST", "/exec", &json!({ "argv": ["sh", "-c", script], "ms": ms }), Duration::from_millis(ms + 60_000))
+        }),
+        (Some("sign"), _) => Config::load().map(|c| {
+            let key = net::Key::load_or_make(&c.driver_key_file);
+            let (m, p) = (args.get(2).map(String::as_str).unwrap_or("GET"), args.get(3).map(String::as_str).unwrap_or("/relay"));
+            json!({ "host": c.host(), "authorization": key.authorization(m, p, b"") })
+        }),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),

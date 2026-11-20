@@ -43,7 +43,9 @@ Answers `200` with an empty body and four headers:
 - `x-fpac-volume-bytes`: the volume's size.
 - `x-fpac-head`: the disk's head, or `none` for a new disk: one line,
   `<epoch> <checkpoint epoch> <checkpoint seq> <sha256 hex>`, or
-  `<epoch> - - -` for a disk with no checkpoint yet. The head's epoch is
+  `<epoch> - - -` for a disk with no checkpoint yet, followed by
+  ` clean` when that life slept cleanly (its checkpoint covers everything
+  it shipped, so the next open replays nothing). The head's epoch is
   older than this life's. The route answers it from what the platform
   gave it at the start: no storage read.
 
@@ -53,7 +55,8 @@ The body is a head's line (as above) for this life. The platform moves
 the disk's head only by the head's rules (`fpac_store::head::decide`):
 only the running life may post; a new life may name any checkpoint (it
 opened from the old head and is the only writer); within a life the
-checkpoint only moves forward. Answers:
+checkpoint only moves forward, and the same checkpoint may gain the clean
+mark (a sleep's last post) but never lose it. Answers:
 
 - `200` with `x-fpac-head-answer: taken`, or `same` (the same head again:
   an earlier post whose answer was lost);
@@ -134,7 +137,7 @@ arrives:
 
 ### Conformance
 
-`fpac-testkit::conformance::run` is the suite (17 cases). Every remote answers all
+`fpac-testkit::conformance::run` is the suite (19 cases). Every remote answers all
 of it: the folder remote in this workspace's tests, the stand-in Worker
 from inside a guest (`fpac-probe conformance`), and later the platform's
 own route in its own end-to-end tests.
@@ -155,7 +158,9 @@ own route in its own end-to-end tests.
 14. The same head again is the same.
 15. A later checkpoint of this life is taken.
 16. The same checkpoint with another body is refused (`409`).
-17. A head from a life that isn't running is refused (`409`).
+17. The same checkpoint marked clean (a sleep) is taken.
+18. A clean head never loses its mark (`409`).
+19. A head from a life that isn't running is refused (`409`).
 
 ## 2. The guest's promise
 
@@ -170,10 +175,14 @@ own route in its own end-to-end tests.
   every write made before it, at one instant), so the order ext4's
   journal relies on holds in the store.
 - **What a crash may lose:** writes made in the last flush interval plus
-  the puts in flight (about a second, more while the store is slow);
-  writes a program never synced, the kernel's writeback delay as well (the
-  daemon sets it to 5 s in the guest). Nothing older: a cut whose
-  segments have all landed is never lost.
+  what is still shipping: about a second while shipping keeps up. During a
+  burst, writes go at the local disk's speed with shipping behind them,
+  up to `UNSHIPPED_BYTES_MAX` (4 GiB) unlanded: a crash then loses up to
+  that backlog, about 85 s of writes at the 50 MB/s a Cloudflare container
+  ships, and a sleep's flush takes as long. Writes a program never synced,
+  the kernel's writeback delay as well (the daemon sets it to 5 s in the
+  guest). Nothing older: a cut whose segments have all landed is never
+  lost.
 - **What R2 holds is always a real moment of the disk**: the disk as it
   stood at some flush, as after a power cut at that instant. ext4 replays
   its journal and SQLite its WAL, as after a power cut.

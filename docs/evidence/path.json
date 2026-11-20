@@ -838,14 +838,14 @@
     },
     "krun": {
       "commit": {
-        "dirty": false,
-        "fpac": "8f27c5c101d4"
+        "dirty": true,
+        "fpac": "058e68d01c49"
       },
       "conformance": {
         "cases": [
           {
-            "case": "open names the disk and this life's epoch",
-            "detail": "Ok(Open { disk: \"spike-path\", epoch: 1795108182401 })",
+            "case": "open names the disk, this life's epoch, the volume and the head",
+            "detail": "Ok(Open { disk: \"spike-path\", epoch: 1795139882996, volume_bytes: 1073741824, head: None })",
             "pass": true
           },
           {
@@ -902,22 +902,57 @@
             "case": "an empty object round-trips",
             "detail": "Ok(Created) Ok(Some(0))",
             "pass": true
+          },
+          {
+            "case": "this life's head is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "the same head again is the same (a lost answer, replayed)",
+            "detail": "Ok(Same)",
+            "pass": true
+          },
+          {
+            "case": "a later checkpoint of this life is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "the same checkpoint with another body is refused",
+            "detail": "Err(Refused { status: 409, detail: \"the same checkpoint with another body\" })",
+            "pass": true
+          },
+          {
+            "case": "the same checkpoint marked clean (a sleep) is taken",
+            "detail": "Ok(Taken)",
+            "pass": true
+          },
+          {
+            "case": "a clean head never loses its mark",
+            "detail": "Err(Refused { status: 409, detail: \"a clean head loses its mark\" })",
+            "pass": true
+          },
+          {
+            "case": "a head from a life that isn't running is refused",
+            "detail": "Err(Refused { status: 409, detail: \"only the running life posts a head\" })",
+            "pass": true
           }
         ],
         "evidence": "conformance",
         "failed": 0,
-        "passed": 12,
+        "passed": 19,
         "remote": "fpac.fragment.internal:80"
       },
       "exit_codes": [
         0,
         0
       ],
-      "measured_at_ms": 1795108183893,
+      "measured_at_ms": 1795139887639,
       "path": {
         "connections_opened": 1,
         "disk": "spike-path",
-        "epoch": 1795108182401,
+        "epoch": 1795139882996,
         "errors": [],
         "evidence": "path",
         "intercept_null_64k": {
@@ -927,37 +962,37 @@
           "handler_colo": null,
           "note": "no /null on this remote"
         },
-        "open_ms": 2.642648,
+        "open_ms": 1.461068,
         "put_50m": {
-          "mbs": 345.8,
-          "ms": 151.634778
+          "mbs": 62.1,
+          "ms": 843.694671
         },
         "put_64k_ms": {
-          "max": 8.649,
-          "mean": 6.476,
-          "min": 3.956,
+          "max": 29.409,
+          "mean": 17.569,
+          "min": 11.362,
           "n": 30,
-          "p50": 6.459,
-          "p99": 8.649
+          "p50": 18.949,
+          "p99": 29.409
         },
         "put_64k_store_ms": {
           "n": 0
         },
         "put_8m_mbs": {
-          "max": 322.9,
-          "mean": 273.98,
-          "min": 238.6,
+          "max": 398.8,
+          "mean": 224.66,
+          "min": 58.6,
           "n": 10,
-          "p50": 275.8,
-          "p99": 322.9
+          "p50": 216.3,
+          "p99": 398.8
         },
         "put_8m_ms": {
-          "max": 35.163,
-          "mean": 30.826,
-          "min": 25.978,
+          "max": 143.154,
+          "mean": 51.203,
+          "min": 21.035,
           "n": 10,
-          "p50": 30.825,
-          "p99": 35.163
+          "p50": 43.115,
+          "p99": 143.154
         },
         "put_8m_store_ms": {
           "n": 0
@@ -968,36 +1003,36 @@
           "same": "Ok(Same)"
         },
         "ranged_1m_first_byte_ms": {
-          "max": 0.699,
-          "mean": 0.264,
-          "min": 0.154,
+          "max": 0.911,
+          "mean": 0.441,
+          "min": 0.203,
           "n": 100,
-          "p50": 0.239,
-          "p99": 0.502
+          "p50": 0.455,
+          "p99": 0.625
         },
         "ranged_1m_ms": {
-          "max": 1.618,
-          "mean": 0.726,
-          "min": 0.559,
+          "max": 1.282,
+          "mean": 0.822,
+          "min": 0.685,
           "n": 100,
-          "p50": 0.702,
-          "p99": 1.179
+          "p50": 0.812,
+          "p99": 1.079
         },
         "ranged_64k_first_byte_ms": {
-          "max": 0.643,
-          "mean": 0.179,
-          "min": 0.101,
-          "n": 200,
-          "p50": 0.166,
-          "p99": 0.321
-        },
-        "ranged_64k_ms": {
-          "max": 0.683,
-          "mean": 0.202,
-          "min": 0.141,
+          "max": 0.329,
+          "mean": 0.188,
+          "min": 0.126,
           "n": 200,
           "p50": 0.187,
-          "p99": 0.348
+          "p99": 0.27
+        },
+        "ranged_64k_ms": {
+          "max": 0.359,
+          "mean": 0.216,
+          "min": 0.153,
+          "n": 200,
+          "p50": 0.214,
+          "p99": 0.307
         },
         "ranged_64k_store_ms": {
           "n": 0
@@ -1005,60 +1040,60 @@
         "remote": "fpac.fragment.internal:80",
         "stream_50m": [
           {
-            "first_byte_ms": 21.933853,
-            "mbs": 1157.8,
-            "ms": 45.282704
+            "first_byte_ms": 34.089303,
+            "mbs": 817.0,
+            "ms": 64.170828
           },
           {
-            "first_byte_ms": 22.076542,
-            "mbs": 1170.1,
-            "ms": 44.805704
+            "first_byte_ms": 33.150133999999994,
+            "mbs": 923.9,
+            "ms": 56.749115
           },
           {
-            "first_byte_ms": 22.577412,
-            "mbs": 1162.8,
-            "ms": 45.089124
+            "first_byte_ms": 29.673246,
+            "mbs": 966.9,
+            "ms": 54.222916000000005
           },
           {
-            "first_byte_ms": 22.413302,
-            "mbs": 1163.7,
-            "ms": 45.052543
+            "first_byte_ms": 29.305837,
+            "mbs": 984.0,
+            "ms": 53.283527
           },
           {
-            "first_byte_ms": 22.198513,
-            "mbs": 1152.7,
-            "ms": 45.485394
+            "first_byte_ms": 29.373777,
+            "mbs": 995.1,
+            "ms": 52.688268
           }
         ],
         "stream_50m_parallel4": [
           {
-            "mbs": 2597.5,
-            "ms": 20.184564,
+            "mbs": 1009.0,
+            "ms": 51.960277999999995,
             "ok": true
           },
           {
-            "mbs": 2756.1,
-            "ms": 19.023154,
+            "mbs": 2210.5,
+            "ms": 23.718171,
             "ok": true
           },
           {
-            "mbs": 2515.1,
-            "ms": 20.845623,
+            "mbs": 2335.7,
+            "ms": 22.446662,
             "ok": true
           }
         ]
       },
       "place": {
         "engine_timings_us": {
-          "guestHelloUs": 246809,
-          "guestUptimeUs": 54000,
-          "jailNetUs": 779,
-          "jailNftUs": 9044,
-          "jailedUs": 118368,
-          "jailerSpawnedUs": 105817,
-          "preparedUs": 105569,
-          "readyUs": 262871,
-          "vmmBuiltUs": 127523
+          "guestHelloUs": 1312614,
+          "guestUptimeUs": 295000,
+          "jailNetUs": 845,
+          "jailNftUs": 161200,
+          "jailedUs": 912168,
+          "jailerSpawnedUs": 747926,
+          "preparedUs": 747655,
+          "readyUs": 1690302,
+          "vmmBuiltUs": 935440
         },
         "name": "krun",
         "what": "the guest in a krun microVM -> the engine's intercept -> the folder remote on a unix socket on this box: a STAND-IN for the route and for R2, never the product's number"

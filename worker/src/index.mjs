@@ -36,6 +36,16 @@ const INSTANCE = { vcpu: 2, memoryMib: 6144, diskMb: 20000 };
 // A disk's size when the driver names none: 20 GB, as a computer's.
 const VOLUME_BYTES_DEFAULT = 20000 * 1024 * 1024 - ((20000 * 1024 * 1024) % 65536);
 const NULL_BYTES_MAX = 1024 * 1024;
+// The relay (docs/results.md, Hermes on Cloudflare): a container's calls
+// to these hosts go, through the Durable Object, over one WebSocket the
+// driver opens, to the stand-ins on the driver's machine (fragment's fake
+// API and the scripted model): STAND-INS, not fragment.
+const RELAY_HOSTS = ["api.fragment.internal", "model.fragment.internal"];
+const RELAY_MS_MAX = 120 * 1000;
+const RELAY_CHUNK_BYTES = 512 * 1024;
+const RELAY_BODY_BYTES_MAX = 64 * 1024 * 1024;
+const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+const ENV_VARS_MAX = 32;
 const REPRO_KEY = /^repro\/[a-z0-9.-]{1,64}$/;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 // Records of mismatches the handler saw, kept and listed at most.
@@ -87,6 +97,10 @@ export default {
     if (!(await signed(request, url, hex(await crypto.subtle.digest("SHA-256", body)), env))) return text(401, "this route answers the spike's driver only\n");
     const stub = env.SPIKE.get(env.SPIKE.idFromName("spike"));
     const headers = { "x-driver-colo": String((request.cf && request.cf.colo) || "unknown") };
+    // the driver's relay: a WebSocket to the Durable Object
+    if (url.pathname === "/relay" && request.headers.get("upgrade") === "websocket") {
+      return stub.fetch(new Request(url, { method: "GET", headers: { ...headers, upgrade: "websocket" } }));
+    }
     return stub.fetch(new Request(url, { method: request.method, headers, body: request.method === "GET" ? undefined : body }));
   },
 };
@@ -248,10 +262,29 @@ async function put(bucket, key, request) {
   return text(sum === claimed ? 200 : 409, "", { "x-fpac-sha256": sum, "server-timing": timing(t0) });
 }
 
+// A container's call to a relayed host: to the Durable Object, which
+// carries it to the driver (`relayCall`). WebSocket upgrades too.
+export class FpacRelay extends WorkerEntrypoint {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const stub = this.env.SPIKE.get(this.env.SPIKE.idFromName("spike"));
+    return stub.fetch(new Request(`https://spike/__relay/${this.ctx.props.host}${url.pathname}${url.search}`, request));
+  }
+}
+
+const b64 = (bytes) => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
 export class FpacSpike extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/relay" && request.headers.get("upgrade") === "websocket") return this.acceptRelay();
+      if (url.pathname.startsWith("/__relay/")) return await this.relayCall(request, url);
       const route = `${request.method} ${url.pathname}`;
       if (route === "POST /start") return json({ ...(await this.start(await request.json())), driver_colo: request.headers.get("x-driver-colo") });
       if (route === "POST /head") return json(await this.head(await request.json()));
@@ -291,9 +324,154 @@ export class FpacSpike extends DurableObject {
     return { refused: d, status: 409 };
   }
 
-  async start({ disk, image, epoch, volume }) {
+  // The relay's state: the driver's socket, the calls waiting on it, the
+  // container's WebSockets it carries.
+  relayState() {
+    this.relay ||= { socket: null, pending: new Map(), sockets: new Map(), next: 1 };
+    return this.relay;
+  }
+
+  acceptRelay() {
+    const r = this.relayState();
+    if (r.socket) {
+      try {
+        r.socket.close(1012, "replaced");
+      } catch {}
+    }
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    r.socket = server;
+    server.addEventListener("message", (ev) => this.onRelay(ev.data));
+    const gone = () => {
+      if (r.socket !== server) return;
+      r.socket = null;
+      for (const [, p] of r.pending) p.fail(new Error("the relay closed"));
+      r.pending.clear();
+      for (const [, ws] of r.sockets) {
+        try {
+          ws.close(1011, "the relay closed");
+        } catch {}
+      }
+      r.sockets.clear();
+    };
+    server.addEventListener("close", gone);
+    server.addEventListener("error", gone);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  relaySend(msg) {
+    const r = this.relayState();
+    if (r.socket) r.socket.send(JSON.stringify(msg));
+  }
+
+  relayWait(id) {
+    const r = this.relayState();
+    return new Promise((resolve, reject) => {
+      const p = { chunks: [], status: 0, headers: [], done: () => resolve(p), fail: reject };
+      r.pending.set(id, p);
+      setTimeout(() => {
+        if (r.pending.delete(id)) reject(new Error("the relay took too long"));
+      }, RELAY_MS_MAX);
+    });
+  }
+
+  onRelay(data) {
+    const r = this.relayState();
+    let m;
+    try {
+      m = JSON.parse(data);
+    } catch {
+      return;
+    }
+    const p = r.pending.get(m.id);
+    if (m.t === "res" && p) {
+      p.status = m.status;
+      p.headers = m.headers || [];
+    } else if (m.t === "body" && p) {
+      p.chunks.push(unb64(m.b));
+    } else if ((m.t === "end" || m.t === "ws-ok") && p) {
+      r.pending.delete(m.id);
+      p.done();
+    } else if (m.t === "fail" && p) {
+      r.pending.delete(m.id);
+      p.fail(new Error(m.why || "the relay's call failed"));
+    } else if (m.t === "ws-msg") {
+      const ws = r.sockets.get(m.id);
+      if (ws) ws.send(m.text !== undefined ? m.text : unb64(m.b));
+    } else if (m.t === "ws-close") {
+      const ws = r.sockets.get(m.id);
+      if (ws && r.sockets.delete(m.id)) {
+        try {
+          ws.close(m.code && m.code >= 1000 && m.code < 5000 && m.code !== 1005 && m.code !== 1006 ? m.code : 1000, m.reason || "");
+        } catch {}
+      }
+    }
+  }
+
+  // A container's call to a relayed host, carried to the driver: a
+  // request (head, body chunks, end) answered the same way, or a
+  // WebSocket upgrade paired with one the driver opens.
+  async relayCall(request, url) {
+    const r = this.relayState();
+    if (!r.socket) return text(502, "no relay\n");
+    const rest = url.pathname.slice("/__relay/".length);
+    const slash = rest.indexOf("/");
+    const host = slash < 0 ? rest : rest.slice(0, slash);
+    const path = (slash < 0 ? "/" : rest.slice(slash)) + url.search;
+    if (!RELAY_HOSTS.includes(host)) return text(400, "not a relayed host\n");
+    const id = r.next++;
+    const skip = ["host", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "content-length"];
+    const headers = [...request.headers].filter(([k]) => !skip.includes(k.toLowerCase()));
+    if (request.headers.get("upgrade") === "websocket") {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      r.sockets.set(id, server);
+      const opened = this.relayWait(id);
+      this.relaySend({ id, t: "ws-open", host, path, headers });
+      try {
+        await opened;
+      } catch (e) {
+        r.sockets.delete(id);
+        return text(502, `${e.message}\n`);
+      }
+      server.addEventListener("message", (ev) => this.relaySend(typeof ev.data === "string" ? { id, t: "ws-msg", text: ev.data } : { id, t: "ws-msg", b: b64(new Uint8Array(ev.data)) }));
+      server.addEventListener("close", (ev) => {
+        if (r.sockets.delete(id)) this.relaySend({ id, t: "ws-close", code: ev.code, reason: ev.reason });
+      });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    const body = request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : new Uint8Array(await request.arrayBuffer());
+    if (body.length > RELAY_BODY_BYTES_MAX) return text(413, "too large\n");
+    const done = this.relayWait(id);
+    this.relaySend({ id, t: "req", host, method: request.method, path, headers });
+    for (let i = 0; i < body.length; i += RELAY_CHUNK_BYTES) this.relaySend({ id, t: "body", b: b64(body.subarray(i, i + RELAY_CHUNK_BYTES)) });
+    this.relaySend({ id, t: "end" });
+    let p;
+    try {
+      p = await done;
+    } catch (e) {
+      return text(502, `${e.message}\n`);
+    }
+    const out = new Uint8Array(p.chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of p.chunks) {
+      out.set(c, at);
+      at += c.length;
+    }
+    const h = new Headers(p.headers.filter(([k]) => !["content-length", "transfer-encoding", "connection"].includes(String(k).toLowerCase())));
+    return new Response([101, 204, 205, 304].includes(p.status) ? null : out, { status: p.status, headers: h });
+  }
+
+  async start({ disk, image, epoch, volume, env, relay }) {
     const c = this.ctx.container;
     if (c.running) throw new Error("a container is running: one at a time");
+    const extra = {};
+    const names = Object.keys(env || {});
+    if (names.length > ENV_VARS_MAX) throw new Error("too many env vars");
+    for (const k of names) {
+      if (!ENV_NAME.test(k) || typeof env[k] !== "string" || env[k].length > 4096) throw new Error(`an env var: ${k}`);
+      extra[k] = env[k];
+    }
     if (!/^[a-z0-9-]{1,40}$/.test(disk)) throw new Error("a disk's name: a-z, 0-9 and -");
     if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error("an epoch is a positive integer");
     const ref = c.images && c.images[image];
@@ -310,7 +488,10 @@ export class FpacSpike extends DurableObject {
     } catch (e) {
       intercept = `after the start (before it: ${String((e && e.message) || e)})`;
     }
-    c.start({ image: ref, enableInternet: false, instance: INSTANCE, env: { FPAC_REMOTE: REMOTE_HOST } });
+    if (relay) {
+      for (const host of RELAY_HOSTS) await c.interceptOutboundHttp(host, this.ctx.exports.FpacRelay({ props: { host } }));
+    }
+    c.start({ image: ref, enableInternet: false, instance: INSTANCE, env: { ...extra, FPAC_REMOTE: REMOTE_HOST } });
     c.monitor().catch(() => {});
     if (intercept !== "before the start") await c.interceptOutboundHttp(REMOTE_HOST, egress);
     const started = Date.now() - t0;

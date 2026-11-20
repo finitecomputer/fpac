@@ -65,22 +65,28 @@ Why it is fast:
 3. Beside it, `fpac mount` (crates/fpac): open (the route answers from
    what the platform gave it: no storage read), then **two rounds** to
    the store, since each round trip is about 100 ms on R2: the head's
-   checkpoint; then, all at once, every map page it names, the first
-   sixteen segment headers a replay may read, and the pack's head (its
-   header and first sixteen extents, which hold the mount's own reads).
-   Replay the head life's segments after the checkpoint (past sixteen,
-   their headers come sixteen at a time), serve the FUSE file, attach the
-   loop device, mount ext4. The rest of the pack streams in beside the
-   mount as ranged gets on eight connections; a read of one of its
-   extents waits for it rather than fetching it twice; a block not in the
-   pack is one ranged get with 1 MiB of read-ahead (a **miss**). Before
-   P5 the pages came one at a time: a 20 GB ext4 spreads its metadata
-   over about twenty pages, and opens on Cloudflare took 2.5 to 9 s,
-   growing with the data.
+   checkpoint; then, all at once, the packs' heads (each pack's header and
+   first 64 extents, which hold the mount's own reads) and, unless the
+   head is marked clean, the first sixteen segment headers a replay may
+   read. **No map page**: a page is fetched when an extent of it is first
+   read or partly written (or when a checkpoint rewrites it), so the open
+   is the same at any size. The packs' entries carry each extent's place,
+   so their extents need no page. Replay the head life's segments after
+   the checkpoint, load the pages that replay changed (a wake after a
+   crash), serve the FUSE file, attach the loop device, mount ext4. The
+   rest of the packs stream in beside the mount as ranged gets on eight
+   connections; a read of one of their extents waits for it rather than
+   fetching it twice; a block not in a pack is one ranged get with 1 MiB
+   of read-ahead (a **miss**).
 
-The pack is what the last boot read, in its order, then what the last
-life wrote, newest first (its databases' pages, its logs' tails), each
-extent clean and checked, up to 96 MiB.
+The boot pack is what the last boot read, in its order (and, for a new
+disk's first life, what its boot wrote: the files its first boot made),
+then what the last life wrote, newest first (its databases' pages, its
+logs' tails), each extent clean and checked, up to 1,535 extents. A
+periodic checkpoint also names a **crash pack**: the extents its life
+rewrote, newest first (ext4's journal and metadata, a database's pages),
+up to 8 MiB, what a wake after a crash reads first. A clean sleep drops
+it.
 
 The pass line: from the second wake on, zero misses on the path to the
 agent's first reply, and a first reply no later than on the container's
@@ -91,15 +97,23 @@ own disk.
 SIGTERM → the guest stops the agent → the daemon unmounts ext4 (or, if
 `/data` is still busy after 2 s, freezes it, which makes the device
 consistent with files open), detaches the loop device, cuts everything
-written, ships it, writes the pack and a checkpoint naming it, posts the
-head, and exits. The platform then destroys the container.
+written, ships it with whatever is still shipping, writes the pack and a
+checkpoint naming it, posts the head **marked clean**, and exits. The
+platform then destroys the container.
 
-While awake: a cut about once a second when something changed, its
-segments shipped eight at a time; a checkpoint after 128 segments or
-five minutes. **fsync returns at once**: the cache file dies with the
-container, so syncing it would protect nothing; every cut is a whole
-moment of the device, so the order ext4's journal relies on holds in
-the store.
+While awake: a cut about once a second when something changed. **A cut
+only names its extents**; each segment is built from the cache file
+when a put slot is free, and eight puts are in flight at once, each
+segment landing as its put ends, so writes go on at the local disk's
+speed with shipping behind them, up to UNSHIPPED_BYTES_MAX unlanded. An
+extent written again before its segment is built keeps its bytes as of
+the cut apart first (a shadow file beside the cache), so every cut is
+still one moment of the device. When shipping falls behind, the timed
+cut waits, so rewrites of the same extents coalesce. A checkpoint (with
+its crash pack) after 128 segments or five minutes. **fsync returns at
+once**: the cache file dies with the container, so syncing it would
+protect nothing; every cut is a whole moment of the device, so the
+order ext4's journal relies on holds in the store.
 
 ## Consistency and failure
 
@@ -169,7 +183,9 @@ them together. Those already in code are marked with their file.
 | `IO_MS_MAX` | 30 s | One read or write on the remote's connection (`remote/limits.rs`) |
 | `EXTENT_BYTES` | 64 KiB | The unit fetched, shipped and checked (`format/limits.rs`, as the rest below) |
 | `SEGMENT_BYTES_TARGET`, `SEGMENT_BYTES_MAX` | 8 MiB, 64 MiB | A put costs about the same to 8 MiB; a bigger cut is a group of segments |
-| `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut. A cut takes all of it at one instant (a subset would reorder ext4's writes), copied under the store's lock; past it writes wait for the next cut |
+| `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut: one cut's size. A cut takes all of it at one instant (a subset would reorder ext4's writes), naming it only; past it a write asks for a cut at once |
+| `UNSHIPPED_BYTES_MAX` | 4 GiB | Written and not yet landed, held in the cache file: a burst this large goes at the local disk's speed. Section 10's 4 GiB line; it bounds a crash's loss during a burst and a sleep's flush (about 85 s at 50 MB/s) |
+| `CRASH_PACK_EXTENTS` | 128 (8 MiB) | A periodic checkpoint's crash pack: about $0.0024 an hour of activity in egress (`store/src/lib.rs`) |
 | `CUT_SEGMENTS_MAX` | 32 | The segments one cut may need |
 | `PACK_EXTENTS_MAX` | 1,535 (96 MiB less one extent) | A wake's pack; past it, the extents written longest ago are left out. With its header the object stays within `OBJECT_BYTES_MAX`, asserted for every kind of object |
 | `READ_AHEAD_BYTES` | 1 MiB | A miss fetches this much of its segment (P2: it costs about what 64 KiB does) |
@@ -275,21 +291,22 @@ quote them as they are.
 
 *Each item stays here until it is paid.*
 
-- **The cut copies every dirty extent under the store's lock** (up to
-  256 MiB, about 0.1 s): writes pause meanwhile. A copy-on-write cut
-  (mark at the instant, copy outside the lock, preserving a written
-  extent's old bytes for the segment) would remove the pause. Delete
-  when a write pause shows in `tools.json` or in the agent's turns.
-- **A wake after a crash replays ext4's journal through misses**: the
-  journal's blocks are not in the pack (the crashed life wrote none).
-  0.2-1.3 s on krun; on Cloudflare each miss is about 100 ms. Pay by
-  writing the pack at checkpoints too, or by prefetching the journal's
-  extents the superblock names.
+- **A segment is built under the store's lock** (reading up to 8 MiB
+  from the cache file and hashing it, about 10 ms): writes pause that
+  long, a few times a second while shipping. Building outside the lock
+  (take the images under it, encode outside, register in order) removes
+  it. Delete when a pause shows in `tools.json` or the agent's turns.
+- **The checkpoint's live-segment list is a superset while map pages are
+  unloaded** (lazy pages): a segment only an unloaded page names can't be
+  told dead. Past half of LIVE_SEGMENTS_MAX a checkpoint loads every page
+  and lists exactly. The cleaner, which reads every page, keeps it exact
+  (P5's item 6).
 - **Live segments are never compacted**: an extent rewritten often
   leaves old segments live while any extent in them is current. Bounded
-  by LIVE_SEGMENTS_MAX (asserted); a compaction pass that rewrites a
-  mostly-dead segment's live extents into a new one is the fix, before
-  any disk can reach the bound.
+  by LIVE_SEGMENTS_MAX (asserted); the cleaner's compaction is the fix.
+- **`fpac mount --cache-max` is a measurement aid** (first in, first out,
+  never what is unshipped or mid-write): the product's cache bound,
+  scan-resistant, is a PR of its own (docs/costs.md).
 - **The image must carry mke2fs** for a new disk (Hermes' image has
   none; the spike's harness made the disk from the tiny image).
 - The probe's FUSE file is backed by a plain local file (`LocalFile`): a
