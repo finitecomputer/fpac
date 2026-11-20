@@ -1137,6 +1137,51 @@ fn a_new_disks_first_pack_holds_its_boots_files() {
     assert_eq!(h.entries.iter().take(3).map(|(e, _)| *e).collect::<Vec<_>>(), boot_files.to_vec(), "the boot's files first");
 }
 
+// Goal: a sequential read's window is planned as few gets of whole runs:
+// each extent of it the map places and the cache lacks, once, in runs
+// within a segment of at most the piece's length; installed, the window
+// reads with no further get. Method: 300 consecutive extents written in
+// one cut (three segments), a new life, extents 0..10 read first, then the
+// window 0..300 in pieces of 64.
+#[test]
+fn a_read_ahead_window_is_planned_in_whole_runs() {
+    let mut remote = SimRemote::new(15, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in 0..300u64 {
+        let b = content(700 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.sleep(&mut Rng(6)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    for e in 0..10 {
+        life.read_check(e).unwrap();
+    }
+    let fetches = life.store.ahead(0, 300, 64);
+    let planned: Vec<u64> = fetches.iter().flat_map(|f| f.extents().collect::<Vec<_>>()).collect();
+    let mut sorted = planned.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), planned.len(), "each extent once");
+    assert!(planned.iter().all(|&e| e >= 10), "what the cache holds is not fetched again");
+    assert!(fetches.iter().all(|f| f.extents().count() <= 64), "pieces of at most 64");
+    assert!(fetches.len() <= 290usize.div_ceil(64) + 3, "{} gets for 290 extents in three segments", fetches.len());
+    for f in &fetches {
+        let mut window = vec![0u8; f.len];
+        let n = life.remote.get_range(&f.name, f.offset, &mut window).unwrap().unwrap();
+        life.store.install(&mut life.cache, f, &window[..n], &mut vec![0u8; EXT]).unwrap();
+    }
+    let gets = life.remote.gets;
+    for e in 0..300 {
+        life.read_check(e).unwrap();
+    }
+    assert_eq!(life.remote.gets, gets, "the window read with no miss");
+    assert!(life.store.ahead(0, 300, 64).is_empty(), "nothing left to fetch");
+}
+
 // Goal: a bounded cache drops only what the store holds: a clean extent
 // leaves and reads back right (fetched again); a dirty one stays, since
 // the cache is its only copy. Method: write, flush and land one extent,

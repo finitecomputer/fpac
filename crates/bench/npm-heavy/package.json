@@ -1,0 +1,25 @@
+{
+  "name": "fpac-npm-heavy",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The npm benchmark's heavy workload (docs/results.md, C): a Next.js app's dependencies and a few heavy libraries, each top-level version pinned (published before 2026-11-05), the tree resolved --before=2026-11-05 into package-lock.json. Installed only in a disposable Cloudflare container.",
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1162.0",
+    "@emotion/react": "11.14.0",
+    "@emotion/styled": "11.14.1",
+    "@mui/material": "9.5.0",
+    "aws-cdk-lib": "2.275.0",
+    "firebase": "13.2.0",
+    "next": "16.4.5",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "eslint": "10.14.0",
+    "eslint-config-next": "16.4.5",
+    "jest": "30.5.2",
+    "typescript": "7.0.2"
+  }
+}

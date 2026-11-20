@@ -33,6 +33,8 @@ const READY_MS_MAX = 120 * 1000;
 // A delete pass lists at most this many pages of 1,000 keys.
 const LIST_PAGES_MAX = 200;
 const INSTANCE = { vcpu: 2, memoryMib: 6144, diskMb: 20000 };
+// The images a start may give the internet (`start`): the npm benchmark's.
+const INTERNET_IMAGES = ["npm"];
 // A disk's size when the driver names none: 20 GB, as a computer's.
 const VOLUME_BYTES_DEFAULT = 20000 * 1024 * 1024 - ((20000 * 1024 * 1024) % 65536);
 const NULL_BYTES_MAX = 1024 * 1024;
@@ -462,9 +464,14 @@ export class FpacSpike extends DurableObject {
     return new Response([101, 204, 205, 304].includes(p.status) ? null : out, { status: p.status, headers: h });
   }
 
-  async start({ disk, image, epoch, volume, env, relay }) {
+  async start({ disk, image, epoch, volume, env, relay, internet }) {
     const c = this.ctx.container;
     if (c.running) throw new Error("a container is running: one at a time");
+    // The npm benchmark's image alone reaches the internet (docs/results.md,
+    // C): a registry install runs its packages' own scripts, so it runs only
+    // in a disposable container, never on the driver's machine. Every other
+    // start has none.
+    if (internet && !INTERNET_IMAGES.includes(image)) throw new Error(`the ${image} image has no internet`);
     const extra = {};
     const names = Object.keys(env || {});
     if (names.length > ENV_VARS_MAX) throw new Error("too many env vars");
@@ -491,7 +498,7 @@ export class FpacSpike extends DurableObject {
     if (relay) {
       for (const host of RELAY_HOSTS) await c.interceptOutboundHttp(host, this.ctx.exports.FpacRelay({ props: { host } }));
     }
-    c.start({ image: ref, enableInternet: false, instance: INSTANCE, env: { ...extra, FPAC_REMOTE: REMOTE_HOST } });
+    c.start({ image: ref, enableInternet: Boolean(internet), instance: INSTANCE, env: { ...extra, FPAC_REMOTE: REMOTE_HOST } });
     c.monitor().catch(() => {});
     if (intercept !== "before the start") await c.interceptOutboundHttp(REMOTE_HOST, egress);
     const started = Date.now() - t0;
@@ -501,7 +508,7 @@ export class FpacSpike extends DurableObject {
     const where = await fetch("https://www.cloudflare.com/cdn-cgi/trace").then((r) => r.text()).then((t) => (/^colo=(\w+)$/m.exec(t) || [])[1] || "unknown", () => "unknown");
     // The image's digest only: its reference names the account.
     const digest = String(ref).split("@")[1] || null;
-    return { version: this.env.VERSION.id, disk, epoch, image, image_digest: digest, intercept, start_call_ms: started, ready, instance: INSTANCE, object_colo: where };
+    return { version: this.env.VERSION.id, disk, epoch, image, image_digest: digest, internet: Boolean(internet), intercept, start_call_ms: started, ready, instance: INSTANCE, object_colo: where };
   }
 
   async until(ms) {

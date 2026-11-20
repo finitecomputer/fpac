@@ -45,6 +45,8 @@ pub struct Progress {
     /// write that finished before it is in the store.
     pub durable_ms: AtomicU64,
     pub head_posted: AtomicBool,
+    /// The shipping runs below the FUSE threads' priority (`behind`).
+    pub behind: AtomicBool,
 }
 
 /// Puts objects, `PUTS_IN_FLIGHT` at a time, each until it lands. A
@@ -242,7 +244,28 @@ struct Ended {
 /// each segment landed as its put ends, and a checkpoint now and then.
 /// Writes go on meanwhile, up to UNSHIPPED_BYTES_MAX unlanded. On a stop
 /// it lets the puts in flight end and leaves the rest to `last`.
+/// The shipping's CPU priority while the disk serves (`nice`): below the
+/// FUSE threads', so a save or a sync is not held behind a segment's build
+/// and puts on a container's two vCPUs (Cloudflare: an office save took
+/// 0.52 ms idle and 12.4 ms beside the shipping, docs/results.md). A sleep's
+/// last flush runs at the daemon's own priority.
+const SHIPPING_NICE: i32 = 10;
+/// Its I/O priority: best effort, the lowest level (7), for its reads of
+/// the cache file.
+const SHIPPING_IOPRIO: i32 = (2 << 13) | 7;
+
+/// Lowers this thread's priorities to the shipping's; the threads it
+/// starts inherit them. Answers whether both were taken.
+fn behind() -> bool {
+    // SAFETY: plain syscalls on the calling thread (`who` 0 is the caller).
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+    let cpu = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, SHIPPING_NICE) } == 0;
+    let io = unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, SHIPPING_IOPRIO) } == 0;
+    cpu && io
+}
+
 pub fn run(disk: Arc<Disk>, p: Arc<Progress>, status: impl Fn(&Disk, &Progress)) {
+    p.behind.store(behind(), Ordering::Relaxed);
     if let Err(e) = first_head(&disk, &p) {
         fence(&disk, &e);
         return;
@@ -351,7 +374,8 @@ fn land(disk: &Disk, p: &Progress, ended: &mut Vec<Ended>, in_flight: &mut usize
     for e in ended.drain(..) {
         *in_flight -= 1;
         e.result?;
-        disk.inner.lock().unwrap().store.landed(e.seq);
+        let cleaned = disk.inner.lock().unwrap().store.landed(e.seq);
+        disk.cleaned(cleaned);
         *since += 1;
         p.segments.fetch_add(1, Ordering::Relaxed);
         p.bytes.fetch_add(e.bytes, Ordering::Relaxed);

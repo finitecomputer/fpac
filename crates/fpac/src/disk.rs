@@ -11,13 +11,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use fpac_device::serve::{Backing, BackingError};
-use fpac_format::limits::{DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
+use fpac_format::limits::{AHEAD_EXTENTS_MAX, AHEAD_PIECE_EXTENTS, DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
 use fpac_remote::Remote;
 use fpac_format::PageRef;
+use fpac_store::evict::{Evictor, Taken, Verdict};
 use fpac_store::{page_name, CacheGate, Fetch, Need, Read, Store, StoreError};
 
 /// Connections kept to the remote, at most: the FUSE threads' and the
@@ -32,6 +33,16 @@ const PACK_WAIT_MS: u64 = 3000;
 /// Tries of one read or write, past which it fails (EIO): a fetch that
 /// moved under it, or a remote that stays down.
 const OP_TRIES_MAX: u32 = 8;
+/// Sequential reads followed at once (docs/design.md, Read-ahead): each
+/// has a window of AHEAD_EXTENTS_MAX kept ahead of it.
+const STREAMS_MAX: usize = 8;
+/// How far apart two reads may be and still be one scan (extents): the
+/// loop device's requests arrive out of order across FUSE threads.
+const STREAM_GAP_EXTENTS: u64 = 8;
+/// Connections one read-ahead window fetches on, and windows in flight at
+/// once across every scan.
+const AHEAD_FETCHES: usize = 8;
+const AHEAD_WINDOWS_MAX: usize = 4;
 
 /// The cache file: one sparse file of the volume's size on the container's
 /// own disk, an extent at `extent * EXTENT_BYTES`; and beside it the
@@ -125,6 +136,11 @@ pub struct Stats {
     pub write_errors: AtomicU64,
     /// Map pages fetched (lazy pages).
     pub page_loads: AtomicU64,
+    /// Read-ahead: windows started, extents they fetched, reads that
+    /// waited for one.
+    pub ahead_windows: AtomicU64,
+    pub ahead_extents: AtomicU64,
+    pub ahead_waits: AtomicU64,
     /// Writes that waited over a millisecond for the lock, and the
     /// longest wait (µs): what a segment's build or a fetch's install
     /// costs the writes beside it.
@@ -135,6 +151,18 @@ pub struct Stats {
 /// The first extents a read waited for the pack to bring, kept for the
 /// pack's event (which of them a larger pack head would have held).
 const WAITED_KEPT: usize = 16;
+
+/// A sequential read being followed: its furthest read, how far its
+/// window reaches (exclusive), and its reads that moved it on.
+#[derive(Debug, Clone, Copy)]
+struct Stream {
+    last: u64,
+    end: u64,
+    seen: u32,
+}
+
+/// What `coming` names for an extent read ahead (not the pack's).
+const AHEAD_MARK: usize = usize::MAX - 1;
 
 /// What wakes the flusher: a stop, or an event (a put that ended, a
 /// writer waiting on a full store).
@@ -164,13 +192,17 @@ pub struct Disk {
     /// Where in the pack the first reads that waited for it found their
     /// extents.
     pub waited: Mutex<Vec<usize>>,
-    /// `--cache-max`, in extents: past it, clean extents leave the cache
-    /// first in, first out. A measurement aid for docs/costs.md (a working
-    /// set larger than the cache), not the product's policy; None keeps
-    /// every extent touched.
-    cache_max: Option<usize>,
-    /// The extents the cache took, in the order it took them, each once.
-    order: Mutex<(std::collections::VecDeque<u64>, std::collections::HashSet<u64>)>,
+    /// The cache's bound, in extents (docs/design.md, The cache): past it,
+    /// clean extents leave as `evict` chooses (S3-FIFO); never one that is
+    /// unshipped or that a write is reading.
+    cache_max: usize,
+    evict: Mutex<Evictor>,
+    /// The sequential reads being followed (`ahead`), and read-ahead
+    /// windows in flight.
+    streams: Mutex<Vec<Stream>>,
+    windows: AtomicU64,
+    /// The disk's own handle, for the read-ahead's threads (`set_me`).
+    me: std::sync::OnceLock<std::sync::Weak<Disk>>,
     /// Extents a partial write is reading first: never dropped between
     /// the fetch of their bytes and the write over them.
     pinned: Mutex<std::collections::HashMap<u64, u32>>,
@@ -181,10 +213,10 @@ pub struct Disk {
 }
 
 impl Disk {
-    pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: Option<u64>) -> std::io::Result<Disk> {
-        let cache_max = cache_max_bytes.map(|b| (b / EXTENT_BYTES as u64) as usize);
+    pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: u64) -> std::io::Result<Disk> {
+        let cache_max = usize::try_from(cache_max_bytes / EXTENT_BYTES as u64).expect("bounded by the volume");
         let reader = cache.reader()?;
-        Ok(Disk { inner: Mutex::new(Inner { store, cache }), reader, cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) })
+        Ok(Disk { inner: Mutex::new(Inner { store, cache }), reader, cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, evict: Mutex::new(Evictor::new(cache_max)), streams: Mutex::new(Vec::new()), windows: AtomicU64::new(0), me: std::sync::OnceLock::new(), pinned: Mutex::new(Default::default()), wake: (Mutex::new(Wake::default()), Condvar::new()), cut_wanted: AtomicBool::new(false) })
     }
 
     /// Extents' bytes from the cache file, without the lock: a write
@@ -230,39 +262,126 @@ impl Disk {
         (g.stop, g.events)
     }
 
-    /// Notes extents the cache just took, then, past `cache_max`, drops
-    /// clean ones, oldest first; never those it just took, which the
-    /// caller is using (a partial write's read, say). Called with the
+    /// Notes extents the cache just took (`how`: used now, or read ahead),
+    /// then, past `cache_max`, drops clean ones as the policy chooses;
+    /// never those it just took, which the caller is using (a partial
+    /// write's read, say), nor one a write has pinned. Called with the
     /// store's lock held.
-    pub(crate) fn took(&self, inner: &mut Inner, extents: impl Iterator<Item = u64>) -> Result<(), StoreError> {
-        let Some(max) = self.cache_max else { return Ok(()) };
-        let mut o = self.order.lock().unwrap();
-        let (queue, queued) = &mut *o;
+    pub(crate) fn took(&self, inner: &mut Inner, extents: impl Iterator<Item = u64>, how: Taken) -> Result<(), StoreError> {
+        self.took_each(inner, extents.map(|e| (e, how)))
+    }
+
+    /// `took`, each extent with its own way in (a fetch's asked extent is
+    /// used now, its read-ahead not yet), in one pass so none of them is
+    /// dropped by the others' arrival.
+    pub(crate) fn took_each(&self, inner: &mut Inner, extents: impl Iterator<Item = (u64, Taken)>) -> Result<(), StoreError> {
+        let mut ev = self.evict.lock().unwrap();
         let mut fresh = std::collections::HashSet::new();
-        for e in extents {
+        for (e, how) in extents {
             fresh.insert(e);
-            if queued.insert(e) {
-                queue.push_back(e);
-            }
+            ev.taken(e, how);
         }
-        // Bounded: one pass over the queue at most.
-        let mut tries = queue.len();
-        while inner.store.cached_extents() > max && tries > 0 {
-            tries -= 1;
-            let Some(e) = queue.pop_front() else { break };
-            if fresh.contains(&e) || self.pinned.lock().unwrap().contains_key(&e) {
-                queue.push_back(e);
-            } else if inner.store.evict(&mut inner.cache, e)? {
-                queued.remove(&e);
+        let pinned = self.pinned.lock().unwrap();
+        // Bounded: each drop lowers the count, and the policy answers None
+        // once nothing it holds may go.
+        while inner.store.cached_extents() > self.cache_max {
+            let store = &inner.store;
+            let verdict = |x: u64| match () {
+                _ if !store.is_cached(x) => Verdict::Gone,
+                _ if fresh.contains(&x) || pinned.contains_key(&x) => Verdict::Keep,
+                // unshipped, or the next pack's: not until it is clean
+                _ if !store.may_leave(x) => Verdict::Park,
+                _ => Verdict::Drop,
+            };
+            let Some(e) = ev.victim(verdict) else { break };
+            if inner.store.evict(&mut inner.cache, e)? {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            } else if inner.store.is_cached(e) {
-                // dirty or shipping: kept, and asked again later
-                queue.push_back(e);
-            } else {
-                queued.remove(&e);
             }
         }
         Ok(())
+    }
+
+    /// Gives the disk its own handle, once it is shared: the read-ahead's
+    /// threads hold it.
+    pub fn set_me(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// Extents whose cut landed are clean: the policy may drop them again.
+    pub fn cleaned(&self, extents: Vec<u64>) {
+        if !extents.is_empty() {
+            self.evict.lock().unwrap().unpark(extents.into_iter());
+        }
+    }
+
+    /// A read of `extent` hit the cache: a use, for the policy.
+    fn used(&self, extent: u64) {
+        self.evict.lock().unwrap().used(extent);
+    }
+
+    /// Follows sequential reads (docs/design.md, Read-ahead): a read next to
+    /// a scan's last moves it on, and once less than half its window is
+    /// ahead of it, the window is extended to AHEAD_EXTENTS_MAX past the
+    /// read, fetched in the background on AHEAD_FETCHES connections. A
+    /// miss far from every scan starts one (it goes ahead from its second
+    /// read). Answers the window to fetch, if any.
+    fn follow(&self, extent: u64, missed: bool) -> Option<(u64, u64)> {
+        let mut st = self.streams.lock().unwrap();
+        let ahead = u64::from(AHEAD_EXTENTS_MAX);
+        if let Some(s) = st.iter_mut().find(|s| extent + STREAM_GAP_EXTENTS >= s.last && extent <= s.last + STREAM_GAP_EXTENTS) {
+            let moved = extent > s.last;
+            s.last = s.last.max(extent);
+            s.seen = s.seen.saturating_add(u32::from(moved));
+            if s.seen >= 1 && s.end < s.last + 1 + ahead / 2 {
+                let from = s.end.max(s.last + 1);
+                s.end = s.last + 1 + ahead;
+                return Some((from, s.end));
+            }
+            return None;
+        }
+        if missed {
+            if st.len() == STREAMS_MAX {
+                st.remove(0);
+            }
+            st.push(Stream { last: extent, end: extent + 1, seen: 0 });
+        }
+        None
+    }
+
+    /// Fetches a read-ahead window: what of it the cache lacks and the map
+    /// places, in pieces of AHEAD_PIECE_EXTENTS on AHEAD_FETCHES
+    /// connections, each installed as it arrives; a read of one waits for
+    /// it rather than fetching it twice. At most AHEAD_WINDOWS_MAX at once.
+    fn ahead(&self, from: u64, to: u64) {
+        let Some(d) = self.me.get().and_then(std::sync::Weak::upgrade) else { return };
+        if self.windows.fetch_add(1, Ordering::SeqCst) >= AHEAD_WINDOWS_MAX as u64 {
+            self.windows.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        std::thread::spawn(move || {
+            let fetches = d.inner.lock().unwrap().store.ahead(from, to, AHEAD_PIECE_EXTENTS as usize);
+            if !fetches.is_empty() {
+                d.stats.ahead_windows.fetch_add(1, Ordering::Relaxed);
+                let all: Vec<u64> = fetches.iter().flat_map(|f| f.extents().collect::<Vec<_>>()).collect();
+                d.expect_pack(all.iter().map(|&e| (e, AHEAD_MARK)));
+                pool(fetches, AHEAD_FETCHES, |f| {
+                    if let Ok(window) = d.get(&f) {
+                        let mut g = d.inner.lock().unwrap();
+                        let ok = {
+                            let Inner { store, cache } = &mut *g;
+                            store.install(cache, &f, &window, &mut vec![0u8; EXTENT_BYTES as usize])
+                        };
+                        if ok.is_ok() {
+                            d.stats.ahead_extents.fetch_add(f.extents().count() as u64, Ordering::Relaxed);
+                        }
+                        let _ = d.took(&mut g, f.extents(), Taken::Ahead);
+                    }
+                    d.arrived(f.extents());
+                });
+                d.arrived(all.into_iter());
+            }
+            d.windows.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     pub fn expect_pack(&self, extents: impl Iterator<Item = (u64, usize)>) {
@@ -281,12 +400,15 @@ impl Disk {
     fn wait_for_pack(&self, extent: u64) {
         let c = self.coming.lock().unwrap();
         if let Some(&at) = c.get(&extent) {
-            self.stats.pack_waits.fetch_add(1, Ordering::Relaxed);
-            let mut w = self.waited.lock().unwrap();
-            if w.len() < WAITED_KEPT {
-                w.push(at);
+            if at == AHEAD_MARK {
+                self.stats.ahead_waits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.stats.pack_waits.fetch_add(1, Ordering::Relaxed);
+                let mut w = self.waited.lock().unwrap();
+                if w.len() < WAITED_KEPT {
+                    w.push(at);
+                }
             }
-            drop(w);
             let _ = self.came.wait_timeout_while(c, Duration::from_millis(PACK_WAIT_MS), |c| c.contains_key(&extent)).unwrap();
         }
     }
@@ -349,7 +471,8 @@ impl Disk {
                         let Inner { store, cache } = &mut *g;
                         store.install(cache, &f, &window, buf)?
                     };
-                    self.took(&mut g, f.extents())?;
+                    // the one asked for is used now; its read-ahead is not yet
+                    self.took_each(&mut g, f.extents().enumerate().map(|(i, e)| (e, if i == 0 { Taken::Used } else { Taken::Ahead })))?;
                     if installed {
                         return Ok(());
                     }
@@ -368,14 +491,27 @@ impl Disk {
     pub fn read_extent(&self, extent: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         self.wait_for_pack(extent);
         let mut last = None;
+        let mut first = true;
         for _ in 0..OP_TRIES_MAX {
-            let plan = {
+            let (plan, cached) = {
                 let mut g = self.inner.lock().unwrap();
                 let Inner { store, cache } = &mut *g;
-                store.read_local(cache, extent, buf)?
+                let cached = store.is_cached(extent);
+                (store.read_local(cache, extent, buf)?, cached)
             };
+            if first {
+                first = false;
+                if let Some((from, to)) = self.follow(extent, !matches!(plan, Read::Done)) {
+                    self.ahead(from, to);
+                }
+            }
             match plan {
-                Read::Done => return Ok(()),
+                Read::Done => {
+                    if cached {
+                        self.used(extent);
+                    }
+                    return Ok(());
+                }
                 Read::Fetch(f) => match self.fetch(f, buf) {
                     Ok(()) => return Ok(()),
                     // the extent moved while it was fetched: plan again
@@ -431,7 +567,7 @@ impl Disk {
                         }
                         other => {
                             let need = other?;
-                            self.took(&mut g, std::iter::once(extent))?;
+                            self.took(&mut g, std::iter::once(extent), Taken::Used)?;
                             break need;
                         }
                     }
@@ -539,6 +675,27 @@ impl Backing for Disk {
         }
         Ok(())
     }
+}
+
+/// Runs `jobs` on at most `workers` threads, in order of start, each
+/// answer in its job's place.
+pub fn pool<T: Send, R: Send>(jobs: Vec<T>, workers: usize, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let n = jobs.len();
+    let jobs = std::sync::Mutex::new(jobs.into_iter().enumerate().collect::<std::collections::VecDeque<_>>());
+    let out = std::sync::Mutex::new((0..n).map(|_| None).collect::<Vec<Option<R>>>());
+    std::thread::scope(|s| {
+        for _ in 0..workers.min(n) {
+            s.spawn(|| {
+                // Bounded by the jobs.
+                loop {
+                    let Some((i, job)) = jobs.lock().unwrap().pop_front() else { break };
+                    let r = f(job);
+                    out.lock().unwrap()[i] = Some(r);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap().into_iter().map(|r| r.expect("every job ran")).collect()
 }
 
 #[cfg(test)]
