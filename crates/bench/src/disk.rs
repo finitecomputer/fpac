@@ -241,7 +241,7 @@ impl Cloudflare {
                 if code != 0 {
                     return Err(format!("the cleaner: {out}"));
                 }
-                json!({ "start": start, "segments_listed": sizes.lines().count(), "out": guest_last_json(&out)?, "exec_ms": t0.elapsed().as_millis() as u64 })
+                json!({ "start": start, "segments_listed": sizes.lines().count(), "out": guest_event(&out, "cleaned")?, "exec_ms": t0.elapsed().as_millis() as u64 })
             }
             Some(after) => {
                 self.sh(&format!("setsid nohup {run} > /tmp/clean.log 2>&1 < /dev/null & echo started"))?;
@@ -321,9 +321,9 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string())).collect()
 }
 
-/// The last line of a guest's output that is JSON.
-fn guest_last_json(out: &str) -> Result<Value, String> {
-    out.lines().rev().find_map(|l| serde_json::from_str::<Value>(l).ok()).ok_or_else(|| format!("no JSON in: {out}"))
+/// The line of a guest's output that is the JSON event `name`.
+fn guest_event(out: &str, name: &str) -> Result<Value, String> {
+    out.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["fpac"] == name).ok_or_else(|| format!("no {name} in: {out}"))
 }
 
 impl Place for Cloudflare {
