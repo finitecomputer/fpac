@@ -1,6 +1,6 @@
 {
   "evidence": "clean",
-  "note": "cloudflare: a fpac-spike container per life against R2. krun-before and krun-after: a krun microVM per life against the folder remote, R2's costs modelled (90 ms an object call, puts sharing 50 MB/s), the same scenario before and after compaction read each segment it moves in one ranged get.",
+  "note": "cloudflare: a fpac-spike container per life against R2. krun-before and krun-after: a krun microVM per life against the folder remote, R2's costs modelled (90 ms an object call, puts sharing 50 MB/s), the same scenario before and after compaction read each segment it moves in one ranged get; krun-sealed, the same as krun-after on a sealed disk, its cleaner holding the key.",
   "places": {
     "cloudflare": {
       "bulk_data_deleted": {
@@ -845,6 +845,278 @@
         "objects": 190
       },
       "sealed": false,
+      "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's), puts sharing 50 MB/s (the rate a Cloudflare container sustained to R2): a STAND-IN for the route and for R2"
+    },
+    "krun-sealed": {
+      "bulk_data_deleted": "the folder removed",
+      "check_after_deletes": {
+        "mounted_ms": 233.005602,
+        "opened": {
+          "disk": "disk",
+          "epoch": 8,
+          "extents_mapped": 187,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 192.957304,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 3,
+              "failed": 0,
+              "ms": 99.47413
+            }
+          ],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "big-ok\nfiles-ok\nsqlite-ok\nrows-ok\ngit-ok\nhead-ok\nfsck-ok\n",
+        "sleep_ms": 9128,
+        "start": {
+          "engine_ready_us": 173691,
+          "start_ms": 173.87283200000002
+        }
+      },
+      "check_after_the_kill": {
+        "mounted_ms": 261.949339,
+        "opened": {
+          "disk": "disk",
+          "epoch": 4,
+          "extents_mapped": 8475,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 208.845202,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 29,
+              "failed": 0,
+              "ms": 115.066277
+            }
+          ],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "big-ok\nfiles-ok\nsqlite-ok\nrows-ok\ngit-ok\nhead-ok\nfsck-ok\n",
+        "sleep_ms": 2847,
+        "start": {
+          "engine_ready_us": 143505,
+          "start_ms": 143.71505200000001
+        }
+      },
+      "cleaner": {
+        "exec_ms": 15649,
+        "out": {
+          "disk": "disk",
+          "epoch": 5,
+          "extents_moved": 2056,
+          "fpac": "cleaned",
+          "head": "5 5 1 c886190fce448ed0c4e57e5b0ac32b3e8c56b754ce97367fe960642768d294c5 clean",
+          "live_after": 72,
+          "live_before": 121,
+          "memory_locked": true,
+          "ms": 15647.109479,
+          "posts": [
+            {
+              "head": "5 4 1 528db89ab05b48f01528248f4142d2131baef7c5656ca192961fc18c20ddaaf7",
+              "taken": true
+            },
+            {
+              "head": "5 5 1 c886190fce448ed0c4e57e5b0ac32b3e8c56b754ce97367fe960642768d294c5 clean",
+              "taken": true
+            }
+          ],
+          "sealed": true,
+          "segments_compacted": 66,
+          "segments_listed": 126
+        },
+        "segments_listed": 126,
+        "start": {
+          "engine_ready_us": 164201,
+          "start_ms": 164.415369
+        }
+      },
+      "cleaner_killed": {
+        "finished_before_the_kill": false,
+        "killed_after_ms": 5000,
+        "log": "{\"fpac\":\"clean-head\",\"head\":\"3 2 1 4e451115ca7b10a407e0349193fdebb569c4196392c4c34b3df57f7919eabc6f\",\"ms\":1181.04783,\"taken\":true}\n",
+        "start": {
+          "engine_ready_us": 179700,
+          "start_ms": 179.94517900000002
+        }
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "fdaae272958c"
+      },
+      "deletes": {
+        "absent": 0,
+        "age_ms_min": 0,
+        "deleted": 89,
+        "deleted_bytes": 740981132,
+        "head": "7 7 1 b7dc4fe7bbac178e4a44f7d69bf25fb39b340a4efca5a7b3cf8cc66829e501fd clean",
+        "kept_checkpoints": [
+          "e5/c1",
+          "e6/c1",
+          "e7/c1"
+        ],
+        "ms": 6,
+        "objects_listed": 193,
+        "planned": 89,
+        "planned_by_kind": {
+          "checkpoints": 3,
+          "packs": 2,
+          "pages": 13,
+          "segments": 71
+        },
+        "planned_bytes": 740981132,
+        "young": 0
+      },
+      "life1": {
+        "mounted_ms": 72.706321,
+        "opened": {
+          "disk": "disk",
+          "epoch": 1,
+          "extents_mapped": 0,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 6.827434,
+          "new": true,
+          "pages": 0,
+          "replayed": 0,
+          "rounds": [],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "wal\nwritten\nwritten\n",
+        "sleep_ms": 22038,
+        "start": {
+          "engine_ready_us": 954846,
+          "start_ms": 955.192142
+        }
+      },
+      "life2": {
+        "mounted_ms": 425.026738,
+        "opened": {
+          "disk": "disk",
+          "epoch": 2,
+          "extents_mapped": 8479,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 209.216571,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 20,
+              "failed": 0,
+              "ms": 115.073107
+            }
+          ],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "rewritten\n",
+        "sleep_ms": 7436,
+        "start": {
+          "engine_ready_us": 623932,
+          "start_ms": 624.243681
+        }
+      },
+      "life_after_1": {
+        "mounted_ms": 236.65497,
+        "opened": {
+          "disk": "disk",
+          "epoch": 6,
+          "extents_mapped": 0,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 192.043306,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 1,
+              "failed": 0,
+              "ms": 100.00979
+            }
+          ],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "noted\n",
+        "sleep_ms": 508,
+        "start": {
+          "engine_ready_us": 135491,
+          "start_ms": 135.71782299999998
+        }
+      },
+      "life_after_2": {
+        "mounted_ms": 236.9111,
+        "opened": {
+          "disk": "disk",
+          "epoch": 7,
+          "extents_mapped": 154,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 191.820456,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 3,
+              "failed": 0,
+              "ms": 98.98218
+            }
+          ],
+          "sealed": true,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "noted\n",
+        "sleep_ms": 508,
+        "start": {
+          "engine_ready_us": 185763,
+          "start_ms": 185.998005
+        }
+      },
+      "measured_at_ms": 1795190358209,
+      "objects_after_compaction": {
+        "bytes": 1399483752,
+        "objects": 183
+      },
+      "objects_after_deletes": {
+        "bytes": 664955364,
+        "objects": 104
+      },
+      "objects_after_the_kill": {
+        "bytes": 1264312852,
+        "objects": 159
+      },
+      "objects_at_end": {
+        "bytes": 766373992,
+        "objects": 113
+      },
+      "objects_before": {
+        "bytes": 1162827808,
+        "objects": 150
+      },
+      "objects_before_deletes": {
+        "bytes": 1405936496,
+        "objects": 193
+      },
+      "sealed": true,
       "what": "a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine, each object call delayed 90 ms (as R2's), puts sharing 50 MB/s (the rate a Cloudflare container sustained to R2): a STAND-IN for the route and for R2"
     }
   }

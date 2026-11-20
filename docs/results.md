@@ -374,6 +374,28 @@ failed before the change). What is left of the 14 s is the new segments'
 puts (128 MiB at 50 MB/s) and a round trip per segment; gets in
 parallel would take a few seconds more off. **Passes.**
 
+### Leftover 3. A sealed disk's compaction (`clean.json`, krun)
+
+Compaction refused a sealed disk: its pages and images are sealed. Now a
+cleaner life holds the disk's key, handed to it at its start as to any
+life (`fpac clean --key-file`; read, removed, kept in locked memory); one
+without the key is refused at its open, before it posts anything. The
+delete pass still plans without the key (a sealed checkpoint is
+authenticated, not sealed). The same cleaner's run, sealed, on krun with
+R2's costs modelled (`fdaae27`):
+
+| | Plain (`85d99b9`) | Sealed |
+| -- | --: | --: |
+| A pass: extents moved, segments | 2,056 from 66 | 2,056 from 66 |
+| Its time | 14.2 s | 15.6 s |
+| Killed 5 s in, then the next life | all checked | all checked |
+| The delete pass; the store | 89 objects; 1,406 → 665 MB | 89 objects; 1,406 → 665 MB |
+| The life after the deletes | all checked | all checked |
+
+The simulator runs the plain disk's compaction and delete pass sealed,
+after a keyless cleaner it refuses; it failed before the change ("a
+sealed disk is compacted by its guest"). **Passes.**
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -396,8 +418,6 @@ parallel would take a few seconds more off. **Passes.**
 8. **The cleaner in the platform's Worker**: the remote gate over the R2
    binding, compaction as a Durable Object's alarm after a sleep, the
    delete pass from the stored head. Fragment's cell, two PRs.
-9. **A sealed disk's compaction**, by a life that holds its key (its
-   pages are sealed). One PR.
 
 ## Gaps
 

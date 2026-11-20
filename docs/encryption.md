@@ -52,8 +52,10 @@ disk keeps, with their checksums and its own place in the chain, all of
 it object names or hashes of ciphertext. Kept readable and authenticated
 by the key, it lets the platform's cleaner plan deletes from it without
 the key (item 6), and the guest still refuses one changed in any byte.
-What the cleaner cannot do on a sealed disk is compact: that reads the
-sealed map pages and images, so it is the guest's to do.
+Compaction reads and rewrites the sealed map pages and images, so a
+sealed disk's cleaner life holds its key: the platform hands it over at
+the cleaner's start as at any other (The key, below), and the life keeps
+it in locked memory. Without it, the cleaner is refused at its open.
 
 **What a read checks.** A fetched image opens at its place, and its tag
 must be the one the map names: the tag replaces sum64, and a wrong ranged

@@ -204,8 +204,12 @@ segments, ships them, checkpoints and posts a clean head. The old
 segments are named by no checkpoint after that one. Every rule of a life
 holds, so a cleaner stopped anywhere leaves a disk that opens (the
 simulator stops one at every step; on Cloudflare one was killed
-mid-pass and the next life found every file). A sealed disk is not
-compacted here: its pages are sealed, so that is its guest's to do.
+mid-pass and the next life found every file). A sealed disk's pages and
+images are sealed, so its cleaner life holds its key, handed to it at its
+start as to any life of the disk (`fpac clean --key-file`; encryption.md,
+The key); in a TEE it is an attested container like the disk's others. A
+cleaner without the key is refused at its open, before it posts
+anything.
 
 It is made to run in the platform's Worker, beside R2, so its reads and
 rewrites pay no container egress: the store has no clock, thread or file
