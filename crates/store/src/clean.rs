@@ -12,8 +12,9 @@
 //!   checkpoint. Every rule of a life holds, so a crash anywhere leaves a
 //!   disk that opens (each cut is whole). It runs where its rewrites pay
 //!   no container egress: the platform's Worker in the product, through
-//!   the same gate. A sealed disk is not compacted here: its map pages
-//!   are sealed (docs/encryption.md), so that is the guest's to do.
+//!   the same gate. A sealed disk's cleaner life holds its key, as any
+//!   life of it does (its pages and images are sealed,
+//!   docs/encryption.md); one without the key is refused at its open.
 //! - **Deletes** (`fpac_format::plan_deletes`): planned from the stored
 //!   head and the checkpoints kept before it, of objects at least
 //!   CLEAN_AGE_MS_MIN old, at the platform's own pace (`kept_checkpoints`).
@@ -68,9 +69,6 @@ pub struct Compacted {
 pub fn compact(remote: &mut dyn RemoteGate, info: &OpenInfo, sizes: &BTreeMap<SegId, u64>, budget: u64, mut post: impl FnMut(&Head) -> bool) -> Result<Compacted, StoreError> {
     assert!(budget <= COMPACT_BYTES_MAX);
     let mut s = Store::open(remote, info)?;
-    if s.sealed() {
-        return Err(StoreError::Refused("a sealed disk is compacted by its guest: its map pages are sealed".into()));
-    }
     let mut cache = MemCache::default();
     // this life's head first, as every life's
     let (objs, head) = s.prepare_head();
@@ -97,7 +95,9 @@ pub fn compact(remote: &mut dyn RemoteGate, info: &OpenInfo, sizes: &BTreeMap<Se
         }
     }
     // the mostly dead, the emptiest first, within the budget
-    let images = |seg: &SegId| sizes.get(seg).map(|b| b.saturating_sub(u64::from(SEGMENT_FIXED_BYTES)) / u64::from(EXTENT_BYTES)).unwrap_or(0);
+    // a segment's images, from its size (a sealed image carries its tag)
+    let stride = u64::from(s.stride());
+    let images = |seg: &SegId| sizes.get(seg).map(|b| b.saturating_sub(u64::from(SEGMENT_FIXED_BYTES)) / stride).unwrap_or(0);
     let mut chosen: Vec<(SegId, Vec<u64>)> = live.into_iter().filter(|(seg, ext)| seg.epoch != info.epoch && images(seg) > 0 && (ext.len() as u64) * 100 < images(seg) * COMPACT_LIVE_PERCENT_MAX).collect();
     chosen.sort_by_key(|(seg, ext)| ((ext.len() as u64) * 1000 / images(seg).max(1), *seg));
     let mut moved = 0u64;

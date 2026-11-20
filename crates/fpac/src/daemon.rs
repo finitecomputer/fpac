@@ -67,8 +67,10 @@ fn event(t0: Instant, what: &str, extra: Value) {
 }
 
 /// One compaction pass as the cleaner's life (`fpac clean`).
-fn clean(host: &str, port: u16, sizes: &Path, budget: u64) -> Result<Value, String> {
+fn clean(host: &str, port: u16, sizes: &Path, budget: u64, key: Option<[u8; 32]>) -> Result<Value, String> {
     let t0 = Instant::now();
+    // a sealed disk's key stays in locked memory, as a mount's does
+    let locked = key.is_some() && lock_memory();
     let text = std::fs::read_to_string(sizes).map_err(|e| format!("{}: {e}", sizes.display()))?;
     let mut map = std::collections::BTreeMap::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -78,7 +80,8 @@ fn clean(host: &str, port: u16, sizes: &Path, budget: u64) -> Result<Value, Stri
     }
     let mut r = Remote::new(host, port);
     let o = r.open().map_err(|e| format!("the open: {e}"))?;
-    let info = OpenInfo { epoch: o.epoch, volume_bytes: o.volume_bytes - o.volume_bytes % EXTENT_BYTES as u64, head: o.head, seal: None };
+    let seal = key.map(|k| Arc::new(fpac_format::Sealer::new(&k, &o.disk)));
+    let info = OpenInfo { epoch: o.epoch, volume_bytes: o.volume_bytes - o.volume_bytes % EXTENT_BYTES as u64, head: o.head, seal };
     let mut posts = Vec::new();
     let c = {
         let mut gate = Remote::new(host, port);
@@ -91,7 +94,7 @@ fn clean(host: &str, port: u16, sizes: &Path, budget: u64) -> Result<Value, Stri
         })
         .map_err(|e| e.to_string())?
     };
-    Ok(json!({ "fpac": "cleaned", "disk": o.disk, "epoch": o.epoch, "segments_listed": map.len(), "live_before": c.live_before, "live_after": c.live_after, "segments_compacted": c.segments_compacted, "extents_moved": c.extents_moved, "head": c.head.encode(), "posts": posts, "ms": t0.elapsed().as_secs_f64() * 1000.0 }))
+    Ok(json!({ "fpac": "cleaned", "disk": o.disk, "epoch": o.epoch, "segments_listed": map.len(), "live_before": c.live_before, "live_after": c.live_after, "segments_compacted": c.segments_compacted, "extents_moved": c.extents_moved, "head": c.head.encode(), "posts": posts, "sealed": key.is_some(), "memory_locked": locked, "ms": t0.elapsed().as_secs_f64() * 1000.0 }))
 }
 
 /// A disk's data key from its file: 64 hex digits, a newline allowed. The
@@ -140,11 +143,14 @@ pub fn main() {
         // ends with a clean head. `--sizes` names a file of the segments'
         // sizes ("<epoch> <seq> <bytes>" a line), from the platform's
         // listing (the guest cannot list).
+        // `--key-file`: a sealed disk's key, as a mount takes it.
         Some("clean") => {
             let host = arg(&args, "--host").unwrap_or_else(|| REMOTE_HOST.into());
             let port: u16 = arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(80);
             let budget: u64 = arg(&args, "--budget-bytes").and_then(|b| b.parse().ok()).unwrap_or(fpac_store::clean::COMPACT_BYTES_MAX).min(fpac_store::clean::COMPACT_BYTES_MAX);
-            match arg(&args, "--sizes").ok_or_else(|| "--sizes <file>".to_string()).and_then(|f| clean(&host, port, Path::new(&f), budget)) {
+            // a sealed disk's cleaner holds its key (docs/encryption.md)
+            let key = arg(&args, "--key-file").map(|p| read_key(Path::new(&p))).transpose();
+            match key.and_then(|key| arg(&args, "--sizes").ok_or_else(|| "--sizes <file>".to_string()).and_then(|f| clean(&host, port, Path::new(&f), budget, key))) {
                 Ok(v) => println!("{v}"),
                 Err(e) => {
                     eprintln!("{}", json!({ "fpac": "error", "why": e }));
@@ -160,7 +166,7 @@ pub fn main() {
             }
         },
         _ => {
-            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] [--cache-max bytes] [--key-file path] | fpac clean --sizes file [--host h] [--port p] [--budget-bytes n] | fpac status [--state dir]");
+            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] [--cache-max bytes] [--key-file path] | fpac clean --sizes file [--host h] [--port p] [--budget-bytes n] [--key-file path] | fpac status [--state dir]");
             std::process::exit(2);
         }
     }

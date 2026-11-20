@@ -704,32 +704,61 @@ fn segment_sizes(remote: &SimRemote) -> BTreeMap<format::SegId, u64> {
 // ones and keeps every byte: the next life reads what the model says, the
 // live list is shorter, and a delete pass planned from the kept
 // checkpoints removes the dead segments and leaves a disk that still opens
-// and reads every extent. Method: a disk with garbage, compacted by a life
-// of the platform's, then a delete pass, each followed by a life that
-// reads all 400 extents.
+// and reads every extent; each segment it moves is read in one ranged get
+// (40 gets for 4 segments when it read run by run). Method: a disk with
+// garbage, a tenth live and scattered, compacted by a life of the
+// platform's, then a delete pass, each followed by a life that reads all
+// 400 extents.
 #[test]
 fn compaction_keeps_every_byte_and_lets_the_dead_go() {
-    let mut remote = SimRemote::new(17, CALM);
+    compacted_and_cleaned(17, None);
+}
+
+// Goal: a sealed disk is compacted by a cleaner life that holds its key,
+// as a plain one is (every byte kept, the dead let go, one ranged get per
+// segment), and a cleaner without the key is refused at its open, before
+// it posts anything. Method: the same run as the plain one, sealed, after
+// a compaction without the key.
+#[test]
+fn a_sealed_disk_is_compacted_by_a_life_with_its_key() {
+    compacted_and_cleaned(20, Some(std::sync::Arc::new(Sealer::new(&[9u8; 32], "sim"))));
+}
+
+/// A disk with garbage, compacted by a life of the platform's, then a
+/// delete pass, each followed by a life that reads all 400 extents.
+fn compacted_and_cleaned(seed: u64, seal: Option<std::sync::Arc<Sealer>>) {
+    let mut remote = SimRemote::new(seed, CALM);
+    remote.seal = seal.clone();
     let mut platform = Platform { head: None, running: 0 };
     let exp = disk_with_garbage(&mut remote, &mut platform);
     let sizes = segment_sizes(&remote);
-    platform.running = 2;
-    let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
-    let c = fpac_store::clean::compact(&mut remote, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
-    assert!(c.segments_compacted >= 1 && c.extents_moved >= 10, "{c:?}");
-    assert!(c.live_after < c.live_before, "{c:?}");
+    if seal.is_some() {
+        platform.running = 2;
+        let head = platform.head;
+        let without = OpenInfo { epoch: 2, volume_bytes: VOLUME, head, seal: None };
+        let r = fpac_store::clean::compact(&mut remote, &without, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h));
+        assert!(r.is_err(), "a cleaner without the key");
+        assert_eq!(platform.head, head, "it posted nothing");
+    }
     platform.running = 3;
-    let mut life = open(&mut remote, &mut platform, 3, exp.clone(), u64::MAX);
+    let info = OpenInfo { epoch: 3, volume_bytes: VOLUME, head: platform.head, seal: seal.clone() };
+    let mut gate = Stopping { inner: &mut remote, left: u64::MAX, ranged: 0 };
+    let c = fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
+    assert!(c.segments_compacted >= 2 && c.extents_moved >= 20, "{c:?}");
+    assert!(c.live_after < c.live_before, "{c:?}");
+    assert_eq!(gate.ranged, c.segments_compacted as u64, "one ranged get per segment moved: {c:?}");
+    platform.running = 4;
+    let mut life = open(&mut remote, &mut platform, 4, exp.clone(), u64::MAX);
     for e in 0..400 {
         life.read_check(e).unwrap();
     }
     // two more lives write and sleep: the checkpoints that named the dead
     // segments leave the kept window (KEPT_CHECKPOINTS)
     let mut exp = exp;
-    for epoch in [3u64, 4] {
-        if epoch == 4 {
-            platform.running = 4;
-            life = open(&mut remote, &mut platform, 4, exp.clone(), u64::MAX);
+    for epoch in [4u64, 5] {
+        if epoch == 5 {
+            platform.running = 5;
+            life = open(&mut remote, &mut platform, 5, exp.clone(), u64::MAX);
         }
         life.post_head().unwrap();
         let b = content(5000 + epoch);
@@ -739,7 +768,8 @@ fn compaction_keeps_every_byte_and_lets_the_dead_go() {
         exp = life.model.after_crash(life.remote);
     }
     drop(life);
-    // the delete pass: the stored head, its kept checkpoints, a day old
+    // the delete pass: the stored head, its kept checkpoints (a sealed
+    // disk's are authenticated, read without the key), a day old
     let head = platform.head.unwrap();
     let names: Vec<String> = remote.objects.keys().cloned().collect();
     let kept: Vec<format::Checkpoint> = fpac_store::clean::kept_checkpoints(&head, &names).into_iter().map(|(e, q)| fpac_store::clean::read_checkpoint(&remote.objects[&format::checkpoint_name(e, q)]).unwrap()).collect();
@@ -750,8 +780,8 @@ fn compaction_keeps_every_byte_and_lets_the_dead_go() {
     for n in &gone {
         remote.objects.remove(n);
     }
-    platform.running = 5;
-    let mut life = open(&mut remote, &mut platform, 5, exp, u64::MAX);
+    platform.running = 6;
+    let mut life = open(&mut remote, &mut platform, 6, exp, u64::MAX);
     for e in 0..400 {
         life.read_check(e).unwrap();
     }
@@ -788,30 +818,6 @@ impl RemoteGate for Stopping<'_> {
     fn put(&mut self, name: &str, body: &[u8]) -> Result<Put, RemoteError> {
         self.take()?;
         self.inner.put(name, body)
-    }
-}
-
-// Goal: compaction reads each segment it moves in one ranged get, not one
-// per run of live extents (a round trip to R2 each). Method: a disk whose
-// old segments are a tenth live, every tenth extent, so no two live
-// extents lie side by side; compaction's ranged gets counted, then a life
-// that reads all 400 extents.
-#[test]
-fn compaction_reads_each_segment_it_moves_once() {
-    let mut remote = SimRemote::new(19, CALM);
-    let mut platform = Platform { head: None, running: 0 };
-    let exp = disk_with_garbage(&mut remote, &mut platform);
-    let sizes = segment_sizes(&remote);
-    platform.running = 2;
-    let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None };
-    let mut gate = Stopping { inner: &mut remote, left: u64::MAX, ranged: 0 };
-    let c = fpac_store::clean::compact(&mut gate, &info, &sizes, fpac_store::clean::COMPACT_BYTES_MAX, |h| platform.post(h)).unwrap();
-    assert!(c.segments_compacted >= 2 && c.extents_moved >= 20, "{c:?}");
-    assert_eq!(gate.ranged, c.segments_compacted as u64, "one ranged get per segment moved: {c:?}");
-    platform.running = 3;
-    let mut life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
-    for e in 0..400 {
-        life.read_check(e).unwrap();
     }
 }
 
