@@ -1,17 +1,18 @@
-# Results after the spike: items 1 to 5, 1b and 7
+# Results after the spike: the queued items
 
 The spike (docs/spike.md) ended at P5. This file is the queued work after
 it, item by item, and every line of design.md's "Benchmarks to match"
 (section 10 of the plan) as it stands now: pass or fail, where, and from
-which evidence file. Items 6 (the cleaner) and 8 (the release binary),
-and the two added after item 7 (A: sealed disks, docs/encryption.md; B:
-fuzzing, fuzz/README.md), come after.
+which evidence file. Then the items added after item 7: C and D, A
+(sealed disks, docs/encryption.md) and B (fuzzing, fuzz/README.md); then
+6 (the cleaner).
 
 **What ran where.** Cloudflare: the stand-in Worker `fpac-spike`'s
 containers (2 vCPU, 6 GiB, 20 GB) and R2, items 1 to 5 and 7 on commit
 `aa3ac0c` (deployed as version `aacc5ef1`), 1b on `4da6478` (`c0b8c13f`),
-the tools line and C on `7384d39` and `d1df490` (`e4e2af69`, `7dd38af0`);
-each evidence place names its commit.
+the tools line and C on `7384d39` and `d1df490` (`e4e2af69`, `7dd38af0`),
+A on `55ca5a6` (`0dbdd213`), 6 on `8cca53f` (`aba127c8`); each evidence
+place names its commit.
 krun: a microVM per life (2 vCPU, 6 GiB, 20 GB) on this machine, the
 folder remote as the store, with R2's costs added where it says "R2
 modelled" (90 ms on each object call, puts sharing 50 MB/s, the rate a
@@ -255,6 +256,59 @@ platform would take that to the copy alone).
 docs/large-disks.md: the options with their numbers, and a
 recommendation.
 
+### A. Sealed disks (`encryption.json`)
+
+Built (AES-256-GCM-SIV, every object and the cache file; a checkpoint
+authenticated, not sealed, as decided) and measured plain against sealed
+on the same build, on krun and on Cloudflare. **Passes**: what a person
+feels barely moves.
+
+| On Cloudflare | Plain | Sealed |
+| -- | --: | --: |
+| The cipher, one core (seal, 64 KiB) | – | 2.2 GB/s (5.1 on this machine) |
+| 4 KiB write + `O_SYNC`, p50 | 0.12 ms | 0.21 ms |
+| Office save at rest, p50 | 0.54 ms | 0.73 ms |
+| SQLite 10k transactions, `FULL` | 4.1 s | 6.2 s |
+| 4 GiB written with fsync; shipped behind it | 318; 103 MB/s | 273; 97 MB/s |
+| Daemon CPU per GB shipped (user) | 2.8 s | 4.2 s |
+| A wake to the boot read done, 1 GB, p50 | 1,989 ms | 1,907 ms |
+| Lives killed at random, then checked | – | 10 of 10 (20 of 20 on krun) |
+
+Two size bugs it found are fixed with tests (a full sealed pack past the
+object limit; a full sealed page past the page limit). What a TEE would
+still need (rollback, sizes and patterns) is in encryption.md.
+
+### B. Fuzzing (`fuzz/`)
+
+Four cargo-fuzz targets, one per gate where bytes FPAC did not make come
+in: `format` (objects as R2 hands them back), `fuse` (requests from
+`/dev/fuse`), `http` (the remote's answers), `head` (the head's wire form
+and the rules that move it). Each ran 20 minutes on this machine with no
+finding, and each found its planted bug (fuzz/README.md). CI runs each for
+30 seconds on every push. **Passes.**
+
+### 6. The cleaner (`clean.json`)
+
+Compaction, a life of the platform's own, and deletes planned from the
+stored head and the checkpoints kept before it (design.md, The cleaner).
+On Cloudflare, a disk with 512 MiB of files three quarters rewritten in
+place (1.2 GB stored):
+
+| | |
+| -- | -- |
+| A cleaner killed 30 s into its pass (its first head taken) | the next life: every file, SQLite, git and `e2fsck -f -n` checked |
+| A pass to its end | 2,056 extents (128 MiB) moved out of 69 segments; live segments 126 → 73; 65 s |
+| The delete pass, two lives later | 98 objects (742 MB) deleted, planned in 2 s; the store 1,407 → 666 MB |
+| The life after the deletes | every file, SQLite, git and `e2fsck -f -n` checked |
+
+The simulator stops a cleaner at every step and opens the disk after
+each; a delete plan that keeps too little fails its test (a planted one
+did). **Passes**, slowly: the pass reads one extent at a time.
+
+The store builds for `wasm32-unknown-unknown`, the platform's Worker's
+target, so compaction can run there, beside R2, with no container egress.
+On this spike it runs as `fpac clean` in a small container.
+
 ## Leftovers, as PRs (FPAC's repo unless named)
 
 1. **The office save and the sequential write beside the shipping, on
@@ -274,9 +328,13 @@ recommendation.
    (plan PR list).
 7. **The harness's 19th Hermes start that never replied** (outside this
    repository).
-8. Next, in this order: A (sealed disks measured on Cloudflare, then
-   merged; built and measured on krun), B (the fuzz targets, merged; done
-   on its branch), 6 (the cleaner) and 8 (the release binary).
+8. **Compaction reads each segment whole** (one get, its live extents
+   taken from it), not one extent at a time: 65 s for 128 MiB now. One PR.
+9. **The cleaner in the platform's Worker**: the remote gate over the R2
+   binding, compaction as a Durable Object's alarm after a sleep, the
+   delete pass from the stored head. Fragment's cell, two PRs.
+10. **A sealed disk's compaction**, by a life that holds its key (its
+    pages are sealed). One PR.
 
 ## Gaps
 
