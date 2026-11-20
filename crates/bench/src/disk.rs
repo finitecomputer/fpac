@@ -773,16 +773,12 @@ pub fn room(p: &mut dyn Place, ceiling: u64) -> Result<Value, String> {
 /// past the cache's floor, and the life writes new data. That write must
 /// fail loudly: the program sees "No space left on device", and the
 /// daemon counts and logs a typed no-space error, unfenced. Then the room
-/// comes back, the sleep ships everything, and the next life finds every
-/// acknowledged file.
+/// comes back, the sleep ships everything, and the next life, its disk
+/// filled again before it reads, finds every acknowledged file: reads of
+/// extents its cache does not hold go on while the disk is full.
 pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     let st = p.start()?;
-    // the daemon's log and status on a tmpfs: on the disk this fills, they
-    // would stop the moment it is full (the guest's own kernel mounts it)
-    let (code, out) = p.sh("mkdir -p /run/fpac && (mountpoint -q /run/fpac || mount -t tmpfs -o size=64m tmpfs /run/fpac) && echo state-on-tmpfs")?;
-    if code != 0 || !out.contains("state-on-tmpfs") {
-        return Err(format!("the state's tmpfs: {out}"));
-    }
+    state_on_tmpfs(p)?;
     let m = mount(p)?;
     let free = guest_free(p)?;
     // a computer's own disk only, never one this run should not fill
@@ -795,10 +791,7 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     }
     let acked = status(p);
     let (_, t_acked) = p.sh("cut -d' ' -f1 /proc/uptime")?;
-    // every byte: what an unprivileged writer may take, then the root's
-    // reserve, until nothing is left (three rounds, two seconds apart, so
-    // whatever the cache gives back is taken too)
-    let (_, fill) = p.sh("fallocate -l $(df -B1 --output=avail /var/lib/fpac | tail -n 1) /var/lib/ballast; for i in 1 2 3; do dd if=/dev/zero of=/var/lib/ballast-$i bs=1M status=none 2>&1 | tail -n 1; sleep 2; done; echo free-blocks $(stat -f -c %f /var/lib/fpac)")?;
+    let (_, fill) = p.sh(FILL_DISK)?;
     let (_, t_full) = p.sh("cut -d' ' -f1 /proc/uptime")?;
     let (_, new) = p.sh("dd if=/dev/urandom of=/data/new bs=1M count=64 conv=fsync status=none 2>&1; echo exit=$?")?;
     std::thread::sleep(Duration::from_secs(2));
@@ -812,8 +805,12 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     let s1 = sleep(p)?;
     p.kill()?;
     let st2 = p.start()?;
+    state_on_tmpfs(p)?;
     let m2 = mount(p)?;
-    let (_, check) = p.sh("sha256sum -c --quiet /data/acked.sha256 && echo acked-ok")?;
+    let (_, fill2) = p.sh(FILL_DISK)?;
+    let (_, check) = p.sh("sha256sum -c --quiet /data/acked.sha256 2>&1 | tail -n 3; sha256sum -c --quiet /data/acked.sha256 > /dev/null 2>&1 && echo acked-ok")?;
+    let read_while_full = status(p);
+    p.sh("rm -f /var/lib/ballast /var/lib/ballast-*")?;
     let s2 = sleep(p)?;
     p.kill()?;
     let loud = !new.contains("exit=0") && new.contains("No space left on device");
@@ -822,8 +819,24 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     Ok(json!({
         "what": p.what(), "ok": ok, "failed_loudly": loud, "typed": typed,
         "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "kernel": kernel, "daemon_log": daemon, "uptime_acked": t_acked, "uptime_full": t_full, "reread_while_full": reread, "sleep": s1 },
-        "life2": { "start": st2, "mount": m2, "check": check, "sleep": s2 },
+        "life2": { "start": st2, "mount": m2, "fill": fill2, "check_while_full": check, "after": read_while_full, "sleep": s2 },
     }))
+}
+
+/// Every byte of the guest's disk that holds the cache: what an
+/// unprivileged writer may take, then the root's reserve, until nothing is
+/// left (three rounds, two seconds apart, so whatever the cache gives back
+/// is taken too).
+const FILL_DISK: &str = "fallocate -l $(df -B1 --output=avail /var/lib/fpac | tail -n 1) /var/lib/ballast; for i in 1 2 3; do dd if=/dev/zero of=/var/lib/ballast-$i bs=1M status=none 2>&1 | tail -n 1; sleep 2; done; echo free-blocks $(stat -f -c %f /var/lib/fpac)";
+
+/// The daemon's log and status on a tmpfs: on a disk a test fills, they
+/// would stop the moment it is full (the guest's own kernel mounts it).
+fn state_on_tmpfs(p: &dyn Place) -> Result<(), String> {
+    let (code, out) = p.sh("mkdir -p /run/fpac && (mountpoint -q /run/fpac || mount -t tmpfs -o size=64m tmpfs /run/fpac) && echo state-on-tmpfs")?;
+    if code != 0 || !out.contains("state-on-tmpfs") {
+        return Err(format!("the state's tmpfs: {out}"));
+    }
+    Ok(())
 }
 
 /// Rounds of a guest killed mid-write, each next life checked.
