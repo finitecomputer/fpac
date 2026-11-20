@@ -71,12 +71,13 @@ pub fn room_bound(free_bytes: u64, cached_extents: u64, shadow_bytes: u64, ceili
 }
 
 /// The cache file: one sparse file of the volume's size on the container's
-/// own disk, an extent at `extent * EXTENT_BYTES`; and beside it the
+/// own disk, an extent at `extent * EXTENT_BYTES` (a sealed cache's is
+/// twice that: two sides, `CacheSeal`); and beside it the
 /// shadow file, where a frozen extent's bytes as of its cut wait for its
 /// segment's build when a write changes them first, one slot each
 /// (bounded by UNSHIPPED_EXTENTS_MAX), its space freed when taken.
-pub struct FileCache {
-    file: File,
+pub struct FileCache<F: CacheBytes = File> {
+    file: F,
     shadow: File,
     /// Each kept copy's slot, and the seal its bytes were written under.
     slots: std::collections::HashMap<(u64, u64), (u64, Option<Sealed>)>,
@@ -90,18 +91,29 @@ pub struct FileCache {
 /// only its tag and that count stay in memory. The host's disk holds
 /// ciphertext; one that changes it, or hands back an earlier write of the
 /// same extent, fails the open.
+///
+/// A sealed extent is opened whole or not at all, so it is never
+/// overwritten in place: a write that failed partway (a full copy-on-write
+/// disk refuses even an overwrite) would leave neither copy readable, and
+/// the extent may be the only copy of acknowledged bytes. Each extent has
+/// two sides, the second a volume further on; a write goes to the side not
+/// in use, the tag moves to it once it is whole, and only then is the old
+/// side punched.
 struct CacheSeal {
     sealer: Arc<Sealer>,
     life: u64,
     writes: u64,
     tags: std::collections::HashMap<u64, Sealed>,
+    /// Where the second side starts: the volume's size.
+    side_bytes: u64,
 }
 
-/// How an extent's bytes in the cache were sealed.
+/// How an extent's bytes in the cache were sealed, and on which side.
 #[derive(Debug, Clone, Copy)]
 pub struct Sealed {
     generation: u64,
     tag: [u8; 16],
+    side: bool,
 }
 
 /// The key and life a sealed cache's reads open with (a segment's build
@@ -110,9 +122,24 @@ pub struct Sealed {
 pub struct CacheKey {
     sealer: Arc<Sealer>,
     life: u64,
+    side_bytes: u64,
+}
+
+/// Where an extent's bytes lie in the cache file: its side's, when sealed.
+fn cache_at(extent: u64, sealed: Option<Sealed>, side_bytes: u64) -> u64 {
+    let at = extent * EXTENT_BYTES as u64;
+    match sealed {
+        Some(s) if s.side => side_bytes + at,
+        _ => at,
+    }
 }
 
 impl CacheKey {
+    /// Where `extent`, sealed as `sealed` says, lies in the cache file.
+    fn at(&self, extent: u64, sealed: Option<Sealed>) -> u64 {
+        cache_at(extent, sealed, self.side_bytes)
+    }
+
     /// Opens an extent read from the cache file as `sealed` says it was
     /// written; None never written (zeros).
     fn open(&self, extent: u64, sealed: Option<Sealed>, buf: &mut [u8]) -> std::io::Result<()> {
@@ -126,30 +153,57 @@ impl CacheKey {
     }
 }
 
+/// The cache file's bytes: the file itself, or in a test one that fails
+/// as a full copy-on-write disk can (even an overwrite refused partway).
+pub trait CacheBytes: Send {
+    fn get(&self, buf: &mut [u8], at: u64) -> std::io::Result<()>;
+    fn put(&self, buf: &[u8], at: u64) -> std::io::Result<()>;
+    /// The extent at `at` reads as zeros, its room given back.
+    fn punch(&self, at: u64) -> std::io::Result<()>;
+}
+
+impl CacheBytes for File {
+    fn get(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+        self.read_exact_at(buf, at)
+    }
+    fn put(&self, buf: &[u8], at: u64) -> std::io::Result<()> {
+        self.write_all_at(buf, at)
+    }
+    fn punch(&self, at: u64) -> std::io::Result<()> {
+        punch_hole(self, at)
+    }
+}
+
 impl FileCache {
     pub fn create(path: &Path, volume_bytes: u64, seal: Option<(Arc<Sealer>, u64)>) -> std::io::Result<FileCache> {
         let open = |p: &Path| OpenOptions::new().read(true).write(true).create(true).truncate(true).custom_flags(libc::O_CLOEXEC).open(p);
         let file = open(path)?;
-        file.set_len(volume_bytes)?;
-        let shadow = open(&path.with_extension("shadow"))?;
-        let seal = seal.map(|(sealer, life)| CacheSeal { sealer, life, writes: 0, tags: Default::default() });
+        // a sealed cache's two sides (CacheSeal)
+        file.set_len(if seal.is_some() { 2 * volume_bytes } else { volume_bytes })?;
+        FileCache::over(file, open(&path.with_extension("shadow"))?, seal, volume_bytes)
+    }
+
+    /// A second handle on the cache file, for reads outside the lock.
+    pub fn reader(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
+}
+
+impl<F: CacheBytes> FileCache<F> {
+    fn over(file: F, shadow: File, seal: Option<(Arc<Sealer>, u64)>, volume_bytes: u64) -> std::io::Result<FileCache<F>> {
+        let seal = seal.map(|(sealer, life)| CacheSeal { sealer, life, writes: 0, tags: Default::default(), side_bytes: volume_bytes });
         Ok(FileCache { file, shadow, slots: Default::default(), free: Vec::new(), next_slot: 0, seal })
     }
 
     /// The key for reads outside the lock, when the cache is sealed.
     pub fn key(&self) -> Option<CacheKey> {
-        self.seal.as_ref().map(|c| CacheKey { sealer: c.sealer.clone(), life: c.life })
+        self.seal.as_ref().map(|c| CacheKey { sealer: c.sealer.clone(), life: c.life, side_bytes: c.side_bytes })
     }
 
     /// How each extent was last sealed (for reads outside the lock); None
     /// when the cache is plain.
     pub fn seals_of(&self, extents: &[u64]) -> Option<Vec<Option<Sealed>>> {
         self.seal.as_ref().map(|c| extents.iter().map(|e| c.tags.get(e).copied()).collect())
-    }
-
-    /// A second handle on the cache file, for reads outside the lock.
-    pub fn reader(&self) -> std::io::Result<File> {
-        self.file.try_clone()
     }
 
     /// What the shadow file holds now, in bytes.
@@ -169,28 +223,45 @@ fn punch_hole(f: &File, offset: u64) -> std::io::Result<()> {
     }
 }
 
-impl CacheGate for FileCache {
+impl<F: CacheBytes> CacheGate for FileCache<F> {
     fn read(&mut self, extent: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.file.read_exact_at(buf, extent * EXTENT_BYTES as u64)?;
-        match &self.seal {
-            Some(c) => CacheKey { sealer: c.sealer.clone(), life: c.life }.open(extent, c.tags.get(&extent).copied(), buf),
-            None => Ok(()),
+        match self.key() {
+            Some(k) => {
+                let sealed = self.seal.as_ref().and_then(|c| c.tags.get(&extent).copied());
+                self.file.get(buf, k.at(extent, sealed))?;
+                k.open(extent, sealed, buf)
+            }
+            None => self.file.get(buf, extent * EXTENT_BYTES as u64),
         }
     }
     fn write(&mut self, extent: u64, bytes: &[u8]) -> std::io::Result<()> {
-        let at = extent * EXTENT_BYTES as u64;
-        let Some(c) = &mut self.seal else { return self.file.write_all_at(bytes, at) };
+        let Some(c) = &mut self.seal else { return self.file.put(bytes, extent * EXTENT_BYTES as u64) };
+        // the side not in use: the current copy stays whole until this one is
+        let old = c.tags.get(&extent).copied();
+        let side = old.is_some_and(|s| !s.side);
         c.writes += 1;
         let generation = c.writes;
         let mut sealed = bytes.to_vec();
         let tag = c.sealer.seal_detached(Place::Cache { life: c.life, extent, generation }, &mut sealed);
-        self.file.write_all_at(&sealed, at)?;
-        c.tags.insert(extent, Sealed { generation, tag });
+        let new = Sealed { generation, tag, side };
+        let at = cache_at(extent, Some(new), c.side_bytes);
+        if let Err(e) = self.file.put(&sealed, at) {
+            // a part written is nobody's: its room back, if the disk lets
+            let _ = self.file.punch(at);
+            return Err(e);
+        }
+        c.tags.insert(extent, new);
+        if let Some(o) = old {
+            // the old copy's room back; one left is only room, never read
+            let _ = self.file.punch(cache_at(extent, Some(o), c.side_bytes));
+        }
         Ok(())
     }
     fn punch(&mut self, extent: u64) -> std::io::Result<()> {
-        punch_hole(&self.file, extent * EXTENT_BYTES as u64)?;
+        let at = extent * EXTENT_BYTES as u64;
+        self.file.punch(at)?;
         if let Some(c) = &mut self.seal {
+            self.file.punch(c.side_bytes + at)?;
             c.tags.remove(&extent);
         }
         Ok(())
@@ -199,8 +270,8 @@ impl CacheGate for FileCache {
         // the bytes as they lie in the file (sealed, when the cache is),
         // and how they were sealed
         let mut b = vec![0u8; EXTENT_BYTES as usize];
-        self.file.read_exact_at(&mut b, extent * EXTENT_BYTES as u64)?;
         let sealed = self.seal.as_ref().and_then(|c| c.tags.get(&extent).copied());
+        self.file.get(&mut b, cache_at(extent, sealed, self.seal.as_ref().map_or(0, |c| c.side_bytes)))?;
         let slot = self.free.pop().unwrap_or_else(|| {
             self.next_slot += 1;
             self.next_slot - 1
@@ -352,10 +423,15 @@ impl Disk {
         let mut opened = Vec::with_capacity(extents.len());
         for (i, &e) in extents.iter().enumerate() {
             let mut b = vec![0u8; EXTENT_BYTES as usize];
-            self.reader.read_exact_at(&mut b, e * EXTENT_BYTES as u64)?;
             let ok = match (&self.reader_key, &seals) {
-                (Some(k), Some(s)) => k.open(e, s[i], &mut b).is_ok(),
-                _ => true,
+                (Some(k), Some(s)) => {
+                    self.reader.read_exact_at(&mut b, k.at(e, s[i]))?;
+                    k.open(e, s[i], &mut b).is_ok()
+                }
+                _ => {
+                    self.reader.read_exact_at(&mut b, e * EXTENT_BYTES as u64)?;
+                    true
+                }
             };
             out.push(b);
             opened.push(ok);
@@ -946,8 +1022,9 @@ mod tests {
         assert_eq!(buf, b);
         c.shadow_take(1, 5, &mut buf).unwrap();
         assert_eq!(buf, a);
-        // the host changes a byte, then hands back the first write
-        let at = EXTENT_BYTES as u64;
+        // the host changes a byte, then hands back the first write (where
+        // the extent's copy lies now)
+        let at = c.key().unwrap().at(1, c.seal.as_ref().unwrap().tags.get(&1).copied());
         let mut cur = vec![0u8; ext];
         c.file.read_exact_at(&mut cur, at).unwrap();
         cur[100] ^= 1;
@@ -958,6 +1035,65 @@ mod tests {
         c.punch(1).unwrap();
         c.read(1, &mut buf).unwrap();
         assert!(buf.iter().all(|&x| x == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache file that tears its next write when told: the first `n`
+    /// bytes written, the rest refused as a full copy-on-write disk does.
+    struct Tearing {
+        file: File,
+        tear: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl CacheBytes for Tearing {
+        fn get(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+            FileExt::read_exact_at(&self.file, buf, at)
+        }
+        fn put(&self, buf: &[u8], at: u64) -> std::io::Result<()> {
+            match self.tear.lock().unwrap().take() {
+                Some(n) => {
+                    FileExt::write_all_at(&self.file, &buf[..n], at)?;
+                    Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                }
+                None => FileExt::write_all_at(&self.file, buf, at),
+            }
+        }
+        fn punch(&self, at: u64) -> std::io::Result<()> {
+            punch_hole(&self.file, at)
+        }
+    }
+
+    // Goal: a sealed cache's write that fails partway (a full
+    // copy-on-write disk refuses even an overwrite) leaves the extent's last
+    // whole write readable, and loses nothing: the extent was acknowledged.
+    // Method: a sealed cache over a file that tears the next write (half
+    // of it written, the rest refused); the extent read back; the same
+    // write made again, and the old copy's room given back.
+    #[test]
+    fn a_torn_write_leaves_the_last_whole_one_readable() {
+        let dir = std::env::temp_dir().join(format!("fpac-torn-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let open = |p: &Path| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+        let file = open(&dir.join("cache"));
+        file.set_len(8 * EXTENT_BYTES as u64).unwrap();
+        let sealer = Arc::new(Sealer::new(&[4u8; 32], "disk"));
+        let mut c = FileCache::over(Tearing { file, tear: std::sync::Mutex::new(None) }, open(&dir.join("shadow")), Some((sealer, 9)), 4 * EXTENT_BYTES as u64).unwrap();
+        let ext = EXTENT_BYTES as usize;
+        let (a, b) = (vec![0xa5u8; ext], vec![0x5au8; ext]);
+        let mut buf = vec![0u8; ext];
+        c.write(1, &a).unwrap();
+        let a_at = c.key().unwrap().at(1, c.seal.as_ref().unwrap().tags.get(&1).copied());
+        *c.file.tear.lock().unwrap() = Some(ext / 2);
+        let e = c.write(1, &b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        c.read(1, &mut buf).expect("the last whole write still opens");
+        assert_eq!(buf, a);
+        c.write(1, &b).unwrap();
+        c.read(1, &mut buf).unwrap();
+        assert_eq!(buf, b);
+        // the copy written over is punched: its side reads as zeros
+        FileExt::read_exact_at(&c.file.file, &mut buf, a_at).unwrap();
+        assert!(buf.iter().all(|&x| x == 0), "the old copy's room given back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
