@@ -788,16 +788,19 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
         return Err(format!("the acknowledged files: {out}"));
     }
     let acked = status(p);
+    let (_, t_acked) = p.sh("cut -d' ' -f1 /proc/uptime")?;
     // every byte: what an unprivileged writer may take, then the root's
     // reserve, until nothing is left (three rounds, two seconds apart, so
     // whatever the cache gives back is taken too)
     let (_, fill) = p.sh("fallocate -l $(df -B1 --output=avail /var/lib/fpac | tail -n 1) /var/lib/ballast; for i in 1 2 3; do dd if=/dev/zero of=/var/lib/ballast-$i bs=1M status=none 2>&1 | tail -n 1; sleep 2; done; echo free-blocks $(stat -f -c %f /var/lib/fpac)")?;
+    let (_, t_full) = p.sh("cut -d' ' -f1 /proc/uptime")?;
     let (_, new) = p.sh("dd if=/dev/urandom of=/data/new bs=1M count=64 conv=fsync status=none 2>&1; echo exit=$?")?;
     std::thread::sleep(Duration::from_secs(2));
     let after = status(p);
     let (_, log) = p.sh("grep -E 'no-space|\"error\"' /run/fpac/log | head -n 5")?;
     // where an error came from, as the guest's kernel saw it
-    let (_, kernel) = p.sh("dmesg 2>&1 | grep -iE 'error|loop|ext4|fuse|space' | tail -n 25")?;
+    let (_, kernel) = p.sh("dmesg 2>&1 | grep -vE 'Buffer I/O error' | tail -n 60")?;
+    let (_, daemon) = p.sh("grep -vE '\"fpac\":\"(opened|cache|fuse|loop|mkfs)\"' /run/fpac/log | tail -n 40")?;
     let (_, reread) = p.sh("sha256sum -c --quiet /data/acked.sha256 && echo acked-readable")?;
     p.sh("rm -f /var/lib/ballast /var/lib/ballast-*")?;
     let s1 = sleep(p)?;
@@ -812,7 +815,7 @@ pub fn full(p: &mut dyn Place) -> Result<Value, String> {
     let ok = loud && typed && after["fenced"] == false && s1["flushed"]["error"].is_null() && check.contains("acked-ok");
     Ok(json!({
         "what": p.what(), "ok": ok, "failed_loudly": loud, "typed": typed,
-        "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "kernel": kernel, "reread_while_full": reread, "sleep": s1 },
+        "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "kernel": kernel, "daemon_log": daemon, "uptime_acked": t_acked, "uptime_full": t_full, "reread_while_full": reread, "sleep": s1 },
         "life2": { "start": st2, "mount": m2, "check": check, "sleep": s2 },
     }))
 }
