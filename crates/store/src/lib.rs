@@ -53,7 +53,12 @@ pub enum StoreError {
     #[error("corrupt: {0}")]
     Corrupt(String),
     #[error("the cache file: {0}")]
-    Cache(#[from] std::io::Error),
+    Cache(std::io::Error),
+    /// The cache file's disk is full: the write that asked for room failed
+    /// and changed nothing; what was written before is kept (typed, so the
+    /// kernel is told ENOSPC, not EIO).
+    #[error("the cache file's disk is full: {0}")]
+    NoSpace(String),
     /// DIRTY_EXTENTS_MAX are written and not yet cut: the write waits for
     /// the next cut (an operating error, retried).
     #[error("{0} extents wait to be cut: the write waits")]
@@ -61,6 +66,15 @@ pub enum StoreError {
     /// The remote refused a call it should take (a bug or a fence).
     #[error("refused: {0}")]
     Refused(String),
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> StoreError {
+        match e.kind() {
+            std::io::ErrorKind::StorageFull => StoreError::NoSpace(e.to_string()),
+            _ => StoreError::Cache(e),
+        }
+    }
 }
 
 fn from_remote(e: RemoteError) -> StoreError {
@@ -732,9 +746,13 @@ impl Store {
     /// Before the cache's bytes for `extent` change: a frozen extent's
     /// bytes as of its cut are kept apart for its segment.
     fn keep_frozen(&mut self, cache: &mut dyn CacheGate, extent: u64) -> Result<(), StoreError> {
+        // once: a write that failed after its copy was kept apart (a full
+        // disk) leaves the extent frozen, and the copy is still the cut's
         if let Some(Local::Frozen(seq)) = self.local.get(&extent).copied() {
-            cache.shadow_save(extent, seq)?;
-            assert!(self.shadows.insert((extent, seq)), "a frozen extent is kept apart once");
+            if !self.shadows.contains(&(extent, seq)) {
+                cache.shadow_save(extent, seq)?;
+                self.shadows.insert((extent, seq));
+            }
         }
         Ok(())
     }

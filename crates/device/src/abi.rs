@@ -431,6 +431,7 @@ pub mod errno {
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
     pub const EFBIG: i32 = 27;
+    pub const ENOSPC: i32 = 28;
     pub const ENOSYS: i32 = 38;
     pub const EPROTO: i32 = 71;
     pub const EOPNOTSUPP: i32 = 95;

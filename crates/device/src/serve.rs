@@ -12,11 +12,35 @@
 use crate::abi::{self, errno, opcode, Attr};
 use crate::limits;
 
-/// What a backing failed to do: an operating error, answered to the
-/// kernel as EIO (the loop device and ext4 above it handle that).
+/// What a backing failed to do, as the kernel is answered: a full disk
+/// under the backing as ENOSPC (the loop device passes it up, so a program
+/// above sees "No space left on device"), anything else as EIO. The loop
+/// device and ext4 above it handle both.
 #[derive(Debug, thiserror::Error)]
-#[error("the backing failed: {0}")]
-pub struct BackingError(pub String);
+pub enum BackingError {
+    #[error("the backing failed: {0}")]
+    Io(String),
+    #[error("the backing's disk is full: {0}")]
+    NoSpace(String),
+}
+
+impl BackingError {
+    /// An I/O error, typed: a full disk is NoSpace.
+    pub fn from_io(e: &std::io::Error) -> BackingError {
+        match e.kind() {
+            std::io::ErrorKind::StorageFull => BackingError::NoSpace(e.to_string()),
+            _ => BackingError::Io(e.to_string()),
+        }
+    }
+
+    /// The errno the kernel is answered with.
+    pub fn errno(&self) -> i32 {
+        match self {
+            BackingError::Io(_) => errno::EIO,
+            BackingError::NoSpace(_) => errno::ENOSPC,
+        }
+    }
+}
 
 /// The bytes behind the file. A backing is shared by every serving thread.
 pub trait Backing: Send + Sync {
@@ -129,7 +153,7 @@ pub fn answer(file: &File, backing: &dyn Backing, message: &[u8], read_buf: &mut
         opcode::WRITE => write(file, backing, u, &abi::write_in(message).expect("write decodes")),
         opcode::FSYNC => match backing.sync() {
             Ok(()) => reply(u, &[]),
-            Err(_) => error(u, errno::EIO),
+            Err(e) => error(u, e.errno()),
         },
         opcode::FLUSH | opcode::RELEASE => reply(u, &[]),
         opcode::FALLOCATE => fallocate(file, backing, u, &abi::fallocate_in(message).expect("fallocate decodes")),
@@ -193,7 +217,7 @@ fn read(file: &File, backing: &dyn Backing, unique: u64, r: &abi::ReadIn, buf: &
     let len = u64::from(r.size).min(file.size_bytes - r.offset) as usize;
     match backing.read_at(r.offset, &mut buf[..len]) {
         Ok(()) => Answer::Read { header: abi::out_header(abi::OUT_HEADER_BYTES + len, 0, unique), len },
-        Err(_) => error(unique, errno::EIO),
+        Err(e) => error(unique, e.errno()),
     }
 }
 
@@ -210,7 +234,7 @@ fn write(file: &File, backing: &dyn Backing, unique: u64, w: &abi::WriteIn<'_>) 
             abi::write_out(u32::try_from(w.data.len()).expect("bounded by max_write"), &mut b);
             reply(unique, &b)
         }
-        Err(_) => error(unique, errno::EIO),
+        Err(e) => error(unique, e.errno()),
     }
 }
 
@@ -231,7 +255,7 @@ fn fallocate(file: &File, backing: &dyn Backing, unique: u64, f: &abi::Fallocate
     };
     match punched {
         Ok(()) => reply(unique, &[]),
-        Err(_) => error(unique, errno::EIO),
+        Err(e) => error(unique, e.errno()),
     }
 }
 
@@ -335,6 +359,39 @@ mod tests {
         assert_eq!(&m.0.lock().unwrap()[..4], &[0, 0, 0, 0]);
         b[24..28].copy_from_slice(&0x8u32.to_ne_bytes());
         assert_eq!(status(&answer(&f, &m, &request(opcode::FALLOCATE, abi::FILE_ID, &b), &mut buf)), -errno::EOPNOTSUPP);
+    }
+
+    // Goal: a write the backing's disk has no room for is answered ENOSPC,
+    // not EIO, so the program above is told the disk is full; any other
+    // failure is EIO. Method: a backing that refuses writes, typed and not.
+    #[test]
+    fn a_full_disk_is_answered_enospc() {
+        struct Refusing(bool);
+        impl Backing for Refusing {
+            fn read_at(&self, _: u64, _: &mut [u8]) -> Result<(), BackingError> {
+                Ok(())
+            }
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), BackingError> {
+                Err(if self.0 { BackingError::NoSpace("full".into()) } else { BackingError::Io("broken".into()) })
+            }
+            fn sync(&self) -> Result<(), BackingError> {
+                Ok(())
+            }
+            fn punch(&self, _: u64, _: u64) -> Result<(), BackingError> {
+                Err(if self.0 { BackingError::NoSpace("full".into()) } else { BackingError::Io("broken".into()) })
+            }
+        }
+        let (f, _, mut buf) = fixture();
+        let mut b = vec![0u8; abi::FALLOCATE_IN_BYTES];
+        b[16..24].copy_from_slice(&4u64.to_ne_bytes());
+        b[24..28].copy_from_slice(&abi::fallocate_mode::ZERO_RANGE.to_ne_bytes());
+        for (full, want) in [(true, errno::ENOSPC), (false, errno::EIO)] {
+            let r = Refusing(full);
+            assert_eq!(status(&answer(&f, &r, &request(opcode::WRITE, abi::FILE_ID, &rw_body(0, 4, b"data")), &mut buf)), -want);
+            assert_eq!(status(&answer(&f, &r, &request(opcode::FALLOCATE, abi::FILE_ID, &b), &mut buf)), -want);
+        }
+        assert_eq!(BackingError::from_io(&std::io::Error::from(std::io::ErrorKind::StorageFull)).errno(), errno::ENOSPC);
+        assert_eq!(BackingError::from_io(&std::io::Error::other("x")).errno(), errno::EIO);
     }
 
     // Goal: only `disk` exists, and its size cannot change. Method: look

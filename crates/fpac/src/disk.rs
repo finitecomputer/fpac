@@ -51,6 +51,8 @@ pub const CACHE_DISK_HEADROOM_BYTES: u64 = 2 << 30;
 /// the unshipped budget (unshipped extents cannot leave) and the next
 /// pack's extents (the boot's, kept for the next wake).
 pub const CACHE_FLOOR_BYTES: u64 = UNSHIPPED_BYTES_MAX + PACK_BYTES_MAX;
+/// A full cache disk is said in the log at most this often.
+const NO_SPACE_LOG_MS: u64 = 10_000;
 /// Extents dropped under one hold of the lock while giving room back, so
 /// writes beside it wait at most one batch's punches.
 const ROOM_DROP_BATCH: usize = 1024;
@@ -240,8 +242,14 @@ pub struct Stats {
     /// those, the ones dropped because its disk was short of room.
     pub evictions: AtomicU64,
     pub room_evictions: AtomicU64,
-    /// Writes answered with an error (the kernel sees EIO).
+    /// Writes answered with an error (the kernel sees EIO), and those
+    /// refused because the cache file's disk is full (ENOSPC).
     pub write_errors: AtomicU64,
+    pub no_space_errors: AtomicU64,
+    /// When a refusal for a full disk was last logged (ms since the mount's
+    /// epoch), so a full disk is said once each NO_SPACE_LOG_MS, not per
+    /// write.
+    no_space_logged_ms: AtomicU64,
     /// Map pages fetched (lazy pages).
     pub page_loads: AtomicU64,
     /// Read-ahead: windows started, extents they fetched, reads that
@@ -695,6 +703,22 @@ impl Disk {
 
     /// `data` at `offset` within one extent, the extent pinned in the cache
     /// while a partial write reads it first.
+    /// A write the store refused: counted, and answered as the kernel
+    /// should hear it. A full disk (ENOSPC) is said in the log too, at most
+    /// once each NO_SPACE_LOG_MS, with how many writes it has refused.
+    fn write_failed(&self, err: StoreError) -> BackingError {
+        self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+        if let StoreError::NoSpace(why) = &err {
+            let refused = self.stats.no_space_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+            let last = self.stats.no_space_logged_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= NO_SPACE_LOG_MS && self.stats.no_space_logged_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                eprintln!("{}", serde_json::json!({ "fpac": "no-space", "refused_writes": refused, "why": why, "at_ms": now }));
+            }
+        }
+        eio(err)
+    }
+
     pub fn write_extent(&self, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
         *self.pinned.lock().unwrap().entry(extent).or_insert(0) += 1;
         let r = self.write_extent_pinned(extent, offset, data);
@@ -774,7 +798,10 @@ impl Disk {
 }
 
 fn eio(e: StoreError) -> BackingError {
-    BackingError(e.to_string())
+    match e {
+        StoreError::NoSpace(s) => BackingError::NoSpace(s),
+        e => BackingError::Io(e.to_string()),
+    }
 }
 
 /// The pieces of `[offset, offset + len)`, extent by extent: (extent,
@@ -812,8 +839,7 @@ impl Backing for Disk {
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), BackingError> {
         for (e, within, n, at) in pieces(offset, data.len()) {
             if let Err(err) = self.write_extent(e, within, &data[at..at + n]) {
-                self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(eio(err));
+                return Err(self.write_failed(err));
             }
         }
         Ok(())
@@ -832,11 +858,8 @@ impl Backing for Disk {
     fn punch(&self, offset: u64, length: u64) -> Result<(), BackingError> {
         let zeros = vec![0u8; EXTENT_BYTES as usize];
         for (e, within, n, _) in pieces(offset, usize::try_from(length).expect("bounded")) {
-            if within == 0 && n == EXTENT_BYTES as usize {
-                self.punch_extent(e).map_err(eio)?;
-            } else {
-                self.write_extent(e, within, &zeros[..n]).map_err(eio)?;
-            }
+            let r = if within == 0 && n == EXTENT_BYTES as usize { self.punch_extent(e) } else { self.write_extent(e, within, &zeros[..n]) };
+            r.map_err(|err| self.write_failed(err))?;
         }
         Ok(())
     }

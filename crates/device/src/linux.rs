@@ -60,13 +60,13 @@ impl LocalFile {
 
 impl Backing for LocalFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
-        self.file.read_exact_at(buf, offset).map_err(|e| BackingError(e.to_string()))
+        self.file.read_exact_at(buf, offset).map_err(|e| BackingError::from_io(&e))
     }
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), BackingError> {
-        self.file.write_all_at(data, offset).map_err(|e| BackingError(e.to_string()))
+        self.file.write_all_at(data, offset).map_err(|e| BackingError::from_io(&e))
     }
     fn sync(&self) -> Result<(), BackingError> {
-        self.file.sync_data().map_err(|e| BackingError(e.to_string()))
+        self.file.sync_data().map_err(|e| BackingError::from_io(&e))
     }
     fn punch(&self, offset: u64, length: u64) -> Result<(), BackingError> {
         let (o, l) = (i64::try_from(offset).expect("bounded by the volume"), i64::try_from(length).expect("bounded by the volume"));
@@ -75,7 +75,7 @@ impl Backing for LocalFile {
         if r == 0 {
             Ok(())
         } else {
-            Err(BackingError(std::io::Error::last_os_error().to_string()))
+            Err(BackingError::from_io(&std::io::Error::last_os_error()))
         }
     }
 }

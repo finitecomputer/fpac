@@ -787,6 +787,94 @@ fn compacted_and_cleaned(seed: u64, seal: Option<std::sync::Arc<Sealer>>) {
     }
 }
 
+/// A cache whose disk has no room left: a write that takes new room (an
+/// extent it does not hold, a copy kept apart) fails as a full disk does.
+/// On a copy-on-write disk (`cow`), an overwrite in place needs room too.
+struct NoRoom {
+    inner: MemCache,
+    shadows_fit: bool,
+    cow: bool,
+}
+
+fn full() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::StorageFull)
+}
+
+impl CacheGate for NoRoom {
+    fn read(&mut self, extent: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read(extent, buf)
+    }
+    fn write(&mut self, extent: u64, bytes: &[u8]) -> std::io::Result<()> {
+        if self.cow || !self.inner.extents.contains_key(&extent) {
+            return Err(full());
+        }
+        self.inner.write(extent, bytes)
+    }
+    fn punch(&mut self, extent: u64) -> std::io::Result<()> {
+        self.inner.punch(extent)
+    }
+    fn shadow_save(&mut self, extent: u64, seq: u64) -> std::io::Result<()> {
+        if !self.shadows_fit {
+            return Err(full());
+        }
+        self.inner.shadow_save(extent, seq)
+    }
+    fn shadow_take(&mut self, extent: u64, seq: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.shadow_take(extent, seq, buf)
+    }
+}
+
+// Goal: a write the cache's disk has no room for fails typed (NoSpace,
+// which the daemon answers ENOSPC, not EIO), changes nothing, and loses
+// nothing written before: everything written reads back while the disk is
+// full, the same write lands once room comes back, and the next life reads
+// it all. Method: a life writes 50 extents and cuts them (frozen, not yet
+// built); with no room, a write to a new extent, to a frozen one whose copy
+// cannot be kept apart, and to a frozen one on a copy-on-write disk (its
+// copy kept apart, the overwrite refused) each fail NoSpace; every extent
+// reads back; room returns, the last write is made again; a sleep; the
+// next life reads every extent.
+#[test]
+fn a_write_with_no_room_fails_typed_and_loses_nothing() {
+    let mut remote = SimRemote::new(21, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in 0..50u64 {
+        let b = content(e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.flush().unwrap();
+    let mut cache = NoRoom { inner: std::mem::take(&mut life.cache), shadows_fit: false, cow: false };
+    for (e, shadows_fit, cow) in [(100u64, false, false), (7, false, false), (8, true, true)] {
+        (cache.shadows_fit, cache.cow) = (shadows_fit, cow);
+        let r = life.store.write(life.remote, &mut cache, e, 0, &content(1000 + e));
+        assert!(matches!(r, Err(StoreError::NoSpace(_))), "extent {e}: {r:?}");
+    }
+    let mut buf = vec![0u8; EXT];
+    for e in 0..50u64 {
+        life.store.read(life.remote, &mut cache, e, &mut buf).unwrap();
+        assert_eq!(buf, life.model.live[&e], "extent {e} as acknowledged, while the disk is full");
+    }
+    life.store.read(life.remote, &mut cache, 100, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0), "the refused write changed nothing");
+    // room again: the write to the frozen extent whose copy was kept apart
+    // is made again (its copy is the cut's still)
+    life.cache = cache.inner;
+    let b = content(1008);
+    life.store.write(life.remote, &mut life.cache, 8, 0, &b).unwrap();
+    life.model.live.insert(8, b);
+    life.sleep(&mut Rng(9)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    platform.running = 2;
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    for e in 0..50u64 {
+        life.read_check(e).unwrap();
+    }
+    life.read_check(100).unwrap();
+}
+
 /// A gate that stops answering after `left` calls: the cleaner's crash.
 struct Stopping<'a> {
     inner: &'a mut SimRemote,
