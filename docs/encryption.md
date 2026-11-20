@@ -73,7 +73,62 @@ them (GCM-SIV over nothing, its associated data the name and the bytes).
 
 ## What it costs
 
-*Numbers: see "The numbers" below (filled from encryption.json).*
+Measured on Cloudflare (a `fpac-spike` container, 2 vCPU, against R2)
+and on krun (this box, R2 modelled), plain and sealed on the same build,
+one after the other (`docs/evidence/encryption.json`).
+
+**The cipher, one core, 64 KiB extents (MB/s).** Both CPUs have AES-NI,
+CLMUL, VAES and VPCLMULQDQ; Cloudflare's is an AMD EPYC 9684X.
+
+| | Cloudflare | krun |
+| -- | --: | --: |
+| AES-256-GCM-SIV seal | 2,202 | 5,108 |
+| AES-256-GCM-SIV open | 2,184 | 5,126 |
+| XChaCha20-Poly1305 seal | 1,202 | 1,614 |
+| SHA-256 (what plain already pays per object) | 1,759 | 2,772 |
+
+**What a person feels, Cloudflare, plain against sealed.** Each run's own
+local-disk column moved as much as the difference (a clone took 1.1 s in
+one and 2.7 s in the other), so this compares the two FPAC columns.
+
+| | Plain | Sealed |
+| -- | --: | --: |
+| 4 KiB write + O_SYNC, p50 (idle) | 0.12 ms | 0.21 ms |
+| Office save, p50 (idle) | 0.54 ms | 0.73 ms |
+| SQLite 10k transactions, `synchronous=FULL` | 4.1 s | 6.2 s |
+| SQLite 10k transactions, `NORMAL` | 265 ms | 271 ms |
+| SQLite 1M rows, one transaction | 1.33 s | 1.21 s |
+| git clone, 7,260 files | 2.6 s | 2.2 s |
+| git status, warm / cold | 95 ms / 78 ms | 91 ms / 911 ms |
+| Small file, cold read each | 0.08 ms | 0.13 ms |
+| 4 GiB written with fsync | 318 MB/s | 273 MB/s |
+| Shipped to R2 behind it | 103 MB/s | 97 MB/s |
+| 4 GiB read cold | 753 MB/s | 771 MB/s |
+| Daemon CPU, user, per GB shipped | 2.8 s | 4.2 s |
+| Daemon CPU, all, per GB shipped | 11.0 s | 13.1 s |
+
+So sealing adds about 0.08 ms to each synced write (the cache file
+reseals the 64 KiB extent), 0.05 ms to each cold small read (it opens
+one), a seventh off sequential writes, and 1.4 s of one core per GB
+shipped (the cache's seal and open, then the segment's seal). The CPU
+rows are the daemon's whole run, serving ext4 as well as shipping.
+
+**A wake, 1 GB disk, p50 of 3 wakes.**
+
+| | Cloudflare plain | Cloudflare sealed | krun plain | krun sealed |
+| -- | --: | --: | --: | --: |
+| Wake to the boot read done | 1,989 ms | 1,907 ms | 531 ms | 605 ms |
+| Open (head, pages) | 613 ms | 590 ms | 197 ms | 197 ms |
+| Pack's first 64 extents installed | 9.7 ms | 16.5 ms | 2.0 ms | 8.2 ms |
+| Sleep | 1,954 ms | 2,157 ms | 1,321 ms | 1,320 ms |
+
+Opening the pack costs about 7 ms more per 4 MiB; the rest of a wake is
+the container's start and R2's round trips, the same either way.
+
+**Correctness, sealed.** 10 lives killed at random points on Cloudflare
+and 20 on krun: every row acknowledged before a kill was found, no wrong
+byte handed out, 0 failures. Two lives on Cloudflare (write, sleep, wake,
+check files, SQLite, git and the head): all checks pass.
 
 ## The key
 
