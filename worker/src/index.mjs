@@ -32,6 +32,14 @@ const EXEC_OUTPUT_BYTES_MAX = 4 * 1024 * 1024;
 const READY_MS_MAX = 120 * 1000;
 // A delete pass lists at most this many pages of 1,000 keys.
 const LIST_PAGES_MAX = 200;
+// The cleaner's delete pass (FpacSpike.cleanDelete): crates/store's
+// CLEAN_AGE_MS_MIN; a checkpoint's bytes at most, above crates/format's
+// CHECKPOINT_BYTES_MAX (about 1.3 MB) and a sealed disk's tag; and one
+// call's names at most (a call's body is DRIVER_BODY_BYTES_MAX).
+const CLEAN_AGE_MS_MIN = 24 * 60 * 60 * 1000;
+const CHECKPOINT_BYTES_MAX = 4 * 1024 * 1024;
+const CHECKPOINT_NAME = /^e[1-9][0-9]{0,19}\/c[1-9][0-9]{0,19}$/;
+const CLEAN_DELETE_NAMES_MAX = 2000;
 const INSTANCE = { vcpu: 2, memoryMib: 6144, diskMb: 20000 };
 // The images a start may give the internet (`start`): the npm benchmark's.
 const INTERNET_IMAGES = ["npm"];
@@ -295,6 +303,10 @@ export class FpacSpike extends DurableObject {
       if (route === "GET /state") return json({ version: this.env.VERSION.id, running: this.ctx.container.running, images: Object.keys(this.ctx.container.images || {}) });
       if (route === "POST /objects/delete") return json(await this.deleteObjects(await request.json()));
       if (route === "POST /objects/usage") return json(await this.usage(await request.json()));
+      if (route === "POST /objects/disks") return json(await this.disks(await request.json()));
+      if (route === "POST /clean/list") return json(await this.cleanList(await request.json()));
+      if (route === "POST /clean/checkpoint") return json(await this.cleanCheckpoint(await request.json()));
+      if (route === "POST /clean/delete") return json(await this.cleanDelete(await request.json()));
       if (route === "POST /records") return json(await this.keep(await request.json()));
       if (route === "GET /records") return json([...(await this.ctx.storage.list({ prefix: "rec:", limit: RECORDS_MAX })).values()]);
       if (route === "POST /records/clear") return json(await this.clear());
@@ -554,6 +566,89 @@ export class FpacSpike extends DurableObject {
     if (c.running) await c.destroy("the driver asked").catch(() => {});
     while (c.running && Date.now() - t0 < 30000) await new Promise((r) => setTimeout(r, 100));
     return { running: c.running, ms: Date.now() - t0 };
+  }
+
+  // The cleaner's delete pass (docs/design.md, The cleaner), as the
+  // platform runs it: planned from the head this object stores and the
+  // checkpoints kept before it (crates/store/src/clean.rs and
+  // crates/format, `plan_deletes`), never from a guest's word. Here the
+  // driver plans it with the same code; the product's Worker runs that
+  // code itself. These routes give it the stored head, the disk's objects
+  // with their ages, a checkpoint's bytes, and delete what it names.
+
+  // Disk names under `disks/` that start with `prefix` (a name's start).
+  async disks({ prefix }) {
+    if (typeof prefix !== "string" || !/^[a-z0-9-]{1,40}$/.test(prefix)) throw new Error("a prefix is the start of a disk's name");
+    const names = [];
+    let cursor;
+    for (let page = 0; page < LIST_PAGES_MAX; page++) {
+      const l = await this.env.DISKS.list({ prefix: `disks/${prefix}`, delimiter: "/", limit: 1000, cursor });
+      for (const d of l.delimitedPrefixes) names.push(d.slice("disks/".length, -1));
+      if (!l.truncated) return { disks: names };
+      cursor = l.cursor;
+    }
+    throw new Error(`more than ${LIST_PAGES_MAX} pages under disks/${prefix}`);
+  }
+
+  // The disk's stored head and every object of it: name, size, age.
+  async cleanList({ disk }) {
+    if (typeof disk !== "string" || !/^[a-z0-9-]{1,40}$/.test(disk)) throw new Error("a disk's name: a-z, 0-9 and -");
+    const head = (await this.ctx.storage.get(`head:${disk}`)) || null;
+    const now = Date.now();
+    const objects = [];
+    let cursor;
+    for (let page = 0; page < LIST_PAGES_MAX; page++) {
+      const l = await this.env.DISKS.list({ prefix: `disks/${disk}/`, limit: 1000, cursor });
+      for (const o of l.objects) objects.push([o.key.slice(`disks/${disk}/`.length), o.size, Math.max(0, now - o.uploaded.getTime())]);
+      if (!l.truncated) return { head, now_ms: now, objects };
+      cursor = l.cursor;
+    }
+    throw new Error(`more than ${LIST_PAGES_MAX} pages under disks/${disk}/`);
+  }
+
+  // A checkpoint's bytes (hex) and the SHA-256 R2 holds for them.
+  async cleanCheckpoint({ disk, name }) {
+    if (typeof disk !== "string" || !/^[a-z0-9-]{1,40}$/.test(disk)) throw new Error("a disk's name: a-z, 0-9 and -");
+    if (typeof name !== "string" || !CHECKPOINT_NAME.test(name)) throw new Error("a checkpoint's name: e<epoch>/c<seq>");
+    const o = await this.env.DISKS.get(`disks/${disk}/${name}`);
+    if (o === null) return { absent: true };
+    if (o.size > CHECKPOINT_BYTES_MAX) throw new Error("a checkpoint past its limit");
+    const bytes = new Uint8Array(await o.arrayBuffer());
+    return { hex: hex(bytes), sha256: o.checksums.sha256 ? hex(o.checksums.sha256) : null };
+  }
+
+  // Deletes the named objects of a disk, each only if it is at least
+  // `age_ms_min` old by R2's own record (a guard of its own, whatever the
+  // plan said), and only while no container runs: the cleaner deletes
+  // beside no life. The floor is CLEAN_AGE_MS_MIN; the bench's own scratch
+  // disks (named clean-…) may name a lower one, so a run fits in minutes.
+  async cleanDelete({ disk, names, age_ms_min }) {
+    if (typeof disk !== "string" || !/^[a-z0-9-]{1,40}$/.test(disk)) throw new Error("a disk's name: a-z, 0-9 and -");
+    if (!Array.isArray(names) || names.length > CLEAN_DELETE_NAMES_MAX) throw new Error(`names: a list of at most ${CLEAN_DELETE_NAMES_MAX}`);
+    if (!Number.isSafeInteger(age_ms_min) || age_ms_min < 0) throw new Error("age_ms_min: a whole number of ms");
+    if (age_ms_min < CLEAN_AGE_MS_MIN && !disk.startsWith("clean-")) throw new Error(`objects younger than ${CLEAN_AGE_MS_MIN} ms are never deleted`);
+    for (const n of names) if (typeof n !== "string" || !NAME.test(n)) throw new Error(`a name outside the grammar: ${String(n).slice(0, 100)}`);
+    if (this.ctx.container.running) return { refused: "a container is running" };
+    // R2's own record of each object (one list, not a call per name)
+    const stored = new Map();
+    for (const [n, size, age] of (await this.cleanList({ disk })).objects) stored.set(n, { size, age });
+    let bytes = 0;
+    const keys = [];
+    const young = [];
+    const absent = [];
+    for (const n of names) {
+      const o = stored.get(n);
+      if (!o) absent.push(n);
+      else if (o.age < age_ms_min) young.push(n);
+      else {
+        keys.push(`disks/${disk}/${n}`);
+        bytes += o.size;
+      }
+    }
+    // checked again just before the delete: a life may have started
+    if (this.ctx.container.running) return { refused: "a container started" };
+    for (let i = 0; i < keys.length; i += 1000) await this.env.DISKS.delete(keys.slice(i, i + 1000));
+    return { deleted: keys.length, bytes, young, absent };
   }
 
   async keep(rec) {

@@ -193,6 +193,139 @@ impl Cloudflare {
 
 }
 
+impl Cloudflare {
+    fn call(&self, path: &str, body: &Value) -> Result<Value, String> {
+        net::worker(self.c.host(), &self.key, "POST", path, body, Duration::from_secs(300))
+    }
+
+    /// The disk's stored head (the platform's, never a guest's) and its
+    /// objects: (name, bytes, age in ms).
+    fn listing(&self) -> Result<(Option<String>, Vec<Stored>), String> {
+        let l = self.call("/clean/list", &json!({ "disk": self.disk }))?;
+        let objects = l["objects"]
+            .as_array()
+            .ok_or("no objects listed")?
+            .iter()
+            .map(|o| Some((o[0].as_str()?.to_string(), o[1].as_u64()?, o[2].as_u64()?)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("a malformed listing")?;
+        Ok((l["head"].as_str().map(str::to_string), objects))
+    }
+
+    /// A cleaner's life (docs/design.md, The cleaner): a fresh container
+    /// for the disk, a new epoch, and `fpac clean` against its segments'
+    /// sizes from the listing. Killed `kill_after` in, if given.
+    pub fn cleaner(&mut self, kill_after: Option<Duration>) -> Result<Value, String> {
+        let (_, objects) = self.listing()?;
+        let mut sizes = String::new();
+        for (name, bytes, _) in &objects {
+            let seg = name.strip_prefix('e').and_then(|r| r.split_once("/s")).and_then(|(e, q)| Some((e.parse::<u64>().ok()?, q.parse::<u64>().ok()?)));
+            if let Some((e, q)) = seg {
+                sizes.push_str(&format!("{e} {q} {bytes}\n"));
+            }
+        }
+        // one exec's body is the Worker's DRIVER_BODY_BYTES_MAX (64 KiB)
+        if sizes.len() > 48 << 10 {
+            return Err(format!("{} bytes of sizes: past what one exec carries", sizes.len()));
+        }
+        let start = self.start()?;
+        let (code, out) = self.sh(&format!("cat > /tmp/sizes <<'EOF'\n{sizes}EOF\necho sized"))?;
+        if code != 0 || !out.contains("sized") {
+            return Err(format!("the sizes file: {out}"));
+        }
+        let run = "/usr/local/bin/fpac clean --sizes /tmp/sizes";
+        let t0 = Instant::now();
+        let r = match kill_after {
+            None => {
+                let (code, out) = self.sh(run)?;
+                if code != 0 {
+                    return Err(format!("the cleaner: {out}"));
+                }
+                json!({ "start": start, "segments_listed": sizes.lines().count(), "out": guest_last_json(&out)?, "exec_ms": t0.elapsed().as_millis() as u64 })
+            }
+            Some(after) => {
+                self.sh(&format!("setsid nohup {run} > /tmp/clean.log 2>&1 < /dev/null & echo started"))?;
+                std::thread::sleep(after);
+                let (_, log) = self.sh("cat /tmp/clean.log")?;
+                json!({ "start": start, "killed_after_ms": after.as_millis() as u64, "finished_before_the_kill": log.contains("\"cleaned\""), "log": log.chars().take(2000).collect::<String>() })
+            }
+        };
+        self.kill()?;
+        Ok(r)
+    }
+
+    /// The delete pass, as the platform runs it: the stored head, the
+    /// checkpoints kept before it (each checked against R2's SHA-256, the
+    /// head's against the head's), `plan_deletes`, then the Worker's
+    /// delete, which checks each object's age again and refuses beside a
+    /// running container.
+    pub fn delete_pass(&mut self, age_ms_min: u64) -> Result<Value, String> {
+        self.kill()?;
+        let t0 = Instant::now();
+        let (line, objects) = self.listing()?;
+        let line = line.ok_or("the disk has no head")?;
+        let head = fpac_store::Head::decode(&line).ok_or("a malformed head")?;
+        let names: Vec<String> = objects.iter().map(|(n, _, _)| n.clone()).collect();
+        let kept_ids = fpac_store::clean::kept_checkpoints(&head, &names);
+        let mut kept = Vec::new();
+        for (e, q) in &kept_ids {
+            let c = self.call("/clean/checkpoint", &json!({ "disk": self.disk, "name": format!("e{e}/c{q}") }))?;
+            let bytes = unhex(c["hex"].as_str().ok_or("no checkpoint")?)?;
+            let sum = ring::digest::digest(&ring::digest::SHA256, &bytes);
+            if Some(hex(sum.as_ref()).as_str()) != c["sha256"].as_str() {
+                return Err(format!("e{e}/c{q}: not the bytes R2 holds"));
+            }
+            if let Some(h) = head.checkpoint.filter(|h| (h.epoch, h.seq) == (*e, *q)) {
+                if sum.as_ref() != h.sum {
+                    return Err(format!("e{e}/c{q}: not the checkpoint the head names"));
+                }
+            }
+            kept.push(fpac_store::clean::read_checkpoint(&bytes).map_err(|e| e.to_string())?);
+        }
+        let ages: Vec<(String, u64)> = objects.iter().map(|(n, _, a)| (n.clone(), *a)).collect();
+        let plan = fpac_format::plan_deletes(&kept, head.epoch, &ages, age_ms_min);
+        let size: std::collections::BTreeMap<&str, u64> = objects.iter().map(|(n, b, _)| (n.as_str(), *b)).collect();
+        let planned_bytes: u64 = plan.iter().map(|n| size[n.as_str()]).sum();
+        let (mut deleted, mut bytes, mut young, mut absent) = (0u64, 0u64, 0usize, 0usize);
+        for chunk in plan.chunks(1000) {
+            let d = self.call("/clean/delete", &json!({ "disk": self.disk, "names": chunk, "age_ms_min": age_ms_min }))?;
+            if let Some(why) = d["refused"].as_str() {
+                return Err(format!("the delete was refused: {why}"));
+            }
+            deleted += d["deleted"].as_u64().unwrap_or(0);
+            bytes += d["bytes"].as_u64().unwrap_or(0);
+            young += d["young"].as_array().map_or(0, Vec::len);
+            absent += d["absent"].as_array().map_or(0, Vec::len);
+        }
+        let kind = |p: char| plan.iter().filter(|n| n.split_once('/').is_some_and(|(_, r)| r.starts_with(p))).count();
+        Ok(json!({
+            "head": line, "objects_listed": objects.len(), "kept_checkpoints": kept_ids.iter().map(|(e, q)| format!("e{e}/c{q}")).collect::<Vec<_>>(),
+            "age_ms_min": age_ms_min, "planned": plan.len(), "planned_bytes": planned_bytes,
+            "planned_by_kind": { "segments": kind('s'), "pages": kind('m'), "checkpoints": kind('c'), "packs": kind('p') },
+            "deleted": deleted, "deleted_bytes": bytes, "young": young, "absent": absent, "ms": t0.elapsed().as_millis() as u64,
+        }))
+    }
+}
+
+/// An object of a disk as the store lists it: name, bytes, age in ms.
+type Stored = (String, u64, u64);
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err("odd hex".into());
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string())).collect()
+}
+
+/// The last line of a guest's output that is JSON.
+fn guest_last_json(out: &str) -> Result<Value, String> {
+    out.lines().rev().find_map(|l| serde_json::from_str::<Value>(l).ok()).ok_or_else(|| format!("no JSON in: {out}"))
+}
+
 impl Place for Cloudflare {
     fn start(&mut self) -> Result<Value, String> {
         let _ = net::worker(self.c.host(), &self.key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
@@ -413,6 +546,72 @@ test "$(sqlite3 /data/db.sqlite 'pragma integrity_check')" = ok && echo sqlite-o
 echo "max: $(sqlite3 /data/db.sqlite 'select coalesce(max(id),0) from w')"
 echo "count: $(sqlite3 /data/db.sqlite 'select count(*) from w')"
 if [ -d /data/repo/.git ]; then git -C /data/repo fsck --no-progress > /tmp/gitfsck.log 2>&1 && echo git-ok || { echo git-failed; tail -5 /tmp/gitfsck.log; }; else echo git-ok; fi"#;
+
+/// Life 1 of the cleaner's run: 512 MiB in 4 MiB files.
+const WRITE_BIG: &str = r#"set -e
+mkdir -p /data/big
+for i in $(seq 1 128); do head -c 4194304 /dev/urandom > /data/big/b$i; done
+sync
+echo written"#;
+
+/// Life 2: three quarters of them written again, so most of life 1's
+/// segments hold dead extents.
+const REWRITE_BIG: &str = r#"set -e
+for i in $(seq 1 96); do head -c 4194304 /dev/urandom > /data/big/b$i; done
+sha256sum /data/big/* > /data/big.sha256
+sync
+echo rewritten"#;
+
+/// Everything the cleaner's run wrote, checked, then ext4 itself.
+const CHECK_CLEAN: &str = r#"cd /data
+sha256sum -c --quiet big.sha256 && echo big-ok
+sha256sum -c --quiet files.sha256 && echo files-ok
+test "$(sqlite3 db.sqlite 'pragma integrity_check')" = ok && echo sqlite-ok
+test "$(sqlite3 db.sqlite 'select count(*) from t')" = 5000 && echo rows-ok
+git -C repo fsck --strict --no-progress && echo git-ok
+test "$(git -C repo rev-parse HEAD)" = "$(cat repo.head)" && echo head-ok
+cd /
+dev=$(awk '$2=="/data" {print $1}' /proc/mounts)
+umount /data
+e2fsck -f -n $dev > /tmp/fsck.log 2>&1 && echo fsck-ok || { echo fsck-failed; tail -5 /tmp/fsck.log; }
+mount -t ext4 -o noatime,commit=1,discard $dev /data"#;
+const CHECK_CLEAN_OK: [&str; 7] = ["big-ok", "files-ok", "sqlite-ok", "rows-ok", "git-ok", "head-ok", "fsck-ok"];
+
+/// The cleaner on Cloudflare (docs/design.md, The cleaner): a disk with
+/// garbage, a cleaner killed partway and the disk checked, a cleaner to
+/// its end, two lives so the kept checkpoints move past the old segments,
+/// the delete pass, and the disk checked again; the store's objects
+/// before and after each.
+pub fn clean(p: &mut Cloudflare, kill_after: Duration) -> Result<Value, String> {
+    let life = |p: &mut Cloudflare, script: &str, ok: &[&str]| -> Result<Value, String> {
+        let st = p.start()?;
+        let m = mount(p)?;
+        let (code, out) = p.sh(script)?;
+        let s = sleep(p)?;
+        p.kill()?;
+        if let Some(missing) = ok.iter().find(|w| !out.contains(*w)) {
+            return Err(format!("{missing} missing (exit {code}): {out}"));
+        }
+        Ok(json!({ "start": st, "opened": m["opened"], "mounted_ms": m["mounted"]["ms"], "out": out.chars().take(1000).collect::<String>(), "sleep_ms": s["sleep_ms"] }))
+    };
+    let mut r = json!({ "what": p.what() });
+    r["life1"] = life(p, &format!("{WRITE_A}\n{WRITE_BIG}"), &["written"])?;
+    r["life2"] = life(p, REWRITE_BIG, &["rewritten"])?;
+    r["objects_before"] = p.objects();
+    r["cleaner_killed"] = p.cleaner(Some(kill_after))?;
+    r["check_after_the_kill"] = life(p, CHECK_CLEAN, &CHECK_CLEAN_OK)?;
+    r["objects_after_the_kill"] = p.objects();
+    r["cleaner"] = p.cleaner(None)?;
+    r["objects_after_compaction"] = p.objects();
+    for i in 1..=2 {
+        r[format!("life_after_{i}")] = life(p, &format!("echo {i} > /data/note && sync && echo noted"), &["noted"])?;
+    }
+    r["objects_before_deletes"] = p.objects();
+    r["deletes"] = p.delete_pass(0)?;
+    r["objects_after_deletes"] = p.objects();
+    r["check_after_deletes"] = life(p, CHECK_CLEAN, &CHECK_CLEAN_OK)?;
+    Ok(r)
+}
 
 /// Rounds of a guest killed mid-write, each next life checked.
 pub fn crash(p: &mut dyn Place, rounds: u32) -> Result<Value, String> {

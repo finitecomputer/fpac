@@ -206,7 +206,9 @@ dependencies = [
 name = "fpac-bench"
 version = "0.1.0"
 dependencies = [
+ "fpac-format",
  "fpac-remote",
+ "fpac-store",
  "fpac-testkit",
  "ring",
  "rustls",

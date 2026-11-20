@@ -312,6 +312,25 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
     // larger than the guest's 20 GB disk needs one)
     let volume: u64 = flag(args, "--volume-gb").and_then(|g| g.parse::<u64>().ok()).map_or(20_000 << 20, |g| g << 30);
     let mount_args = flag(args, "--cache-max").map(|b| format!("--cache-max {b}")).unwrap_or_default();
+    if scenario == "clean" {
+        // the cleaner's routes are the stand-in Worker's (Cloudflare only);
+        // its disk is named clean-…, the one kind the Worker lets a delete
+        // pass name an age under a day for
+        if place != "cloudflare" {
+            return Err("the cleaner's run is on Cloudflare only".into());
+        }
+        let mut c = disk::Cloudflare::new(&format!("clean-{}", now_ms()), volume)?;
+        let kill_after = Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(1500));
+        let r = disk::clean(&mut c, kill_after);
+        let objects = disk::Place::objects(&c);
+        let cleaned = disk::Place::cleanup(&mut c);
+        return r.map(|mut v| {
+            v["objects_at_end"] = objects;
+            v["bulk_data_deleted"] = cleaned;
+            v["sealed"] = json!(false);
+            v
+        });
+    }
     let mut p: Box<dyn disk::Place> = match place {
         // an npm install runs its packages' own scripts: never here
         _ if scenario == "npm" && place != "cloudflare" => return Err("the npm benchmark runs in a disposable Cloudflare container only".into()),
@@ -755,7 +774,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead" | "clean")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -791,10 +810,19 @@ fn main() {
         // only names under disks/hermes- (the harness never deletes its own)
         (Some("delete-hermes-disks"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
-            let prefix = "disks/hermes-";
-            let usage = net::worker(c.host(), &key, "POST", "/objects/usage", &json!({ "prefix": prefix }), Duration::from_secs(300))?;
-            let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": prefix }), Duration::from_secs(900))?;
-            Ok(json!({ "prefix": prefix, "before": usage, "deleted": deleted }))
+            // each disk the harness made (hermes-…), whole: the Worker
+            // deletes a disk's prefix and no wider
+            let call = |path: &str, body: Value| net::worker(c.host(), &key, "POST", path, &body, Duration::from_secs(900));
+            let disks: Vec<String> = call("/objects/disks", json!({ "prefix": "hermes-" }))?["disks"].as_array().ok_or("no disks listed")?.iter().filter_map(|d| d.as_str().map(str::to_string)).collect();
+            let (mut objects, mut bytes, mut deleted) = (0u64, 0u64, 0u64);
+            for d in &disks {
+                let prefix = format!("disks/{d}/");
+                let u = call("/objects/usage", json!({ "prefix": prefix }))?;
+                objects += u["objects"].as_u64().unwrap_or(0);
+                bytes += u["bytes"].as_u64().unwrap_or(0);
+                deleted += call("/objects/delete", json!({ "prefix": prefix }))?["deleted"].as_u64().unwrap_or(0);
+            }
+            Ok(json!({ "disks": disks.len(), "objects_before": objects, "bytes_before": bytes, "deleted": deleted }))
         }),
         // the npm benchmark's heavy lockfile, made in a disposable
         // Cloudflare container (never here): crates/bench/npm-heavy
@@ -830,7 +858,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead", "clean"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two

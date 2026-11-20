@@ -6,7 +6,9 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+fpac-format = { workspace = true }
 fpac-remote = { workspace = true }
+fpac-store = { workspace = true }
 fpac-testkit = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
