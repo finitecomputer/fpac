@@ -323,6 +323,15 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
+        // what sealing costs on this place's CPU (docs/encryption.md)
+        "aead" => (|| {
+            p.start()?;
+            let (code, out) = p.sh("/usr/local/bin/fpac-probe aead")?;
+            if code != 0 {
+                return Err(format!("the aead probe: {out}"));
+            }
+            guest_json(&out)
+        })(),
         "npm" => disk::npm(p.as_mut(), &flag(args, "--variant").unwrap_or_else(|| "shipped".into()), &flag(args, "--workload").unwrap_or_else(|| "sandbox-sdk".into())),
         "thrash" => disk::thrash(p.as_mut(), flag(args, "--big-files").and_then(|r| r.parse().ok()).unwrap_or(2560), flag(args, "--cache-max").and_then(|r| r.parse().ok()), !args.iter().any(|a| a == "--no-wake")),
         _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0), &mount_args),
@@ -746,7 +755,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -778,6 +787,15 @@ fn main() {
         }),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
+        // the Hermes harness's test disks, deleted once nothing needs them:
+        // only names under disks/hermes- (the harness never deletes its own)
+        (Some("delete-hermes-disks"), _) => Config::load().and_then(|c| {
+            let key = net::Key::load_or_make(&c.driver_key_file);
+            let prefix = "disks/hermes-";
+            let usage = net::worker(c.host(), &key, "POST", "/objects/usage", &json!({ "prefix": prefix }), Duration::from_secs(300))?;
+            let deleted = net::worker(c.host(), &key, "POST", "/objects/delete", &json!({ "prefix": prefix }), Duration::from_secs(900))?;
+            Ok(json!({ "prefix": prefix, "before": usage, "deleted": deleted }))
+        }),
         // the npm benchmark's heavy lockfile, made in a disposable
         // Cloudflare container (never here): crates/bench/npm-heavy
         (Some("npm-lock"), _) => (|| {
@@ -812,7 +830,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two
