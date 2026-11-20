@@ -1,0 +1,310 @@
+{
+  "evidence": "clean",
+  "places": {
+    "cloudflare": {
+      "bulk_data_deleted": {
+        "deleted": 114,
+        "pages": 1
+      },
+      "check_after_deletes": {
+        "mounted_ms": 424.043873,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186387841,
+          "extents_mapped": 190,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 338.518216,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 3,
+              "failed": 0,
+              "ms": 214.022295
+            }
+          ],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "big-ok\nfiles-ok\nsqlite-ok\nrows-ok\ngit-ok\nhead-ok\nfsck-ok\n",
+        "sleep_ms": 2974,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 172,
+          "start_ms": 267.178984,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "check_after_the_kill": {
+        "mounted_ms": 932.597424,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186294247,
+          "extents_mapped": 8478,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 773.712137,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 29,
+              "failed": 0,
+              "ms": 559.818733
+            }
+          ],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "big-ok\nfiles-ok\nsqlite-ok\nrows-ok\ngit-ok\nhead-ok\nfsck-ok\n",
+        "sleep_ms": 3146,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 302,
+          "start_ms": 404.570309,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "cleaner": {
+        "exec_ms": 64829,
+        "out": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186311683,
+          "extents_moved": 2056,
+          "fpac": "cleaned",
+          "head": "1795186311683 1795186311683 1 2cdc58206d7e6fd07775d7ab33470ad1ff72ad75df5dab9e58b68eb12971ec66 clean",
+          "live_after": 73,
+          "live_before": 126,
+          "ms": 64733.127349,
+          "posts": [
+            {
+              "head": "1795186311683 1795186294247 1 51afb781fefb11b018c129e3363694b0a84b17c9ce442556a0e98b68907cff5a",
+              "taken": true
+            },
+            {
+              "head": "1795186311683 1795186311683 1 2cdc58206d7e6fd07775d7ab33470ad1ff72ad75df5dab9e58b68eb12971ec66 clean",
+              "taken": true
+            }
+          ],
+          "segments_compacted": 69,
+          "segments_listed": 136
+        },
+        "segments_listed": 136,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 176,
+          "start_ms": 290.77144799999996,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "cleaner_killed": {
+        "finished_before_the_kill": false,
+        "killed_after_ms": 30000,
+        "log": "{\"fpac\":\"clean-head\",\"head\":\"1795186263356 1795186236228 1 3186f80f07d2a7231653e59efc0b96f07daf64f75d2db163fdc7e13cafd5bdbc\",\"ms\":1631.37988,\"taken\":true}\n",
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 207,
+          "start_ms": 310.447583,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "commit": {
+        "dirty": false,
+        "fpac": "8cca53f73bcb"
+      },
+      "deletes": {
+        "absent": 0,
+        "age_ms_min": 0,
+        "deleted": 98,
+        "deleted_bytes": 741652084,
+        "head": "1795186381926 1795186381926 1 fb0983e89f57fcb097b5681bd757ddca59651c5a20946548d8e5ac0aec462b99 clean",
+        "kept_checkpoints": [
+          "e1795186311683/c1",
+          "e1795186377593/c1",
+          "e1795186381926/c1"
+        ],
+        "ms": 1996,
+        "objects_listed": 204,
+        "planned": 98,
+        "planned_by_kind": {
+          "checkpoints": 3,
+          "packs": 2,
+          "pages": 13,
+          "segments": 80
+        },
+        "planned_bytes": 741652084,
+        "young": 0
+      },
+      "life1": {
+        "mounted_ms": 78.74940699999999,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186217509,
+          "extents_mapped": 0,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 20.355113,
+          "new": true,
+          "pages": 0,
+          "replayed": 0,
+          "rounds": [],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "wal\nwritten\nwritten\n",
+        "sleep_ms": 12555,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 1156,
+          "start_ms": 1257.603118,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "life2": {
+        "mounted_ms": 872.8417539999999,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186236228,
+          "extents_mapped": 8479,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 462.140194,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 20,
+              "failed": 0,
+              "ms": 302.781548
+            }
+          ],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "rewritten\n",
+        "sleep_ms": 3850,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 206,
+          "start_ms": 298.015072,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "life_after_1": {
+        "mounted_ms": 694.85532,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186377593,
+          "extents_mapped": 0,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 618.186527,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 1,
+              "failed": 0,
+              "ms": 459.871331
+            }
+          ],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "noted\n",
+        "sleep_ms": 1482,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 175,
+          "start_ms": 275.853944,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "life_after_2": {
+        "mounted_ms": 483.83059,
+        "opened": {
+          "disk": "clean-1795186217422",
+          "epoch": 1795186381926,
+          "extents_mapped": 157,
+          "fpac": "opened",
+          "memory_locked": true,
+          "ms": 404.875153,
+          "new": false,
+          "pages": 20,
+          "replayed": 0,
+          "rounds": [
+            {
+              "asks": 3,
+              "failed": 0,
+              "ms": 249.517832
+            }
+          ],
+          "sealed": false,
+          "volume_bytes": 20971520000,
+          "writeback_set": true
+        },
+        "out": "noted\n",
+        "sleep_ms": 1284,
+        "start": {
+          "image": "tiny",
+          "internet": false,
+          "object_colo": "DFW",
+          "ready_ms": 236,
+          "start_ms": 379.969724,
+          "version": "aba127c8-6026-4bbe-b38e-dc23f3a07386"
+        }
+      },
+      "measured_at_ms": 1795186403075,
+      "objects_after_compaction": {
+        "bytes": 1400581640,
+        "objects": 193
+      },
+      "objects_after_deletes": {
+        "bytes": 665512140,
+        "objects": 106
+      },
+      "objects_after_the_kill": {
+        "bytes": 1265444180,
+        "objects": 169
+      },
+      "objects_at_end": {
+        "bytes": 766905824,
+        "objects": 114
+      },
+      "objects_before": {
+        "bytes": 1163918216,
+        "objects": 160
+      },
+      "objects_before_deletes": {
+        "bytes": 1407164224,
+        "objects": 204
+      },
+      "sealed": false,
+      "what": "a Cloudflare container per life (2 vCPU, 6 GiB, 20 GB); the stand-in Worker's handler on its machine and R2"
+    }
+  }
+}

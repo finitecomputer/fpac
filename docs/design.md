@@ -160,6 +160,63 @@ than half is left ahead; a read of an extent on its way waits for it
 rather than fetching it twice. A scan that stops early leaves at most a
 window fetched and unread (gets only; reads are not billed as egress).
 
+## The cleaner
+
+What keeps a disk's store from growing with every rewrite
+(`store/src/clean.rs`, `format::plan_deletes`). It is the platform's,
+never the guest's: a guest that could delete could destroy its own past,
+and one that lied could have the platform delete what a kept checkpoint
+needs.
+
+**Compaction** is a life of its own while the disk is asleep. The
+platform mints it an epoch as it would for any start, so the head's rules
+fence it: a wake during a pass is a later life, and the cleaner's next
+head is refused. It opens the disk as a life does, loads every map page
+(so each segment's live extents are known exactly), and chooses the
+segments whose live extents are under COMPACT_LIVE_PERCENT_MAX (half) of
+their images, the emptiest first, up to COMPACT_BYTES_MAX a pass. It
+writes their live extents again: the store cuts them into new, dense
+segments, ships them, checkpoints and posts a clean head. The old
+segments are named by no checkpoint after that one. Every rule of a life
+holds, so a cleaner stopped anywhere leaves a disk that opens (the
+simulator stops one at every step; on Cloudflare one was killed
+mid-pass and the next life found every file). A sealed disk is not
+compacted here: its pages are sealed, so that is its guest's to do.
+
+It is made to run in the platform's Worker, beside R2, so its reads and
+rewrites pay no container egress: the store has no clock, thread or file
+of its own, builds for `wasm32-unknown-unknown` (CI builds it), and
+reaches R2 only through the remote gate, which a Worker implements over
+its bucket binding. The spike runs it as `fpac clean` in a small
+container, through the same route a life uses (`fpac-bench clean`).
+
+**Deletes** are planned from the head the platform stores and the
+KEPT_CHECKPOINTS (3) checkpoints up to it, never from a guest's word.
+Kept: every page, segment, pack and crash pack those checkpoints name;
+the segments a replay from any of them reads (its life's, after its end);
+every object of the head's life and of later lives (a life still
+writing); and every object younger than CLEAN_AGE_MS_MIN (a day).
+Everything else of FPAC's is deleted. Each kept checkpoint is checked
+against R2's SHA-256 as it is read, the head's against the sum the head
+names. A sealed disk's checkpoints are authenticated, not sealed, so the
+platform plans without the key. The delete itself checks each object's
+age again by R2's own record, and refuses while a container runs.
+
+So a rewritten extent's old copy leaves the store a day after the
+checkpoints that named it have passed out of the kept three; until then,
+it is what a wake falls back on. When to run a pass is the platform's
+choice: after a sleep, say, once the listing's segment bytes pass twice
+the live ones.
+
+Measured on Cloudflare (`docs/evidence/clean.json`): a disk of 1.2 GB
+stored, its 512 MiB of files three quarters rewritten in place. A pass
+moved 2,056 extents (128 MiB) out of 69 segments in 65 s, from a 2-vCPU
+container, one extent at a time (the leftover is to read each segment
+whole). Two lives later the delete pass, planned in 2 s, deleted 98
+objects (742 MB): the store went from 1,407 MB to 666 MB. A cleaner killed
+30 s into its pass, and the disk after the deletes, each opened whole:
+every file, SQLite, git and `e2fsck -f -n` checked.
+
 ## Consistency and failure
 
 - **One writer.** A disk's epoch is the platform's start generation. The
@@ -241,6 +298,8 @@ them together. Those already in code are marked with their file.
 | `CHECKPOINT_SEGMENTS`, `REPLAY_SEGMENTS_MAX` | 256 | An open never replays more; the daemon checkpoints at half |
 | `LIVE_SEGMENTS_MAX` | 16,384 | A 100 GB disk at 8 MiB is about 12,000 |
 | `PAGE_EXTENTS` | 4,096 | A map page covers 256 MiB of the disk; a checkpoint rewrites only the pages that changed |
+| `COMPACT_LIVE_PERCENT_MAX`, `COMPACT_BYTES_MAX` | 50, 1 GiB | A segment under half live is compacted; a pass moves at most this much (`store/src/clean.rs`) |
+| `KEPT_CHECKPOINTS`, `CLEAN_AGE_MS_MIN` | 3, a day | What a delete pass keeps: the head's checkpoint and two before it, and anything younger (`store/src/clean.rs`) |
 | `FLUSH_MS`, `CHECKPOINT_MS` | 1,000, 5 min | The loss window; the replay's other bound (`fpac/src/flush.rs`) |
 | `PUTS_IN_FLIGHT` | 8 | Segments shipped at once (`fpac/src/flush.rs`) |
 | The guest's writeback | 5 s expiry, 1 s wakeups | Set by the daemon at its mount: a page only written reaches the device within 5 s, not 30 |
@@ -348,10 +407,7 @@ quote them as they are.
   every page, in the flusher, and lists exactly. An open and a sleep load
   every page only when their list would pass the limit itself, so neither
   grows with the data (a disk past about 64 GiB is past half). The
-  cleaner, which reads every page, keeps it exact (P5's item 6).
-- **Live segments are never compacted**: an extent rewritten often
-  leaves old segments live while any extent in them is current. Bounded
-  by LIVE_SEGMENTS_MAX (asserted); the cleaner's compaction is the fix.
+  cleaner, which reads every page, makes it exact (The cleaner).
 - **The image must carry mke2fs** for a new disk (Hermes' image has
   none; the spike's harness made the disk from the tiny image).
 - The probe's FUSE file is backed by a plain local file (`LocalFile`): a
