@@ -173,13 +173,22 @@ pub struct Cloudflare {
     key: net::Key,
     disk: String,
     volume: u64,
+    image: &'static str,
+    /// The container reaches the internet (the npm image's alone: the
+    /// Worker refuses any other).
+    internet: bool,
 }
 
 impl Cloudflare {
     pub fn new(disk: &str, volume: u64) -> Result<Cloudflare, String> {
         let c = Config::load()?;
         let key = net::Key::load_or_make(&c.driver_key_file);
-        Ok(Cloudflare { c, key, disk: disk.to_string(), volume })
+        Ok(Cloudflare { c, key, disk: disk.to_string(), volume, image: "tiny", internet: false })
+    }
+
+    /// The npm benchmark's place (C): the npm image, with the internet.
+    pub fn npm(disk: &str, volume: u64) -> Result<Cloudflare, String> {
+        Ok(Cloudflare { image: "npm", internet: true, ..Cloudflare::new(disk, volume)? })
     }
 
 }
@@ -189,8 +198,8 @@ impl Place for Cloudflare {
         let _ = net::worker(self.c.host(), &self.key, "POST", "/destroy", &json!({}), Duration::from_secs(60));
         let epoch = crate::now_ms();
         let t0 = Instant::now();
-        let s = net::worker(self.c.host(), &self.key, "POST", "/start", &json!({ "disk": self.disk, "image": "tiny", "epoch": epoch, "volume": self.volume }), Duration::from_secs(300))?;
-        Ok(json!({ "start_ms": t0.elapsed().as_secs_f64() * 1000.0, "ready_ms": s["ready"]["ms"], "object_colo": s["object_colo"], "version": s["version"] }))
+        let s = net::worker(self.c.host(), &self.key, "POST", "/start", &json!({ "disk": self.disk, "image": self.image, "epoch": epoch, "volume": self.volume, "internet": self.internet }), Duration::from_secs(300))?;
+        Ok(json!({ "start_ms": t0.elapsed().as_secs_f64() * 1000.0, "ready_ms": s["ready"]["ms"], "object_colo": s["object_colo"], "version": s["version"], "image": s["image"], "internet": s["internet"] }))
     }
 
     fn sh(&self, script: &str) -> Result<(i64, String), String> {
@@ -647,3 +656,96 @@ pub fn tools(p: &mut dyn Place) -> Result<Value, String> {
     p.kill()?;
     Ok(json!({ "what": p.what(), "start": st, "mount": m["mounted"], "results": by, "daemon": status, "sleep_ms": sl["sleep_ms"], "npm": "not run: the guests have no internet (enableInternet is off), and npm ci needs its registry" }))
 }
+
+/// The npm benchmark's workload (docs/results.md, C): cloudflare/sandbox-sdk
+/// at a pinned commit, installed from its own lockfile.
+const NPM_REPO: &str = "https://github.com/cloudflare/sandbox-sdk";
+const NPM_COMMIT: &str = "61cac81b53334b314e4a4daf04486b9cee9b65c2";
+/// Every top-level package of the tree required once, its time and how
+/// many loaded: a cold start of a program that requires much of the tree.
+const NPM_REQUIRE_ALL: &str = r#"const fs = require('fs'); const t0 = process.hrtime.bigint();
+const lock = JSON.parse(fs.readFileSync('node_modules/.package-lock.json'));
+let loaded = 0, failed = 0;
+for (const k of Object.keys(lock.packages)) { const m = /^node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(k); if (!m) continue; try { require(m[1]); loaded++; } catch (e) { failed++; } }
+console.log(JSON.stringify({ loaded, failed, ms: Number(process.hrtime.bigint() - t0) / 1e6 })); process.exit(0);"#;
+
+/// A shell step's wall time in the guest (ms), its exit code and its last
+/// output, run detached and polled (an install outlasts one exec).
+fn timed(p: &dyn Place, script: &str, tag: &str) -> Result<Value, String> {
+    let wrapped = format!("t0=$(date +%s%N)\n{script}\nrc=$?\nt1=$(date +%s%N)\necho \"FPAC_MS $(( (t1 - t0) / 1000000 ))\"\nexit $rc");
+    let (code, out) = sh_long(p, &wrapped, "", tag)?;
+    let ms: Option<u64> = out.lines().rev().find_map(|l| l.strip_prefix("FPAC_MS ")).and_then(|v| v.trim().parse().ok());
+    let tail: String = out.lines().filter(|l| !l.starts_with("FPAC_MS ")).collect::<Vec<_>>().iter().rev().take(6).rev().cloned().collect::<Vec<_>>().join("\n");
+    Ok(json!({ "code": code, "ms": ms, "tail": tail }))
+}
+
+/// One run of the npm benchmark (C), in a disposable Cloudflare container
+/// with the internet, `variant`: `own` (the container's own disk), `shipped`
+/// (FPAC, node_modules shipped with the rest) or `local` (FPAC, node_modules
+/// on the container's own disk, so a wake installs it again). Never run on
+/// this machine: an install runs its packages' own scripts.
+pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
+    assert!(["own", "shipped", "local"].contains(&variant));
+    let fpac = variant != "own";
+    let w = if fpac { "/data/work" } else { "/root/work" };
+    let sb = format!("{w}/sb");
+    let local_nm = |p: &dyn Place| -> Result<(), String> {
+        // the bind mount survives `npm ci`, which empties node_modules
+        let (c, o) = p.sh(&format!("mkdir -p /scratch/nm {sb}/node_modules && mount --bind /scratch/nm {sb}/node_modules && echo bound"))?;
+        if c != 0 || !o.contains("bound") {
+            return Err(format!("node_modules local: {o}"));
+        }
+        Ok(())
+    };
+    // life 1: fetch, install cold, install again warm, sleep at once
+    let start1 = p.start()?;
+    let mount1 = if fpac { mount(p)? } else { Value::Null };
+    let fetch = timed(p, &format!("mkdir -p {sb} && cd {sb} && git init -q && git fetch -q --depth 1 {NPM_REPO} {NPM_COMMIT} && git checkout -q FETCH_HEAD"), "fetch")?;
+    if variant == "local" {
+        local_nm(p)?;
+    }
+    if fpac {
+        p.sh(SAMPLER)?;
+    }
+    let before = status(p);
+    let install = timed(p, &format!("cd {sb} && npm ci --no-audit --no-fund --loglevel=error"), "install1")?;
+    let after = status(p);
+    let (_, tree) = p.sh(&format!("cd {sb} && echo files $(find node_modules -type f | wc -l) bytes $(du -sb node_modules | cut -f1) packages $(ls node_modules | wc -l)"))?;
+    let again = timed(p, &format!("cd {sb} && npm ci --no-audit --no-fund --loglevel=error"), "install2")?;
+    let after_again = status(p);
+    let timeline: Vec<Value> = if fpac {
+        let (_, log) = p.sh("kill $(cat /tmp/sampler.pid) 2>/dev/null; cat /tmp/status.log")?;
+        log.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|s| json!({ "up_ms": s["up_ms"], "unshipped": s["unshipped_extents"], "full_waits": s["full_waits"], "lock_waits_over_1ms": s["lock_waits_over_1ms"], "shipped": s["bytes_shipped"] })).collect()
+    } else {
+        Vec::new()
+    };
+    let sleep1 = if fpac { sleep(p)? } else { Value::Null };
+    let shipped = status(p);
+    // life 2: a wake; what it must install again; a cold start, then warm
+    let start2 = p.start()?;
+    let mount2 = if fpac { mount(p)? } else { Value::Null };
+    let reinstall = match variant {
+        "own" => Some(timed(p, &format!("mkdir -p {sb} && cd {sb} && git init -q && git fetch -q --depth 1 {NPM_REPO} {NPM_COMMIT} && git checkout -q FETCH_HEAD && npm ci --no-audit --no-fund --loglevel=error"), "reinstall")?),
+        "local" => {
+            local_nm(p)?;
+            Some(timed(p, &format!("cd {sb} && npm ci --no-audit --no-fund --loglevel=error"), "reinstall")?)
+        }
+        _ => None,
+    };
+    p.sh(&format!("cat > {sb}/fpac-require-all.cjs <<'FPAC_EOF'\n{NPM_REQUIRE_ALL}\nFPAC_EOF\necho ok"))?;
+    let misses0 = status(p)["misses"].as_u64();
+    let node_cold = timed(p, &format!("cd {sb} && timeout 600 node fpac-require-all.cjs"), "nodecold")?;
+    let misses1 = status(p)["misses"].as_u64();
+    let node_warm = timed(p, &format!("cd {sb} && timeout 600 node fpac-require-all.cjs"), "nodewarm")?;
+    let sleep2 = if fpac { sleep(p)? } else { Value::Null };
+    let _ = p.kill();
+    let bytes = shipped["bytes_shipped"].as_u64();
+    Ok(json!({
+        "evidence": "npm", "variant": variant, "workload": { "repo": NPM_REPO, "commit": NPM_COMMIT, "install": "npm ci --no-audit --no-fund (its lockfile, lockfileVersion 3)", "tree": tree.trim() },
+        "life1": { "start": start1, "mount": mount1, "fetch": fetch, "install_cold": install, "install_warm_disk": again, "status_before": before, "status_after_install": after, "status_after_second": after_again, "timeline": timeline, "sleep": sleep1 },
+        "shipped_bytes": bytes, "egress_usd_at_0_026_per_gb": bytes.map(|b| (b as f64 / 1e9 * 0.026 * 10000.0).round() / 10000.0),
+        "life2": { "start": start2, "mount": mount2, "reinstall": reinstall, "node_cold": node_cold, "node_warm": node_warm, "misses_during_cold_start": misses0.zip(misses1).map(|(a, b)| b.saturating_sub(a)), "sleep": sleep2 },
+        "what": "a Cloudflare container of the spike's Worker (2 vCPU, 6 GiB, 20 GB), the npm image (node:22-bookworm, pinned by digest) with the internet on for its starts alone; the stand-in Worker's handler and R2",
+    }))
+}
+
