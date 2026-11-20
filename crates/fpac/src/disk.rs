@@ -18,7 +18,7 @@ use fpac_device::serve::{Backing, BackingError};
 use fpac_format::limits::{AHEAD_EXTENTS_MAX, AHEAD_PIECE_EXTENTS, DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX};
 use fpac_remote::Remote;
 use fpac_format::PageRef;
-use fpac_store::evict::{Evictor, Taken};
+use fpac_store::evict::{Evictor, Taken, Verdict};
 use fpac_store::{page_name, CacheGate, Fetch, Need, Read, Store, StoreError};
 
 /// Connections kept to the remote, at most: the FUSE threads' and the
@@ -41,7 +41,7 @@ const STREAMS_MAX: usize = 8;
 const STREAM_GAP_EXTENTS: u64 = 8;
 /// Connections one read-ahead window fetches on, and windows in flight at
 /// once across every scan.
-const AHEAD_FETCHES: usize = 4;
+const AHEAD_FETCHES: usize = 8;
 const AHEAD_WINDOWS_MAX: usize = 4;
 
 /// The cache file: one sparse file of the volume's size on the container's
@@ -286,7 +286,14 @@ impl Disk {
         // once nothing it holds may go.
         while inner.store.cached_extents() > self.cache_max {
             let store = &inner.store;
-            let Some(e) = ev.victim(|x| !fresh.contains(&x) && !pinned.contains_key(&x) && store.may_leave(x)) else { break };
+            let verdict = |x: u64| match () {
+                _ if !store.is_cached(x) => Verdict::Gone,
+                _ if fresh.contains(&x) || pinned.contains_key(&x) => Verdict::Keep,
+                // unshipped, or the next pack's: not until it is clean
+                _ if !store.may_leave(x) => Verdict::Park,
+                _ => Verdict::Drop,
+            };
+            let Some(e) = ev.victim(verdict) else { break };
             if inner.store.evict(&mut inner.cache, e)? {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
@@ -298,6 +305,13 @@ impl Disk {
     /// threads hold it.
     pub fn set_me(self: &Arc<Self>) {
         let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// Extents whose cut landed are clean: the policy may drop them again.
+    pub fn cleaned(&self, extents: Vec<u64>) {
+        if !extents.is_empty() {
+            self.evict.lock().unwrap().unpark(extents.into_iter());
+        }
     }
 
     /// A read of `extent` hit the cache: a use, for the policy.

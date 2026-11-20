@@ -27,6 +27,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// The most a count goes to (two bits, as the paper's).
 const FREQ_MAX: u8 = 3;
 
+/// What the caller says of a candidate (`victim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// It may leave now.
+    Drop,
+    /// Not now (a write is reading it, or it was just taken): back into the
+    /// main queue, asked again later.
+    Keep,
+    /// Not until it is clean (unshipped, or kept for the next pack): out of
+    /// the queues, so a pass never looks at it, until `unpark`.
+    Park,
+    /// It left the cache another way: forgotten.
+    Gone,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Taken {
     /// Fetched for a read, or written: the taking is its first use.
@@ -58,13 +73,16 @@ pub struct Evictor {
     ghost: VecDeque<u64>,
     ghosts: HashSet<u64>,
     entries: HashMap<u64, Entry>,
+    /// Extents out of the queues until they are clean (`Verdict::Park`):
+    /// a burst's unshipped gigabytes are not scanned by every drop.
+    parked: HashSet<u64>,
 }
 
 impl Evictor {
     /// A policy for a cache of `bound` extents.
     pub fn new(bound: usize) -> Evictor {
         assert!(bound >= 10, "a cache of at least ten extents");
-        Evictor { small_max: bound / 10, ghost_max: bound, small: VecDeque::new(), main: VecDeque::new(), ghost: VecDeque::new(), ghosts: HashSet::new(), entries: HashMap::new() }
+        Evictor { small_max: bound / 10, ghost_max: bound, small: VecDeque::new(), main: VecDeque::new(), ghost: VecDeque::new(), ghosts: HashSet::new(), entries: HashMap::new(), parked: HashSet::new() }
     }
 
     /// Extents the policy knows to be in the cache.
@@ -79,7 +97,7 @@ impl Evictor {
     /// The cache took `extent` (a fetch, a write, a read ahead); if it
     /// holds it already, this is a use.
     pub fn taken(&mut self, extent: u64, how: Taken) {
-        if self.entries.contains_key(&extent) {
+        if self.entries.contains_key(&extent) || self.parked.contains(&extent) {
             if how == Taken::Used {
                 self.used(extent);
             }
@@ -112,12 +130,36 @@ impl Evictor {
     pub fn gone(&mut self, extent: u64) {
         // its queue slot is dropped lazily, when it comes up
         self.entries.remove(&extent);
+        self.parked.remove(&extent);
+    }
+
+    /// Parked extents that are clean now (their cut landed): back into
+    /// the queue they would be in, main if they were used again.
+    pub fn unpark(&mut self, extents: impl Iterator<Item = u64>) {
+        for x in extents {
+            if !self.parked.remove(&x) {
+                continue;
+            }
+            let Some(e) = self.entries.get_mut(&x) else { continue };
+            if e.freq > 0 {
+                e.queue = Queue::Main;
+                self.main.push_back(x);
+            } else {
+                e.queue = Queue::Small;
+                self.small.push_back(x);
+            }
+        }
+    }
+
+    /// Extents parked until they are clean.
+    pub fn parked(&self) -> usize {
+        self.parked.len()
     }
 
     /// The next extent to drop, asking `can_drop` of each candidate; at
     /// most `tries` candidates (each queue's length bounds a pass). None
     /// when nothing it was asked about may go.
-    pub fn victim(&mut self, mut can_drop: impl FnMut(u64) -> bool) -> Option<u64> {
+    pub fn victim(&mut self, mut verdict: impl FnMut(u64) -> Verdict) -> Option<u64> {
         // Bounded: each pass looks at an extent at most once per queue
         // turn; a kept one is put back, so twice the length ends it.
         let mut tries = 2 * (self.small.len() + self.main.len()) + 2;
@@ -146,15 +188,26 @@ impl Evictor {
                 self.main.push_back(x);
                 continue;
             }
-            if !can_drop(x) {
-                // dirty, shipping or being read: kept, asked again later
-                if !from_small {
-                    kept += 1;
+            match verdict(x) {
+                Verdict::Drop => {}
+                Verdict::Keep => {
+                    // being read, or just taken: asked again later
+                    if !from_small {
+                        kept += 1;
+                    }
+                    e.queue = Queue::Main;
+                    self.entries.insert(x, e);
+                    self.main.push_back(x);
+                    continue;
                 }
-                e.queue = Queue::Main;
-                self.entries.insert(x, e);
-                self.main.push_back(x);
-                continue;
+                Verdict::Park => {
+                    self.parked.insert(x);
+                    continue;
+                }
+                Verdict::Gone => {
+                    self.entries.remove(&x);
+                    continue;
+                }
             }
             self.entries.remove(&x);
             if from_small {
@@ -190,7 +243,7 @@ mod tests {
             cached.insert(x);
             ev.taken(x, Taken::Used);
             while cached.len() > bound {
-                let v = ev.victim(|_| true).expect("something to drop");
+                let v = ev.victim(|_| Verdict::Drop).expect("something to drop");
                 assert!(cached.remove(&v));
             }
         }
@@ -229,7 +282,7 @@ mod tests {
             ev.taken(x, Taken::Ahead);
             ev.used(x);
             while cached.len() > bound {
-                let v = ev.victim(|_| true).unwrap();
+                let v = ev.victim(|_| Verdict::Drop).unwrap();
                 cached.remove(&v);
             }
         }
@@ -245,12 +298,45 @@ mod tests {
         for x in 1..=3 {
             ev.taken(x, Taken::Used);
         }
-        assert_eq!(ev.victim(|x| x == 3), Some(3));
-        assert_eq!(ev.victim(|_| false), None);
+        assert_eq!(ev.victim(|x| if x == 3 { Verdict::Drop } else { Verdict::Keep }), Some(3));
+        assert_eq!(ev.victim(|_| Verdict::Keep), None);
         assert_eq!(ev.len(), 2);
         ev.gone(1);
-        assert_eq!(ev.victim(|_| true), Some(2));
-        assert_eq!(ev.victim(|_| true), None);
+        assert_eq!(ev.victim(|_| Verdict::Drop), Some(2));
+        assert_eq!(ev.victim(|_| Verdict::Drop), None);
+    }
+
+    // Goal: a burst's unshipped extents cost a drop nothing: each is asked
+    // once and parked, and a later pass asks only of the clean ones; landed
+    // and unparked, they may go again. Method: 10,000 extents taken, all
+    // but ten unshipped; drops counted in asks; then all unparked.
+    #[test]
+    fn unshipped_extents_are_parked_not_scanned() {
+        let mut ev = Evictor::new(1000);
+        for x in 0..10_000u64 {
+            ev.taken(x, Taken::Used);
+        }
+        let mut asks = 0;
+        let mut dropped = Vec::new();
+        for _ in 0..10 {
+            let v = ev.victim(|x| {
+                asks += 1;
+                if x % 1000 == 0 { Verdict::Drop } else { Verdict::Park }
+            });
+            dropped.push(v.expect("a clean one"));
+        }
+        assert_eq!(dropped.len(), 10);
+        assert!(asks <= 10_000 + 10, "each unshipped extent asked about once: {asks}");
+        // the rest of the burst is parked by the next pass, once each
+        let before = asks;
+        assert_eq!(ev.victim(|x| { asks += 1; if x % 1000 == 0 { Verdict::Drop } else { Verdict::Park } }), None);
+        assert_eq!(asks - before, 999, "each of the rest asked about once");
+        let before = asks;
+        assert_eq!(ev.victim(|_| { asks += 1; Verdict::Drop }), None, "nothing in the queues");
+        assert_eq!(asks, before, "and nothing parked was asked about");
+        ev.unpark(0..10_000);
+        assert_eq!(ev.parked(), 0);
+        assert!(ev.victim(|_| Verdict::Drop).is_some(), "landed, they may go");
     }
 
     // Goal: an extent taken again soon after it left (its number a ghost)

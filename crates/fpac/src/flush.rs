@@ -374,7 +374,8 @@ fn land(disk: &Disk, p: &Progress, ended: &mut Vec<Ended>, in_flight: &mut usize
     for e in ended.drain(..) {
         *in_flight -= 1;
         e.result?;
-        disk.inner.lock().unwrap().store.landed(e.seq);
+        let cleaned = disk.inner.lock().unwrap().store.landed(e.seq);
+        disk.cleaned(cleaned);
         *since += 1;
         p.segments.fetch_add(1, Ordering::Relaxed);
         p.bytes.fetch_add(e.bytes, Ordering::Relaxed);

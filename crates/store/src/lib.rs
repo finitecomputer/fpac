@@ -1050,10 +1050,13 @@ impl Store {
     /// Segment `seq` of this life landed. The map moves a whole cut at a
     /// time, in segment order: a cut counts only once every segment of it
     /// has landed, so the map (and any checkpoint of it) is always a real
-    /// moment of the disk; a segment that landed early waits.
-    pub fn landed(&mut self, seq: u64) {
+    /// moment of the disk; a segment that landed early waits. Answers the
+    /// extents that became clean (the cache's policy may drop them now).
+    pub fn landed(&mut self, seq: u64) -> Vec<u64> {
         let s = self.shipping.get_mut(&seq).expect("a segment this life shipped");
         s.landed = true;
+        // the extents that became clean, for the cache's policy
+        let mut cleaned = Vec::new();
         // Bounded by the segments in flight.
         loop {
             // the first cut in flight: its segments up to its last
@@ -1070,7 +1073,7 @@ impl Store {
                 }
             }
             if !complete {
-                return;
+                return cleaned;
             }
             for q in cut {
                 let s = self.shipping.remove(&q).expect("present");
@@ -1081,6 +1084,7 @@ impl Store {
                     self.pages_dirty.insert(page_of(*e));
                     if self.local.get(e) == Some(&Local::Shipping(q)) {
                         self.set_local(*e, Some(Local::Clean));
+                        cleaned.push(*e);
                     }
                     if !loc.is_zero() {
                         // the most recent PACK_EXTENTS_MAX, each once,
