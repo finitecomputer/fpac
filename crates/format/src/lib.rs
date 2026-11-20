@@ -726,6 +726,7 @@ pub fn sealed_pack_header_len(count: usize) -> usize {
 /// under the name, each extent at its place in the pack. Answers the
 /// object and its plain header's SHA-256 (what its PackRef names).
 pub fn encode_pack_sealed(s: &Sealer, name: &str, extents: &[(u64, Loc, &[u8])]) -> (Vec<u8>, Sum) {
+    assert!(extents.len() <= seal::PACK_EXTENTS_SEALED_MAX as usize, "a sealed pack's extents within their limit");
     let entries: Vec<(u64, Loc)> = extents.iter().map(|(e, l, _)| (*e, *l)).collect();
     let mut w = W(Vec::with_capacity(sealed_pack_header_len(extents.len()) + extents.len() * SEALED_EXTENT_BYTES as usize));
     w.bytes(seal::PACK_SEALED_MAGIC);
@@ -758,7 +759,7 @@ pub fn decode_pack_header_sealed(s: &Sealer, name: &str, b: &[u8]) -> Result<(Pa
     if r.u32()? != 0 {
         return Err(FormatError::Layout("a sealed pack's reserved field"));
     }
-    if count == 0 || count > PACK_EXTENTS_MAX {
+    if count == 0 || count > seal::PACK_EXTENTS_SEALED_MAX {
         return Err(FormatError::Limit("a pack's extents"));
     }
     let body = r.take(pack_header_len(count as usize))?;

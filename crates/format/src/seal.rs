@@ -24,7 +24,7 @@
 use aes_gcm_siv::aead::{AeadInOut, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce, Tag};
 
-use crate::limits::{EXTENT_BYTES, PACK_EXTENTS_MAX, SEGMENT_EXTENTS_MAX};
+use crate::limits::{EXTENT_BYTES, PACK_ENTRY_BYTES, PACK_EXTENTS_MAX, PACK_FIXED_BYTES, PACK_OBJECT_BYTES_MAX, SEGMENT_BYTES_MAX, SEGMENT_EXTENTS_MAX, SEGMENT_HEADER_BYTES_MAX};
 use crate::{sha256, FormatError, SegId};
 
 pub const TAG_BYTES: u32 = 16;
@@ -39,6 +39,16 @@ const OBJECT_SEALED_MAGIC: &[u8; 8] = b"FPACSEAL";
 const DOMAIN: &[u8; 8] = b"fpacsiv1";
 
 const _: () = assert!(SEGMENT_EXTENTS_MAX <= u32::MAX / SEALED_EXTENT_BYTES && PACK_EXTENTS_MAX <= u32::MAX / SEALED_EXTENT_BYTES);
+
+/// A sealed pack's extents, at most: each carries its tag, so one fewer
+/// than a plain pack's (a full one was refused 413 at 100,683,808 bytes).
+pub const PACK_EXTENTS_SEALED_MAX: u32 = PACK_EXTENTS_MAX - 1;
+/// A sealed pack's largest object; within the plain one's, so every limit
+/// asserted of that holds of it.
+pub const PACK_SEALED_OBJECT_BYTES_MAX: u64 = SEALED_PREFIX_BYTES as u64 + PACK_FIXED_BYTES + PACK_EXTENTS_SEALED_MAX as u64 * PACK_ENTRY_BYTES + 32 + TAG_BYTES as u64 + PACK_EXTENTS_SEALED_MAX as u64 * SEALED_EXTENT_BYTES as u64;
+const _: () = assert!(PACK_SEALED_OBJECT_BYTES_MAX <= PACK_OBJECT_BYTES_MAX);
+/// A sealed segment at its most extents stays within SEGMENT_BYTES_MAX.
+const _: () = assert!(SEALED_PREFIX_BYTES as u64 + SEGMENT_HEADER_BYTES_MAX as u64 + TAG_BYTES as u64 + SEGMENT_EXTENTS_MAX as u64 * SEALED_EXTENT_BYTES as u64 <= SEGMENT_BYTES_MAX);
 
 /// What a seal binds, beside the disk.
 #[derive(Debug, Clone, Copy)]

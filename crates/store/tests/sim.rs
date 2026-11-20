@@ -869,7 +869,22 @@ fn a_stale_pack_entry_is_ignored() {
 // from the pack.
 #[test]
 fn a_full_pack_fits_one_object() {
+    full_pack_fits(false);
+}
+
+// Goal: the same for a sealed pack, whose extents each carry a tag (a
+// sealed 1 GB fill on krun was refused 413 at 100,683,808 bytes, and its
+// sleep failed). Method: as above, sealed.
+#[test]
+fn a_full_sealed_pack_fits_one_object() {
+    full_pack_fits(true);
+}
+
+fn full_pack_fits(sealed: bool) {
     let mut remote = SimRemote::new(11, CALM);
+    if sealed {
+        remote.seal = Some(std::sync::Arc::new(Sealer::new(&[4u8; 32], "sim")));
+    }
     let mut platform = Platform { head: None, running: 0 };
     let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
     life.post_head().unwrap();

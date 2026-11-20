@@ -1240,6 +1240,8 @@ impl Store {
     /// A pack of `order`'s extents, each once, each clean in the cache
     /// (its bytes the map's), up to `max`.
     fn build_pack(&mut self, cache: &mut dyn CacheGate, order: Vec<u64>, max: usize) -> Result<Option<(String, Vec<u8>, PackRef)>, StoreError> {
+        // a sealed extent carries its tag: one fewer fits the object
+        let max = if self.seal.is_some() { max.min(format::seal::PACK_EXTENTS_SEALED_MAX as usize) } else { max };
         let seq = self.next_pack;
         let mut images: Vec<(u64, Loc, Vec<u8>)> = Vec::new();
         let mut taken = BTreeSet::new();
