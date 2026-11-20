@@ -98,8 +98,16 @@ fn guest_json(stdout: &str) -> Result<Value, String> {
     serde_json::from_str(line).map_err(|e| format!("the guest's JSON: {e}"))
 }
 
-/// Merges `value` into `docs/evidence/<name>.json` under `place`.
+/// Merges `value` into `docs/evidence/<name>.json` under `place`. With
+/// `FPAC_EVIDENCE=<file>` set, into `docs/evidence/<file>.json` instead,
+/// under `<name>-<place>` (a measurement of its own, such as
+/// encryption.json's plain and sealed runs).
 fn write(name: &str, place: &str, value: &Value) {
+    let (name, place) = match std::env::var("FPAC_EVIDENCE") {
+        Ok(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') => (f, format!("{name}-{place}")),
+        _ => (name.to_string(), place.to_string()),
+    };
+    let (name, place) = (name.as_str(), place.as_str());
     let path = repo().join("docs/evidence").join(format!("{name}.json"));
     let mut doc: Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({ "evidence": name, "places": {} }));
     doc["places"][place] = value.clone();
@@ -320,6 +328,8 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
     r.map(|mut v| {
         v["objects_at_end"] = objects;
         v["bulk_data_deleted"] = cleaned;
+        // the disk's objects sealed (FPAC_ENCRYPT, docs/encryption.md)
+        v["sealed"] = json!(std::env::var_os("FPAC_ENCRYPT").is_some());
         v
     })
 }

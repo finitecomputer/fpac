@@ -191,3 +191,74 @@ fn deletes_are_planned_from_kept_checkpoints_only() {
     plan.sort();
     assert_eq!(plan, vec!["e4/c1", "e5/m3-1", "e5/s2"]);
 }
+
+// Goal: a sealed segment's header and images open where they were
+// sealed, and nowhere else: any byte changed, another key, another
+// segment's name, or two images swapped is refused. Method: a segment of
+// two images and a zero; each refusal in turn.
+#[test]
+fn sealed_segments_open_only_where_sealed() {
+    let s = Sealer::new(&[9u8; 32], "disk-a");
+    let (a, b) = (extent(1), extent(2));
+    let id = SegId { epoch: 4, seq: 7 };
+    let images = [Image { extent: 3, bytes: Some(&a) }, Image { extent: 9, bytes: None }, Image { extent: 10, bytes: Some(&b) }];
+    let obj = encode_segment_sealed(&s, id, GENESIS, 2, true, &images);
+    let h = decode_segment_header_sealed(&s, id, &obj).unwrap();
+    assert_eq!(h.entries.len(), 3);
+    let hl = sealed_segment_header_len(3);
+    assert_eq!(h.entries[0].offset as usize, hl);
+    assert_eq!(h.entries[2].offset as usize, hl + SEALED_EXTENT_BYTES as usize);
+    let open = |e: &Entry, obj: &[u8]| {
+        let mut out = vec![0u8; EXTENT_BYTES as usize];
+        let at = e.offset as usize;
+        s.open_extent(Place::Image { seg: id, extent: e.extent, offset: e.offset }, &obj[at..at + SEALED_EXTENT_BYTES as usize], e.sum, &mut out).map(|()| out)
+    };
+    assert_eq!(open(&h.entries[0], &obj).unwrap(), a);
+    assert_eq!(open(&h.entries[2], &obj).unwrap(), b);
+    // the images hold no plain bytes
+    assert!(!obj.windows(64).any(|w| w == &a[..64]));
+    for i in [0, 12, 20, hl - 1, hl, hl + 100, obj.len() - 1] {
+        let mut bad = obj.clone();
+        bad[i] ^= 1;
+        let refused = if i < hl { decode_segment_header_sealed(&s, id, &bad).is_err() } else { open(&h.entries[if i < hl + SEALED_EXTENT_BYTES as usize { 0 } else { 2 }], &bad).is_err() };
+        assert!(refused, "byte {i} changed");
+    }
+    assert_eq!(decode_segment_header_sealed(&Sealer::new(&[8u8; 32], "disk-a"), id, &obj).err(), Some(FormatError::Sealed));
+    assert_eq!(decode_segment_header_sealed(&Sealer::new(&[9u8; 32], "disk-b"), id, &obj).err(), Some(FormatError::Sealed));
+    assert_eq!(decode_segment_header_sealed(&s, SegId { epoch: 4, seq: 8 }, &obj).err(), Some(FormatError::Sealed));
+    // an image moved to the other's place does not open there
+    let (e0, e2) = (h.entries[0], h.entries[2]);
+    let moved = Entry { offset: e2.offset, ..e0 };
+    let mut swapped = obj.clone();
+    let n = SEALED_EXTENT_BYTES as usize;
+    swapped.copy_within(e0.offset as usize..e0.offset as usize + n, e2.offset as usize);
+    assert!(open(&moved, &swapped).is_err(), "an image is bound to its offset");
+    assert!(open(&Entry { extent: 11, ..e0 }, &obj).is_err(), "and to its extent");
+}
+
+// Goal: a sealed pack opens extent by extent at its places, and a sealed
+// page or checkpoint opens only under its own name. Method: a pack of two
+// extents; a page sealed and opened under two names.
+#[test]
+fn sealed_packs_and_objects_open_only_where_sealed() {
+    let s = Sealer::new(&[5u8; 32], "disk-a");
+    let (a, b) = (extent(3), extent(4));
+    let la = Loc { seg: SegId { epoch: 1, seq: 2 }, offset: 4096, len: EXTENT_BYTES, sum: 77 };
+    let lb = Loc { seg: SegId { epoch: 1, seq: 3 }, offset: 4096, len: EXTENT_BYTES, sum: 78 };
+    let (obj, sum) = encode_pack_sealed(&s, "e1/p1", &[(5, la, &a), (6, lb, &b)]);
+    let (h, sum2) = decode_pack_header_sealed(&s, "e1/p1", &obj).unwrap();
+    assert_eq!((h.entries, sum2), (vec![(5, la), (6, lb)], sum));
+    assert!(decode_pack_header_sealed(&s, "e1/p2", &obj).is_err());
+    let at = sealed_pack_header_len(2) + SEALED_EXTENT_BYTES as usize;
+    let mut out = vec![0u8; EXTENT_BYTES as usize];
+    let sealed = &obj[at..at + SEALED_EXTENT_BYTES as usize];
+    let tag: [u8; 16] = sealed[EXTENT_BYTES as usize..].try_into().unwrap();
+    s.open_extent(Place::Packed { pack: "e1/p1", index: 1, extent: 6 }, sealed, Sealer::sum_of(&tag), &mut out).unwrap();
+    assert_eq!(out, b);
+    assert!(s.open_extent(Place::Packed { pack: "e1/p1", index: 0, extent: 6 }, sealed, Sealer::sum_of(&tag), &mut out).is_err());
+    let page = encode_page(0, &[(3, la)]);
+    let sealed = s.seal_object("e1/m1-0", &page);
+    assert_eq!(s.open_object("e1/m1-0", &sealed).unwrap(), page);
+    assert_eq!(s.open_object("e1/m1-1", &sealed), Err(FormatError::Sealed));
+    assert!(!sealed.windows(8).any(|w| w == b"FPACMAP1"), "a sealed page shows nothing plain");
+}

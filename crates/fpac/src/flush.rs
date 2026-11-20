@@ -122,12 +122,22 @@ pub fn first_head(disk: &Disk, p: &Progress) -> Result<(), StoreError> {
 /// kept apart since its cut are swapped in, not behind its 8 MiB read
 /// and its checksums.
 fn build(disk: &Disk) -> Result<Option<Outgoing>, StoreError> {
-    let Some(b) = disk.inner.lock().unwrap().store.build_take()? else { return Ok(None) };
-    let mut bytes = disk.read_unlocked(b.extents())?;
-    {
+    let (b, seals) = {
+        let mut g = disk.inner.lock().unwrap();
+        let Some(b) = g.store.build_take()? else { return Ok(None) };
+        let seals = g.cache.seals_of(b.extents());
+        (b, seals)
+    };
+    let (mut bytes, opened) = disk.read_unlocked(b.extents(), seals)?;
+    let replaced = {
         let mut g = disk.inner.lock().unwrap();
         let Inner { store, cache } = &mut *g;
-        store.build_resolve(cache, &b, &mut bytes)?;
+        store.build_resolve(cache, &b, &mut bytes)?
+    };
+    // a sealed extent that did not open is good only where a write since
+    // the take replaced it with its kept copy
+    if let Some(i) = (0..bytes.len()).find(|&i| !opened[i] && !replaced[i]) {
+        return Err(StoreError::Corrupt(format!("extent {}: the cache's seal does not open", b.extents()[i])));
     }
     let body = b.encode(&bytes);
     Ok(Some(disk.inner.lock().unwrap().store.build_done(b, body)))

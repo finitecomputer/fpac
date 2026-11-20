@@ -9,11 +9,13 @@
 //! fpac-probe rangecheck --mode stream|tee|buffer --pattern aligned|unaligned --count <n> --threads <t> --size-max <bytes> [--out <file>] [--host <h>] [--port <p>] [--tag <t>]
 //! fpac-probe fsbench --dir <dir>
 //! fpac-probe idle
+//! fpac-probe aead
 //!
 //! `--check-only` reads what the place offers and changes nothing: no
 //! node made, nothing mounted, no loop device attached. It is the only
 //! mode run in a container that shares this box's kernel.
 
+mod aead;
 #[cfg(target_os = "linux")]
 mod fsbench;
 mod path;
@@ -55,6 +57,7 @@ fn main() {
         #[cfg(target_os = "linux")]
         Some("probe") => probe::run(args.iter().any(|a| a == "--check-only"), &arg(&args, "--dir").unwrap_or_else(|| "/var/tmp/fpac-probe".into())),
         Some("path") => path::run(&host, port, &tag),
+        Some("aead") => aead::run(),
         Some("rangecheck") => path::rangecheck(&host, port, &tag, &args),
         #[cfg(target_os = "linux")]
         Some("fsbench") => fsbench::run(&arg(&args, "--dir").unwrap_or_else(|| "/data".into())),

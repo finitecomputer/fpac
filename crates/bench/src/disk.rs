@@ -216,6 +216,21 @@ impl Place for Cloudflare {
     }
 }
 
+/// Whether this run's disks are sealed (`FPAC_ENCRYPT` set): the test
+/// data key the local config names, as hex.
+pub fn sealed_key() -> Result<Option<String>, String> {
+    if std::env::var_os("FPAC_ENCRYPT").is_none() {
+        return Ok(None);
+    }
+    let c = crate::config::Config::load()?;
+    let f = c.test_data_key_file.ok_or("FPAC_ENCRYPT is set and the local config names no test_data_key_file")?;
+    let hex = std::fs::read_to_string(&f).map_err(|e| format!("the test key file: {e}"))?.trim().to_string();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err("the test key file holds no key (64 lowercase hex digits)".into());
+    }
+    Ok(Some(hex))
+}
+
 /// Starts the daemon and waits for its mount: its events, by name, in ms.
 pub fn mount(p: &dyn Place) -> Result<Value, String> {
     mount_with(p, "")
@@ -223,6 +238,17 @@ pub fn mount(p: &dyn Place) -> Result<Value, String> {
 
 /// `fpac mount` with more arguments (`--cache-max <bytes>`, say).
 pub fn mount_with(p: &dyn Place, extra: &str) -> Result<Value, String> {
+    let extra = match sealed_key()? {
+        // the test key into the guest's tmpfs, mode 600, then named
+        Some(hex) => {
+            let (code, out) = p.sh(&format!("mkdir -p /run/fpac && (umask 077; printf '%s\\n' {hex} > /run/fpac/key) && echo keyed"))?;
+            if code != 0 || !out.contains("keyed") {
+                return Err(format!("the key file: {out}"));
+            }
+            format!("{extra} --key-file /run/fpac/key")
+        }
+        None => extra.to_string(),
+    };
     let (code, out) = p.sh(&format!("mkdir -p /run/fpac && setsid nohup /usr/local/bin/fpac mount --dir /data {extra} > /run/fpac/log 2>&1 < /dev/null & echo started"))?;
     if code != 0 || !out.contains("started") {
         return Err(format!("the daemon did not start: {out}"));

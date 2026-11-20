@@ -31,7 +31,7 @@ pub mod head;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fpac_format::limits::*;
-use fpac_format::{self as format, Checkpoint, Image, Link, Loc, PackRef, PageRef, SegId, Sum, GENESIS};
+use fpac_format::{self as format, Checkpoint, Image, Link, Loc, PackRef, PageRef, Place, SegId, Sealer, Sum, GENESIS, SEALED_EXTENT_BYTES};
 use fpac_remote::{Put, RemoteError};
 
 pub use gates::{Ask, CacheGate, MemCache, RemoteGate};
@@ -76,6 +76,11 @@ pub struct OpenInfo {
     pub epoch: u64,
     pub volume_bytes: u64,
     pub head: Option<Head>,
+    /// The disk's data key, when it is sealed (docs/encryption.md): every
+    /// object this life reads must open with it, and every one it writes
+    /// is sealed. A disk is sealed or plain for good: the other kind's
+    /// objects are refused by their magic.
+    pub seal: Option<std::sync::Arc<Sealer>>,
 }
 
 /// An object for the caller to put.
@@ -135,6 +140,8 @@ pub struct Fetch {
     pub len: usize,
     extent: u64,
     run: Vec<(u64, Loc)>,
+    /// An image's bytes in the object: 64 KiB, and its tag when sealed.
+    stride: u32,
 }
 
 impl Fetch {
@@ -146,7 +153,7 @@ impl Fetch {
     /// The same fetch for the extent asked for alone.
     pub fn single(&self) -> Fetch {
         let first = self.run[0];
-        Fetch { name: self.name.clone(), offset: self.offset, len: EXTENT_BYTES as usize, extent: self.extent, run: vec![first] }
+        Fetch { name: self.name.clone(), offset: self.offset, len: self.stride as usize, extent: self.extent, run: vec![first], stride: self.stride }
     }
 }
 
@@ -184,6 +191,7 @@ pub struct Building {
     cut: u64,
     last_of_cut: bool,
     extents: Vec<u64>,
+    seal: Option<std::sync::Arc<Sealer>>,
 }
 
 impl Building {
@@ -198,7 +206,10 @@ impl Building {
     pub fn encode(&self, bytes: &[Vec<u8>]) -> Vec<u8> {
         assert_eq!(bytes.len(), self.extents.len());
         let images: Vec<Image<'_>> = self.extents.iter().zip(bytes).map(|(e, b)| Image { extent: *e, bytes: if b.iter().all(|&x| x == 0) { None } else { Some(b.as_slice()) } }).collect();
-        format::encode_segment(self.id, self.base, self.cut, self.last_of_cut, &images)
+        match &self.seal {
+            Some(s) => format::encode_segment_sealed(s, self.id, self.base, self.cut, self.last_of_cut, &images),
+            None => format::encode_segment(self.id, self.base, self.cut, self.last_of_cut, &images),
+        }
     }
 }
 
@@ -225,6 +236,7 @@ pub struct Opened {
 pub struct Store {
     volume_bytes: u64,
     epoch: u64,
+    seal: Option<std::sync::Arc<Sealer>>,
     /// Where each written extent's bytes are, as the store holds them.
     map: BTreeMap<u64, Loc>,
     /// Every segment the map may name, with its header's seal.
@@ -311,6 +323,7 @@ impl Store {
         let mut s = Store {
             volume_bytes: info.volume_bytes,
             epoch: info.epoch,
+            seal: info.seal.clone(),
             map: BTreeMap::new(),
             segments: BTreeMap::new(),
             local: BTreeMap::new(),
@@ -361,7 +374,7 @@ impl Store {
             if c.end.epoch == head.epoch {
                 first_seq = c.end.seq + 1;
             }
-            remote.prefetch(&Self::open_asks(&c, head.epoch, if head.clean { None } else { Some(first_seq) }));
+            remote.prefetch(&Self::open_asks(&c, head.epoch, if head.clean { None } else { Some(first_seq) }, s.seal.is_some()));
             s.unloaded = c.pages.iter().map(|p| (p.page, *p)).collect();
             s.segments = c.segments.iter().copied().collect();
             s.chain_end = c.end;
@@ -401,7 +414,7 @@ impl Store {
         if format::sha256(&body) != cr.sum {
             return Err(StoreError::Corrupt(format!("{name} is not the checkpoint the head names")));
         }
-        let c = format::decode_checkpoint(&body).map_err(|e| StoreError::Corrupt(format!("{name}: {e}")))?;
+        let c = format::decode_checkpoint(&self.opened_object(&name, &body)?).map_err(|e| StoreError::Corrupt(format!("{name}: {e}")))?;
         if (c.epoch, c.seq) != (cr.epoch, cr.seq) {
             return Err(StoreError::Corrupt(format!("{name} names itself otherwise")));
         }
@@ -412,13 +425,13 @@ impl Store {
     /// first OPEN_SEGMENT_HEADERS segment headers a replay may read, and
     /// the pack's head (its header and first extents,
     /// `PACK_HEAD_FETCH_BYTES`). No map page: each comes when first needed.
-    pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: Option<u64>) -> Vec<Ask> {
+    pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: Option<u64>, sealed: bool) -> Vec<Ask> {
         let mut asks: Vec<Ask> = Vec::new();
-        let mut heads: Vec<Ask> = [c.pack, c.crash_pack].into_iter().flatten().map(|pr| Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES }).collect();
+        let mut heads: Vec<Ask> = [c.pack, c.crash_pack].into_iter().flatten().map(|pr| Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: pack_head_fetch_bytes(sealed) }).collect();
         // and the pages the last boot touched
         heads.extend(c.pages.iter().filter(|p| c.boot_pages.contains(&p.page)).map(|p| Ask::Whole(page_name(p))));
         let Some(first_seq) = first_seq else { return heads };
-        asks.extend((first_seq..first_seq + u64::from(OPEN_SEGMENT_HEADERS)).map(|seq| Ask::Range { name: format::segment_name(SegId { epoch, seq }), offset: 0, len: SEGMENT_HEADER_BYTES_MAX as usize }));
+        asks.extend((first_seq..first_seq + u64::from(OPEN_SEGMENT_HEADERS)).map(|seq| Ask::Range { name: format::segment_name(SegId { epoch, seq }), offset: 0, len: segment_header_fetch_bytes(sealed) }));
         asks.extend(heads);
         asks
     }
@@ -435,7 +448,7 @@ impl Store {
         if format::sha256(body) != pr.sum {
             return Err(StoreError::Corrupt(format!("{pname} is not the page its checkpoint names")));
         }
-        let (page, entries) = format::decode_page(body).map_err(|e| StoreError::Corrupt(format!("{pname}: {e}")))?;
+        let (page, entries) = format::decode_page(&self.opened_object(&pname, body)?).map_err(|e| StoreError::Corrupt(format!("{pname}: {e}")))?;
         if page != pr.page {
             return Err(StoreError::Corrupt(format!("{pname} is page {page}")));
         }
@@ -481,13 +494,13 @@ impl Store {
         for (e, l) in want {
             if let Some(f) = out.last_mut() {
                 let (_, last) = *f.run.last().expect("non-empty");
-                if last.seg == l.seg && last.offset + EXTENT_BYTES == l.offset && f.run.len() < READ_AHEAD_EXTENTS as usize {
+                if last.seg == l.seg && last.offset + self.stride() == l.offset && f.run.len() < READ_AHEAD_EXTENTS as usize {
                     f.run.push((e, l));
-                    f.len += EXTENT_BYTES as usize;
+                    f.len += self.stride() as usize;
                     continue;
                 }
             }
-            out.push(Fetch { name: format::segment_name(l.seg), offset: u64::from(l.offset), len: EXTENT_BYTES as usize, extent: e, run: vec![(e, l)] });
+            out.push(Fetch { name: format::segment_name(l.seg), offset: u64::from(l.offset), len: self.stride() as usize, extent: e, run: vec![(e, l)], stride: self.stride() });
         }
         out
     }
@@ -542,13 +555,13 @@ impl Store {
     fn replay(&mut self, remote: &mut dyn RemoteGate, epoch: u64, first: u64) -> Result<(), StoreError> {
         let mut group: Vec<format::SegmentHeader> = Vec::new();
         let mut seq = first;
-        let mut buf = vec![0u8; SEGMENT_HEADER_BYTES_MAX as usize];
+        let mut buf = vec![0u8; segment_header_fetch_bytes(self.seal.is_some())];
         loop {
             if seq - first >= u64::from(REPLAY_SEGMENTS_MAX) + u64::from(CUT_SEGMENTS_MAX) {
                 return Err(StoreError::Corrupt(format!("more than {REPLAY_SEGMENTS_MAX} segments after a checkpoint")));
             }
             let name = format::segment_name(SegId { epoch, seq });
-            let Some(h) = header(remote, &name, &mut buf)? else { break };
+            let Some(h) = header(remote, self.seal.as_deref(), SegId { epoch, seq }, &mut buf)? else { break };
             let expected_base = group.last().map(|g| g.link()).unwrap_or(self.chain_end);
             if h.id != (SegId { epoch, seq }) || h.base != expected_base {
                 return Err(StoreError::Corrupt(format!("{name} does not follow the chain")));
@@ -617,6 +630,33 @@ impl Store {
 
     pub fn shipping(&self) -> usize {
         self.shipping.len()
+    }
+
+    /// Whether this disk's objects are sealed.
+    pub fn sealed(&self) -> bool {
+        self.seal.is_some()
+    }
+
+    /// An image's bytes in a segment: 64 KiB, and its tag when sealed.
+    fn stride(&self) -> u32 {
+        if self.seal.is_some() { SEALED_EXTENT_BYTES } else { EXTENT_BYTES }
+    }
+
+    /// A whole object (a page, a checkpoint) as stored: sealed under its
+    /// name on a sealed disk.
+    fn sealed_object(&self, name: &str, plain: Vec<u8>) -> Vec<u8> {
+        match &self.seal {
+            Some(s) => s.seal_object(name, &plain),
+            None => plain,
+        }
+    }
+
+    /// A whole object's plain bytes, from those stored.
+    fn opened_object(&self, name: &str, body: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match &self.seal {
+            Some(s) => s.open_object(name, body).map_err(|e| StoreError::Corrupt(format!("{name}: {e}"))),
+            None => Ok(body.to_vec()),
+        }
     }
 
     /// Segments cut and not yet built.
@@ -771,11 +811,19 @@ impl Store {
                 return Ok(Read::Done);
             }
             Some(Local::Clean) => {
-                cache.read(extent, buf)?;
-                let right = match self.map.get(&extent) {
-                    Some(l) if !l.is_zero() => format::sum64(buf) == l.sum,
-                    _ => buf.iter().all(|&b| b == 0),
+                // a sealed disk's cache is sealed too: its seal checks the
+                // bytes (the map's sum is the store's tag, not theirs), and
+                // one that does not open is a lie like a wrong sum
+                let opened = match cache.read(extent, buf) {
+                    Ok(()) => true,
+                    Err(_) if self.seal.is_some() => false,
+                    Err(e) => return Err(e.into()),
                 };
+                let right = opened
+                    && match self.map.get(&extent) {
+                        Some(l) if !l.is_zero() => self.seal.is_some() || format::sum64(buf) == l.sum,
+                        _ => buf.iter().all(|&b| b == 0),
+                    };
                 if right {
                     return Ok(Read::Done);
                 }
@@ -807,11 +855,11 @@ impl Store {
                 break;
             }
             match self.map.get(&next) {
-                Some(l) if !l.is_zero() && l.seg == pl.seg && l.offset == pl.offset + EXTENT_BYTES => run.push((next, *l)),
+                Some(l) if !l.is_zero() && l.seg == pl.seg && l.offset == pl.offset + self.stride() => run.push((next, *l)),
                 _ => break,
             }
         }
-        Fetch { name: format::segment_name(loc.seg), offset: u64::from(loc.offset), len: run.len() * EXTENT_BYTES as usize, extent, run }
+        Fetch { name: format::segment_name(loc.seg), offset: u64::from(loc.offset), len: run.len() * self.stride() as usize, extent, run, stride: self.stride() }
     }
 
     /// Installs what a fetch brought (`window`, possibly short): each
@@ -820,10 +868,11 @@ impl Store {
     /// clean. Answers whether the extent asked for is in `buf`; false when
     /// its bytes were wrong (the caller fetches it again).
     pub fn install(&mut self, cache: &mut dyn CacheGate, f: &Fetch, window: &[u8], buf: &mut [u8]) -> Result<bool, StoreError> {
-        let ext = EXTENT_BYTES as usize;
+        let stride = f.stride as usize;
         let mut asked = false;
+        let mut plain = vec![0u8; EXTENT_BYTES as usize];
         for (i, (e, l)) in f.run.iter().enumerate() {
-            let Some(image) = window.get(i * ext..(i + 1) * ext) else { break };
+            let Some(got) = window.get(i * stride..(i + 1) * stride) else { break };
             let placed = self.map.get(e) == Some(l);
             let held = self.local.contains_key(e);
             if *e == f.extent && held {
@@ -832,7 +881,15 @@ impl Store {
                 asked = true;
                 continue;
             }
-            if placed && !held && format::sum64(image) == l.sum {
+            let image: &[u8] = match &self.seal {
+                Some(s) => match s.open_extent(Place::Image { seg: l.seg, extent: *e, offset: l.offset }, got, l.sum, &mut plain) {
+                    Ok(()) => &plain,
+                    Err(_) => continue,
+                },
+                None if format::sum64(got) == l.sum => got,
+                None => continue,
+            };
+            if placed && !held {
                 cache.write(*e, image)?;
                 self.set_local(*e, Some(Local::Clean));
                 if *e == f.extent {
@@ -980,39 +1037,46 @@ impl Store {
         let Some((&seq, _)) = self.planned.first_key_value() else { return Ok(None) };
         let p = self.planned.remove(&seq).expect("present");
         self.building = Some(seq);
-        Ok(Some(Building { id: SegId { epoch: self.epoch, seq }, base: self.chain_end, cut: p.cut, last_of_cut: p.last_of_cut, extents: p.extents }))
+        Ok(Some(Building { id: SegId { epoch: self.epoch, seq }, base: self.chain_end, cut: p.cut, last_of_cut: p.last_of_cut, extents: p.extents, seal: self.seal.clone() }))
     }
 
     /// The segment's bytes as of its cut, from what was read of the cache:
     /// an extent written since then had its bytes kept apart before that
     /// write, and that copy replaces whatever the read saw; any other was
     /// not written, so the read saw its bytes as of the cut. From here on
-    /// they ship.
-    pub fn build_resolve(&mut self, cache: &mut dyn CacheGate, b: &Building, bytes: &mut [Vec<u8>]) -> Result<(), StoreError> {
+    /// they ship. Answers, for each, whether its kept copy replaced it.
+    pub fn build_resolve(&mut self, cache: &mut dyn CacheGate, b: &Building, bytes: &mut [Vec<u8>]) -> Result<Vec<bool>, StoreError> {
         if self.fenced {
             return Err(StoreError::Fenced("this life".into()));
         }
         let seq = b.id.seq;
         assert_eq!(self.building, Some(seq), "the segment taken");
         assert_eq!(bytes.len(), b.extents.len());
+        let mut replaced = Vec::with_capacity(bytes.len());
         for (&e, buf) in b.extents.iter().zip(bytes.iter_mut()) {
             if self.shadows.remove(&(e, seq)) {
                 cache.shadow_take(e, seq, buf)?;
+                replaced.push(true);
             } else {
                 assert_eq!(self.local.get(&e), Some(&Local::Frozen(seq)), "an extent not written since its cut is still frozen");
                 self.set_local(e, Some(Local::Shipping(seq)));
+                replaced.push(false);
             }
         }
-        Ok(())
+        Ok(replaced)
     }
 
     /// The built segment joins those in flight.
     pub fn build_done(&mut self, b: Building, body: Vec<u8>) -> Outgoing {
         assert_eq!(self.building.take(), Some(b.id.seq), "the segment taken");
         assert_eq!(b.base, self.chain_end, "segments are built in order, one at a time");
-        let h = format::decode_segment_header(&body).expect("a segment we made decodes");
-        let link = h.link();
         let id = b.id;
+        let h = match &self.seal {
+            Some(s) => format::decode_segment_header_sealed(s, id, &body),
+            None => format::decode_segment_header(&body),
+        }
+        .expect("a segment we made decodes");
+        let link = h.link();
         let entries: Vec<(u64, Loc)> = h.entries.iter().map(|en| (en.extent, Loc { seg: id, offset: en.offset, len: en.len, sum: en.sum })).collect();
         self.planned_extents -= b.extents.len() as u64;
         self.shipping_extents += entries.len() as u64;
@@ -1114,9 +1178,10 @@ impl Store {
         for &p in &self.pages_dirty {
             let lo = u64::from(p) * PAGE_EXTENTS as u64;
             let entries: Vec<(u32, Loc)> = self.map.range(lo..lo + PAGE_EXTENTS as u64).map(|(e, l)| (u32::try_from(e - lo).expect("in the page"), *l)).collect();
-            let body = format::encode_page(p, &entries);
+            let name = format::page_name(self.epoch, seq, p);
+            let body = self.sealed_object(&name, format::encode_page(p, &entries));
             pages.insert(p, PageRef { page: p, epoch: self.epoch, seq, sum: format::sha256(&body) });
-            out.push(Outgoing { name: format::page_name(self.epoch, seq, p), body, kind: Kind::Page });
+            out.push(Outgoing { name, body, kind: Kind::Page });
         }
         let mut live: BTreeSet<SegId> = self.map.values().filter(|l| !l.is_zero()).map(|l| l.seg).collect();
         // pages not loaded may name any segment the last checkpoint listed:
@@ -1131,7 +1196,7 @@ impl Store {
         assert!(segments.len() <= LIVE_SEGMENTS_MAX as usize, "live segments past their limit: the cleaner's compaction is P5's");
         let boot_pages: Vec<u32> = self.boot_pages.iter().copied().filter(|p| pages.contains_key(p)).collect();
         let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, crash_pack: self.crash_pack, pages: pages.into_values().collect(), boot_pages, segments };
-        let body = format::encode_checkpoint(&c);
+        let body = self.sealed_object(&format::checkpoint_name(self.epoch, seq), format::encode_checkpoint(&c));
         let cr = CheckpointRef { epoch: self.epoch, seq, sum: format::sha256(&body) };
         out.push(Outgoing { name: format::checkpoint_name(self.epoch, seq), body, kind: Kind::Checkpoint(cr) });
         out
@@ -1140,8 +1205,8 @@ impl Store {
     /// A checkpoint landed (its pages before it): it is the one later
     /// checkpoints build on. The pages it wrote are clean.
     pub fn checkpoint_landed(&mut self, objects: &[Outgoing]) {
-        let Some(Outgoing { body, kind: Kind::Checkpoint(cr), .. }) = objects.last() else { panic!("a checkpoint's objects end with it") };
-        let c = format::decode_checkpoint(body).expect("a checkpoint we made decodes");
+        let Some(Outgoing { name, body, kind: Kind::Checkpoint(cr) }) = objects.last() else { panic!("a checkpoint's objects end with it") };
+        let c = format::decode_checkpoint(&self.opened_object(name, body).expect("a checkpoint we sealed opens")).expect("a checkpoint we made decodes");
         assert_eq!(c.end, self.applied_end, "a checkpoint lands before anything else is applied");
         self.pages_dirty.clear();
         self.segments_landed_since = 0;
@@ -1191,7 +1256,8 @@ impl Store {
             }
             let mut b = vec![0u8; EXTENT_BYTES as usize];
             cache.read(e, &mut b)?;
-            if format::sum64(&b) == l.sum {
+            // clean is the map's bytes; a sealed cache checked them as read
+            if self.seal.is_some() || format::sum64(&b) == l.sum {
                 images.push((e, l, b));
             }
         }
@@ -1199,12 +1265,19 @@ impl Store {
             return Ok(None);
         }
         let refs: Vec<(u64, Loc, &[u8])> = images.iter().map(|(e, l, b)| (*e, *l, b.as_slice())).collect();
-        let body = format::encode_pack(&refs);
-        let h = format::decode_pack_header(&body).expect("a pack we made decodes");
-        let header_sum = format::sha256(&body[..h.len()]);
+        let name = format::pack_name(self.epoch, seq);
+        let (body, header_sum) = match &self.seal {
+            Some(s) => format::encode_pack_sealed(s, &name, &refs),
+            None => {
+                let body = format::encode_pack(&refs);
+                let h = format::decode_pack_header(&body).expect("a pack we made decodes");
+                let sum = format::sha256(&body[..h.len()]);
+                (body, sum)
+            }
+        };
         let pr = PackRef { epoch: self.epoch, seq, header_sum };
         self.next_pack += 1;
-        Ok(Some((format::pack_name(self.epoch, seq), body, pr)))
+        Ok(Some((name, body, pr)))
     }
 
     /// The pack landed: the next checkpoint names it.
@@ -1227,36 +1300,49 @@ impl Store {
         self.opened.crash_pack.map(|p| (format::pack_name(p.epoch, p.seq), p))
     }
 
-    /// The pack's header, checked against the checkpoint's record of it.
-    pub fn pack_header(&self, pr: &PackRef, prefix: &[u8]) -> Result<format::PackHeader, StoreError> {
-        let h = format::decode_pack_header(prefix).map_err(|e| StoreError::Corrupt(format!("a pack: {e}")))?;
-        if format::sha256(&prefix[..h.len()]) == pr.header_sum {
-            Ok(h)
-        } else {
-            Err(StoreError::Corrupt("a pack that is not the one its checkpoint names".into()))
+    /// The pack's header, checked against the checkpoint's record of it:
+    /// where its extents are in the object, and how far apart.
+    pub fn pack_header(&self, name: &str, pr: &PackRef, prefix: &[u8]) -> Result<PackView, StoreError> {
+        let bad = |e: format::FormatError| StoreError::Corrupt(format!("{name}: {e}"));
+        let (header, sum, images_at, stride) = match &self.seal {
+            Some(s) => {
+                let (h, sum) = format::decode_pack_header_sealed(s, name, prefix).map_err(bad)?;
+                let at = format::sealed_pack_header_len(h.entries.len());
+                (h, sum, at, SEALED_EXTENT_BYTES)
+            }
+            None => {
+                let h = format::decode_pack_header(prefix).map_err(bad)?;
+                let sum = format::sha256(&prefix[..h.len()]);
+                let at = h.len();
+                (h, sum, at, EXTENT_BYTES)
+            }
+        };
+        if sum != pr.header_sum {
+            return Err(StoreError::Corrupt(format!("{name} is not the pack its checkpoint names")));
         }
+        Ok(PackView { header, name: name.to_string(), images_at: images_at as u64, stride: u64::from(stride) })
     }
 
     /// The pack's data from its extent `from` on, split into ranges of
     /// about `bytes` each (whole extents), to fetch in parallel: (offset
     /// in the object, length).
-    pub fn pack_ranges(h: &format::PackHeader, from: u64, bytes: u64) -> Vec<(u64, u64)> {
-        let per = (bytes / EXTENT_BYTES as u64).max(1);
-        let n = (h.entries.len() as u64).saturating_sub(from);
-        let base = h.len() as u64 + from * EXTENT_BYTES as u64;
-        (0..n.div_ceil(per)).map(|i| (base + i * per * EXTENT_BYTES as u64, (per.min(n - i * per)) * EXTENT_BYTES as u64)).collect()
+    pub fn pack_ranges(v: &PackView, from: u64, bytes: u64) -> Vec<(u64, u64)> {
+        let per = (bytes / v.stride).max(1);
+        let n = (v.header.entries.len() as u64).saturating_sub(from);
+        let base = v.images_at + from * v.stride;
+        (0..n.div_ceil(per)).map(|i| (base + i * per * v.stride, (per.min(n - i * per)) * v.stride)).collect()
     }
 
     /// Installs a fetched range of the pack: each extent whose sum the map
     /// still names, and whose bytes check out, goes to the cache as clean.
     /// Answers how many were installed.
-    pub fn pack_install(&mut self, cache: &mut dyn CacheGate, h: &format::PackHeader, offset: u64, bytes: &[u8]) -> Result<u32, StoreError> {
-        let ext = EXTENT_BYTES as u64;
-        assert!(offset >= h.len() as u64 && (offset - h.len() as u64).is_multiple_of(ext));
-        let first = ((offset - h.len() as u64) / ext) as usize;
+    pub fn pack_install(&mut self, cache: &mut dyn CacheGate, v: &PackView, offset: u64, bytes: &[u8]) -> Result<u32, StoreError> {
+        assert!(offset >= v.images_at && (offset - v.images_at).is_multiple_of(v.stride));
+        let first = ((offset - v.images_at) / v.stride) as usize;
         let mut installed = 0;
-        for (i, image) in bytes.chunks_exact(ext as usize).enumerate() {
-            let Some(&(e, loc)) = h.entries.get(first + i) else { break };
+        let mut plain = vec![0u8; EXTENT_BYTES as usize];
+        for (i, got) in bytes.chunks_exact(v.stride as usize).enumerate() {
+            let Some(&(e, loc)) = v.header.entries.get(first + i) else { break };
             // the map's placement if it has one (a replay is newer than the
             // pack); else, where its page is not loaded, the pack's (it is
             // the checkpoint's, sealed by the header's sum it names)
@@ -1265,12 +1351,26 @@ impl Store {
                     Some(l) => !l.is_zero() && l.sum == loc.sum,
                     None => self.unloaded.contains_key(&page_of(e)) && self.segments.contains_key(&loc.seg) && e < self.extents(),
                 };
-            if wanted && format::sum64(image) == loc.sum {
-                self.map.entry(e).or_insert(loc);
-                cache.write(e, image)?;
-                self.set_local(e, Some(Local::Clean));
-                installed += 1;
+            if !wanted {
+                continue;
             }
+            let image: &[u8] = match &self.seal {
+                Some(s) => {
+                    let tag: [u8; 16] = got[EXTENT_BYTES as usize..].try_into().expect("16");
+                    plain.copy_from_slice(&got[..EXTENT_BYTES as usize]);
+                    let at = Place::Packed { pack: &v.name, index: u32::try_from(first + i).expect("bounded"), extent: e };
+                    if s.open_detached(at, &mut plain, &tag).is_err() {
+                        continue;
+                    }
+                    &plain
+                }
+                None if format::sum64(got) == loc.sum => got,
+                None => continue,
+            };
+            self.map.entry(e).or_insert(loc);
+            cache.write(e, image)?;
+            self.set_local(e, Some(Local::Clean));
+            installed += 1;
         }
         Ok(installed)
     }
@@ -1278,12 +1378,13 @@ impl Store {
 
 /// A segment's header, fetched again when it fails its checksum, as an
 /// extent is; None when the segment is absent.
-fn header(remote: &mut dyn RemoteGate, name: &str, buf: &mut [u8]) -> Result<Option<format::SegmentHeader>, StoreError> {
+fn header(remote: &mut dyn RemoteGate, seal: Option<&Sealer>, id: SegId, buf: &mut [u8]) -> Result<Option<format::SegmentHeader>, StoreError> {
+    let name = &format::segment_name(id);
     let mut last = String::new();
     for _ in 0..FETCH_TRIES_MAX {
         match remote.get_range(name, 0, buf) {
             Ok(None) => return Ok(None),
-            Ok(Some(n)) => match format::decode_segment_header(&buf[..n]) {
+            Ok(Some(n)) => match seal.map_or_else(|| format::decode_segment_header(&buf[..n]), |s| format::decode_segment_header_sealed(s, id, &buf[..n])) {
                 Ok(h) => return Ok(Some(h)),
                 Err(e) => last = e.to_string(),
             },
@@ -1296,6 +1397,31 @@ fn header(remote: &mut dyn RemoteGate, name: &str, buf: &mut [u8]) -> Result<Opt
 
 /// Bytes of a pack's object that hold its header, whatever its count.
 pub const PACK_HEADER_FETCH_BYTES: usize = format::limits::PACK_HEADER_BYTES_MAX as usize;
+
+/// The pack's head as fetched in the open's round, plain or sealed: its
+/// header and its first PACK_HEAD_EXTENTS extents.
+pub fn pack_head_fetch_bytes(sealed: bool) -> usize {
+    if sealed {
+        format::SEALED_PREFIX_BYTES as usize + PACK_HEADER_FETCH_BYTES + format::TAG_BYTES as usize + PACK_HEAD_EXTENTS as usize * SEALED_EXTENT_BYTES as usize
+    } else {
+        PACK_HEAD_FETCH_BYTES
+    }
+}
+
+/// Bytes of a segment's object that hold its header, plain or sealed.
+pub fn segment_header_fetch_bytes(sealed: bool) -> usize {
+    SEGMENT_HEADER_BYTES_MAX as usize + if sealed { format::SEALED_PREFIX_BYTES as usize + format::TAG_BYTES as usize } else { 0 }
+}
+
+/// A pack's header as a wake reads it: where its extents start in the
+/// object, and how far apart (64 KiB, and a tag when sealed).
+#[derive(Debug, Clone)]
+pub struct PackView {
+    pub header: format::PackHeader,
+    pub name: String,
+    pub images_at: u64,
+    pub stride: u64,
+}
 /// The pack's head, fetched in the open's one round: its header and, after
 /// it, its first extents, so a mount waits for no other round trip. An
 /// ext4 mount of a 20 GB disk read past the first 16 and the first 32 of

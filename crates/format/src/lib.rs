@@ -17,8 +17,10 @@
 //! failing its checksum as a value; it never panics on input.
 
 pub mod limits;
+pub mod seal;
 
 use limits::*;
+pub use seal::{Place, Sealer, SEALED_EXTENT_BYTES, SEALED_PREFIX_BYTES, TAG_BYTES};
 use sha2::{Digest, Sha256};
 
 pub type Sum = [u8; 32];
@@ -39,6 +41,10 @@ pub fn sum64(extent: &[u8]) -> u64 {
 pub enum FormatError {
     #[error("{what}: {got} bytes, {need} needed")]
     Short { what: &'static str, need: usize, got: usize },
+    /// A sealed piece that does not open: another key, another place,
+    /// or bytes changed since it was sealed.
+    #[error("a seal that does not open here")]
+    Sealed,
     #[error("{0}: not this kind of object")]
     Magic(&'static str),
     #[error("{0}: version {1}")]
@@ -270,10 +276,86 @@ pub fn encode_segment_header(h: &SegmentHeader) -> Vec<u8> {
     w.0
 }
 
+/// A sealed segment's header bytes: its clear prefix, its plain header,
+/// the header's tag. Its first image follows.
+pub fn sealed_segment_header_len(count: usize) -> usize {
+    SEALED_PREFIX_BYTES as usize + segment_header_len(count) + TAG_BYTES as usize
+}
+
+/// A segment's object, sealed (seal.rs): each image sealed at its place,
+/// its tag after it and its sum the tag's first 8 bytes; the header sealed
+/// under the segment's name.
+pub fn encode_segment_sealed(s: &Sealer, id: SegId, base: Link, cut: u64, last_of_cut: bool, images: &[Image<'_>]) -> Vec<u8> {
+    assert!(!images.is_empty() && images.len() <= SEGMENT_EXTENTS_MAX as usize);
+    let header = sealed_segment_header_len(images.len());
+    let mut offset = u32::try_from(header).expect("bounded");
+    let mut sealed: Vec<Vec<u8>> = Vec::new();
+    let mut entries = Vec::with_capacity(images.len());
+    for i in images {
+        match i.bytes {
+            Some(b) => {
+                assert_eq!(b.len(), EXTENT_BYTES as usize);
+                let mut c = b.to_vec();
+                let tag = s.seal_detached(Place::Image { seg: id, extent: i.extent, offset }, &mut c);
+                c.extend_from_slice(&tag);
+                entries.push(Entry { extent: i.extent, offset, len: EXTENT_BYTES, sum: Sealer::sum_of(&tag) });
+                sealed.push(c);
+                offset += SEALED_EXTENT_BYTES;
+            }
+            None => entries.push(Entry { extent: i.extent, offset: 0, len: 0, sum: 0 }),
+        }
+    }
+    let mut w = W(Vec::with_capacity(offset as usize));
+    w.bytes(seal::SEGMENT_SEALED_MAGIC);
+    w.u32(u32::try_from(images.len()).expect("bounded"));
+    w.u32(0);
+    // the plain header on its own: its SHA-256 covers it alone
+    let mut plain = W(Vec::with_capacity(segment_header_len(entries.len())));
+    write_segment_header(&mut plain, id, base, cut, last_of_cut, &entries);
+    let tag = s.seal_detached(Place::Object(&segment_name(id)), &mut plain.0);
+    w.bytes(&plain.0);
+    w.bytes(&tag);
+    assert_eq!(w.0.len(), header);
+    for c in &sealed {
+        w.bytes(c);
+    }
+    assert_eq!(w.0.len(), offset as usize);
+    w.0
+}
+
+/// A sealed segment's header, from a prefix of its object at least as
+/// long as its header (`SEGMENT_HEADER_BYTES_MAX + SEALED_PREFIX_BYTES +
+/// TAG_BYTES` reads any): `id` is the segment asked for, which its seal
+/// binds.
+pub fn decode_segment_header_sealed(s: &Sealer, id: SegId, b: &[u8]) -> Result<SegmentHeader, FormatError> {
+    let mut r = R { b, at: 0, what: "a sealed segment" };
+    if r.take(8)? != seal::SEGMENT_SEALED_MAGIC {
+        return Err(FormatError::Magic("a sealed segment"));
+    }
+    let count = r.u32()?;
+    if r.u32()? != 0 {
+        return Err(FormatError::Layout("a sealed segment's reserved field"));
+    }
+    if count == 0 || count > SEGMENT_EXTENTS_MAX {
+        return Err(FormatError::Limit("a segment's extents"));
+    }
+    let end = sealed_segment_header_len(count as usize);
+    let body = r.take(segment_header_len(count as usize))?;
+    let tag: [u8; 16] = r.take(TAG_BYTES as usize)?.try_into().expect("16");
+    let mut plain = body.to_vec();
+    s.open_detached(Place::Object(&segment_name(id)), &mut plain, &tag)?;
+    let h = decode_segment_header_placed(&plain, Some(u32::try_from(end).expect("bounded")), SEALED_EXTENT_BYTES)?;
+    if h.id != id || h.entries.len() != count as usize {
+        return Err(FormatError::Layout("a sealed segment names itself otherwise"));
+    }
+    Ok(h)
+}
+
 fn write_segment_header(w: &mut W, id: SegId, base: Link, cut: u64, last_of_cut: bool, entries: &[Entry]) {
     assert!(id.epoch > 0 && id.seq > 0);
     assert!(!entries.is_empty() && entries.len() <= SEGMENT_EXTENTS_MAX as usize);
     assert!(entries.windows(2).all(|w| w[0].extent < w[1].extent), "ascending, each once");
+    assert!(w.0.is_empty(), "a header's SHA-256 covers it alone");
     let start = w.0.len();
     w.bytes(SEGMENT_MAGIC);
     w.u32(VERSION);
@@ -302,6 +384,13 @@ fn write_segment_header(w: &mut W, id: SegId, base: Link, cut: u64, last_of_cut:
 /// the header (a replay fetches `SEGMENT_HEADER_BYTES_MAX`, or less of a
 /// smaller object).
 pub fn decode_segment_header(b: &[u8]) -> Result<SegmentHeader, FormatError> {
+    decode_segment_header_placed(b, None, EXTENT_BYTES)
+}
+
+/// A plain header whose images start at `first` (its own end when None)
+/// and are `stride` apart: a plain segment's (64 KiB), or a sealed one's
+/// (64 KiB and a tag, after the sealed header).
+fn decode_segment_header_placed(b: &[u8], first: Option<u32>, stride: u32) -> Result<SegmentHeader, FormatError> {
     let mut r = R { b, at: 0, what: "a segment" };
     r.magic(SEGMENT_MAGIC, VERSION)?;
     let flags = r.u32()?;
@@ -323,7 +412,7 @@ pub fn decode_segment_header(b: &[u8]) -> Result<SegmentHeader, FormatError> {
     }
     let header = segment_header_len(count as usize);
     let mut entries = Vec::with_capacity(count as usize);
-    let mut offset = u32::try_from(header).expect("bounded");
+    let mut offset = first.unwrap_or(u32::try_from(header).expect("bounded"));
     for _ in 0..count {
         let e = Entry { extent: r.u64()?, offset: r.u32()?, len: r.u32()?, sum: r.u64()? };
         if e.extent >= EXTENTS_MAX {
@@ -340,7 +429,9 @@ pub fn decode_segment_header(b: &[u8]) -> Result<SegmentHeader, FormatError> {
         if !placed {
             return Err(FormatError::Layout("an extent's place in its segment"));
         }
-        offset += e.len;
+        if e.len > 0 {
+            offset += stride;
+        }
         entries.push(e);
     }
     r.sealed()?;
@@ -625,7 +716,64 @@ pub fn encode_pack_header(h: &PackHeader) -> Vec<u8> {
     w.0
 }
 
+/// A sealed pack's header bytes: its clear prefix, its plain header, the
+/// header's tag. Its first extent follows.
+pub fn sealed_pack_header_len(count: usize) -> usize {
+    SEALED_PREFIX_BYTES as usize + pack_header_len(count) + TAG_BYTES as usize
+}
+
+/// A pack's object, sealed (seal.rs), named `name`: the header sealed
+/// under the name, each extent at its place in the pack. Answers the
+/// object and its plain header's SHA-256 (what its PackRef names).
+pub fn encode_pack_sealed(s: &Sealer, name: &str, extents: &[(u64, Loc, &[u8])]) -> (Vec<u8>, Sum) {
+    let entries: Vec<(u64, Loc)> = extents.iter().map(|(e, l, _)| (*e, *l)).collect();
+    let mut w = W(Vec::with_capacity(sealed_pack_header_len(extents.len()) + extents.len() * SEALED_EXTENT_BYTES as usize));
+    w.bytes(seal::PACK_SEALED_MAGIC);
+    w.u32(u32::try_from(extents.len()).expect("bounded"));
+    w.u32(0);
+    let mut plain = W(Vec::with_capacity(pack_header_len(entries.len())));
+    write_pack_header(&mut plain, &entries);
+    let header_sum = sha256(&plain.0);
+    let tag = s.seal_detached(Place::Object(name), &mut plain.0);
+    w.bytes(&plain.0);
+    w.bytes(&tag);
+    for (i, (e, _, b)) in extents.iter().enumerate() {
+        assert_eq!(b.len(), EXTENT_BYTES as usize);
+        let mut c = b.to_vec();
+        let tag = s.seal_detached(Place::Packed { pack: name, index: u32::try_from(i).expect("bounded"), extent: *e }, &mut c);
+        w.bytes(&c);
+        w.bytes(&tag);
+    }
+    (w.0, header_sum)
+}
+
+/// A sealed pack's header from a prefix of its object, with its plain
+/// header's SHA-256; its extents start at `sealed_pack_header_len`.
+pub fn decode_pack_header_sealed(s: &Sealer, name: &str, b: &[u8]) -> Result<(PackHeader, Sum), FormatError> {
+    let mut r = R { b, at: 0, what: "a sealed pack" };
+    if r.take(8)? != seal::PACK_SEALED_MAGIC {
+        return Err(FormatError::Magic("a sealed pack"));
+    }
+    let count = r.u32()?;
+    if r.u32()? != 0 {
+        return Err(FormatError::Layout("a sealed pack's reserved field"));
+    }
+    if count == 0 || count > PACK_EXTENTS_MAX {
+        return Err(FormatError::Limit("a pack's extents"));
+    }
+    let body = r.take(pack_header_len(count as usize))?;
+    let tag: [u8; 16] = r.take(TAG_BYTES as usize)?.try_into().expect("16");
+    let mut plain = body.to_vec();
+    s.open_detached(Place::Object(name), &mut plain, &tag)?;
+    let h = decode_pack_header(&plain)?;
+    if h.entries.len() != count as usize || h.len() != plain.len() {
+        return Err(FormatError::Layout("a sealed pack's count"));
+    }
+    Ok((h, sha256(&plain)))
+}
+
 fn write_pack_header(w: &mut W, entries: &[(u64, Loc)]) {
+    assert!(w.0.is_empty(), "a header's SHA-256 covers it alone");
     assert!(!entries.is_empty() && entries.len() <= PACK_EXTENTS_MAX as usize);
     w.bytes(PACK_MAGIC);
     w.u32(VERSION);

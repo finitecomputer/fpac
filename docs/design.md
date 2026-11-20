@@ -235,6 +235,8 @@ in. All are sandcastle's or macrofiche's own pins.
 | serde, serde_json | 1.0.229, 1.0.151 | The evidence's JSON; the driver's config | probe, bench |
 | ring | 0.17.14 | The driver's ECDSA P-256 key, which signs its calls to the stand-in Worker | bench only |
 | rustls, webpki-roots | 0.23.43, 1.0.9 | TLS from the driver to the Worker and to Cloudflare's API | bench only |
+| aes-gcm-siv | 0.12.1 | A sealed disk's extents, pages, checkpoints, packs and cache (docs/encryption.md): pure Rust, AES-NI and CLMUL found at run time; not sandcastle's or macrofiche's | format, fpac |
+| chacha20poly1305 | 0.11.0 | XChaCha20-Poly1305, measured beside it by `fpac-probe aead` only | probe only |
 | libfuzzer-sys, arbitrary | 0.4.13, 1.5.0 | The fuzz targets (fuzz/README.md), on nightly; not sandcastle's or macrofiche's, and never in the product | fuzz only |
 
 Refused: `fuser`, `hyper` in the guest, and `losetup`'s library; each in

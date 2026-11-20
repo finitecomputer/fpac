@@ -22,6 +22,7 @@ use fpac_format::{self as format};
 use fpac_remote::limits::OBJECT_BYTES_MAX;
 use fpac_remote::{Put, RemoteError};
 use fpac_store::head::{decide, Decision};
+use fpac_format::Sealer;
 use fpac_store::{ship, Ask, Building, CacheGate, Head, Kind, MemCache, OpenInfo, Outgoing, RemoteGate, Store, StoreError};
 
 const EXT: usize = EXTENT_BYTES as usize;
@@ -64,11 +65,13 @@ struct SimRemote {
     always_wrong: BTreeSet<String>,
     gets: u64,
     wrong_served: u64,
+    /// The disk's data key when its lives run sealed (docs/encryption.md).
+    seal: Option<std::sync::Arc<Sealer>>,
 }
 
 impl SimRemote {
     fn new(seed: u64, faults: Faults) -> SimRemote {
-        SimRemote { objects: BTreeMap::new(), reads: 0, read_errors: 0, rng: Rng(seed | 1), faults, always_wrong: BTreeSet::new(), gets: 0, wrong_served: 0 }
+        SimRemote { objects: BTreeMap::new(), reads: 0, read_errors: 0, rng: Rng(seed | 1), faults, always_wrong: BTreeSet::new(), gets: 0, wrong_served: 0, seal: None }
     }
 }
 
@@ -493,7 +496,7 @@ fn open<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: u64, e
 
 fn open_sized<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: u64, expected: BTreeMap<u64, Vec<u8>>, crash_at: u64, volume_bytes: u64) -> Life<'a> {
     platform.running = epoch;
-    let info = OpenInfo { epoch, volume_bytes, head: platform.head };
+    let info = OpenInfo { epoch, volume_bytes, head: platform.head, seal: remote.seal.clone() };
     let mut store = None;
     // Bounded: faults are a few in a thousand calls.
     for _ in 0..1000 {
@@ -515,9 +518,12 @@ fn open_sized<'a>(remote: &'a mut SimRemote, platform: &'a mut Platform, epoch: 
 
 /// One whole run: `lives` lives of random work, each crashing at a random
 /// step (or sleeping cleanly), checked on every reopen.
-fn run(seed: u64, lives: u64, ops: u64, faults: Faults) -> (u64, u64, u64, u64) {
+fn run(seed: u64, lives: u64, ops: u64, faults: Faults, sealed: bool) -> (u64, u64, u64, u64) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut remote = SimRemote::new(seed ^ 0xabcd, faults);
+    if sealed {
+        remote.seal = Some(std::sync::Arc::new(Sealer::new(&[seed as u8; 32], "sim")));
+    }
     let mut platform = Platform { head: None, running: 0 };
     let mut expected: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let hot: Vec<u64> = (0..48).map(|_| rng.below(VOLUME / EXTENT_BYTES as u64)).collect();
@@ -588,7 +594,7 @@ const STORMY: Faults = Faults { unavailable: 30, lost_answer: 30, wrong_bytes: 1
 #[test]
 fn calm_remote_crashes_anywhere() {
     for seed in 1..=SEEDS {
-        run(seed, 12, 150, CALM);
+        run(seed, 12, 150, CALM, false);
     }
 }
 
@@ -600,7 +606,7 @@ fn calm_remote_crashes_anywhere() {
 fn stormy_remote_never_hands_out_wrong_bytes() {
     let (mut wrong, mut crashes, mut reads, mut errors) = (0, 0, 0, 0);
     for seed in 1..=SEEDS {
-        let (c, w, r, e) = run(seed, 12, 150, STORMY);
+        let (c, w, r, e) = run(seed, 12, 150, STORMY, false);
         crashes += c;
         wrong += w;
         reads += r;
@@ -614,6 +620,47 @@ fn stormy_remote_never_hands_out_wrong_bytes() {
     // be about one in eight.
     assert!(errors * 100 < reads, "{errors} of {reads} reads failed: the refetch is not working");
     eprintln!("stormy: {reads} reads, {errors} failed after every try; {wrong} wrong answers served; {crashes} crashes");
+}
+
+// Goal: the calm and the stormy runs again, every object and image
+// sealed: the lives open to what the model says, and a wrong ranged get
+// (one in ten) fails its seal and is fetched again, never handed out.
+// Method: half the seeds of each, sealed.
+#[test]
+fn sealed_lives_crash_anywhere_and_never_hand_out_wrong_bytes() {
+    let (mut wrong, mut reads, mut errors) = (0, 0, 0);
+    for seed in 1..=SEEDS / 2 {
+        run(seed, 12, 150, CALM, true);
+        let (_, w, r, e) = run(seed, 12, 150, STORMY, true);
+        wrong += w;
+        reads += r;
+        errors += e;
+    }
+    assert!(wrong > 5 * SEEDS, "the faults were exercised: {wrong} wrong answers");
+    assert!(errors * 100 < reads, "{errors} of {reads} reads failed: a wrong sealed extent is not fetched again");
+}
+
+// Goal: a sealed disk opens only with its key: another key, another
+// disk's name, or no key at all is refused at the open, before any read.
+// Method: a sealed life that writes and sleeps; three opens of it.
+#[test]
+fn a_sealed_disk_opens_only_with_its_key() {
+    let mut remote = SimRemote::new(14, CALM);
+    remote.seal = Some(std::sync::Arc::new(Sealer::new(&[1u8; 32], "sim")));
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in [0u64, 4096] {
+        let b = content(600 + e);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+    }
+    life.sleep(&mut Rng(5)).unwrap();
+    assert!(remote.objects.values().all(|o| !o.windows(8).any(|w| w == b"FPACCKP3" || w == b"FPACMAP1" || w == b"FPACSEG1")), "nothing plain is stored");
+    for (seal, why) in [(Some(Sealer::new(&[2u8; 32], "sim")), "another key"), (Some(Sealer::new(&[1u8; 32], "other")), "another disk"), (None, "no key")] {
+        let info = OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: seal.map(std::sync::Arc::new) };
+        assert!(matches!(Store::open(&mut remote, &info), Err(StoreError::Corrupt(_))), "{why} is refused");
+    }
 }
 
 // Goal: a crash at every single step of one fixed run is recovered,
@@ -757,8 +804,8 @@ fn the_pack_makes_the_boot_reads_local() {
     let (name, pr) = life.store.pack_to_fetch().expect("a pack");
     let mut head = vec![0u8; fpac_store::PACK_HEADER_FETCH_BYTES];
     let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
-    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
-    assert_eq!(h.entries.len(), 20);
+    let h = life.store.pack_header(&name, &pr, &head[..n]).unwrap();
+    assert_eq!(h.header.entries.len(), 20);
     let mut installed = 0;
     for (off, len) in Store::pack_ranges(&h, 0, 4 * EXTENT_BYTES as u64) {
         let mut b = vec![0u8; len as usize];
@@ -806,7 +853,7 @@ fn a_stale_pack_entry_is_ignored() {
     let (name, pr) = life.store.pack_to_fetch().expect("the old pack");
     let mut head = vec![0u8; fpac_store::PACK_HEADER_FETCH_BYTES];
     let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
-    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
+    let h = life.store.pack_header(&name, &pr, &head[..n]).unwrap();
     let (off, len) = Store::pack_ranges(&h, 0, 1 << 20)[0];
     let mut b = vec![0u8; len as usize];
     life.remote.get_range(&name, off, &mut b).unwrap();
@@ -903,7 +950,7 @@ fn an_open_past_half_the_live_list_fetches_no_page() {
     platform.head = Some(Head { epoch: 1, checkpoint: Some(fpac_store::CheckpointRef { epoch: 1, seq: c.seq, sum }), clean: true });
     platform.running = 2;
     let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
-    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head }).unwrap();
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None }).unwrap();
     assert_eq!(s.opened().pages, 3);
     let pages: Vec<&Ask> = gate.reads.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).collect();
     assert!(pages.len() == 1 && matches!(pages[0], Ask::Whole(n) if n.ends_with("-0")), "the boot's page only: {pages:?}");
@@ -970,7 +1017,7 @@ fn an_open_reads_no_page_but_those_its_replay_changed() {
     // after a sleep: two rounds, no page
     platform.running = 2;
     let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
-    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head }).unwrap();
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head, seal: None }).unwrap();
     assert_eq!(s.opened().pages, 3);
     assert_eq!(gate.rounds.len(), 1, "one round after the checkpoint");
     assert!(matches!(&gate.reads[..gate.rounds[0].0], [Ask::Whole(n)] if n.starts_with("e1/c")), "{:?}", gate.reads);
@@ -996,7 +1043,7 @@ fn an_open_reads_no_page_but_those_its_replay_changed() {
     let exp = life.model.after_crash(life.remote);
     platform.running = 3;
     let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
-    let s = Store::open(&mut gate, &OpenInfo { epoch: 3, volume_bytes: VOLUME, head: platform.head }).unwrap();
+    let s = Store::open(&mut gate, &OpenInfo { epoch: 3, volume_bytes: VOLUME, head: platform.head, seal: None }).unwrap();
     assert_eq!(s.opened().replayed, 3);
     let pages: Vec<&Ask> = gate.reads.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).collect();
     assert!(pages.len() == 1 && matches!(pages[0], Ask::Whole(n) if n.ends_with("-0")), "page 0 only: {pages:?}");
@@ -1038,9 +1085,10 @@ fn a_crash_wake_finds_the_rewritten_in_its_crash_pack() {
     let (name, pr) = life.store.crash_pack_to_fetch().expect("a crash pack");
     let mut head = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
     let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
-    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
-    assert_eq!(h.entries.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![7], "only what was rewritten");
-    let installed = life.store.pack_install(&mut life.cache, &h, h.len() as u64, &head[h.len()..n - (n - h.len()) % EXT]).unwrap();
+    let v = life.store.pack_header(&name, &pr, &head[..n]).unwrap();
+    assert_eq!(v.header.entries.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![7], "only what was rewritten");
+    let at = v.images_at as usize;
+    let installed = life.store.pack_install(&mut life.cache, &v, v.images_at, &head[at..n - (n - at) % v.stride as usize]).unwrap();
     assert_eq!(installed, 1);
     let gets = life.remote.gets;
     life.read_check(7).unwrap();
@@ -1133,8 +1181,8 @@ fn a_new_disks_first_pack_holds_its_boots_files() {
     let (name, pr) = life.store.pack_to_fetch().expect("a pack");
     let mut head = vec![0u8; fpac_store::PACK_HEAD_FETCH_BYTES];
     let n = life.remote.get_range(&name, 0, &mut head).unwrap().unwrap();
-    let h = life.store.pack_header(&pr, &head[..n]).unwrap();
-    assert_eq!(h.entries.iter().take(3).map(|(e, _)| *e).collect::<Vec<_>>(), boot_files.to_vec(), "the boot's files first");
+    let v = life.store.pack_header(&name, &pr, &head[..n]).unwrap();
+    assert_eq!(v.header.entries.iter().take(3).map(|(e, _)| *e).collect::<Vec<_>>(), boot_files.to_vec(), "the boot's files first");
 }
 
 // Goal: a bounded cache drops only what the store holds: a clean extent
@@ -1266,5 +1314,5 @@ fn the_heads_rules() {
 #[ignore = "a debugging aid: SIM_SEED=<n> SIM_TRACE=1"]
 fn one_seed() {
     let seed: u64 = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-    run(seed, 12, 150, CALM);
+    run(seed, 12, 150, CALM, false);
 }

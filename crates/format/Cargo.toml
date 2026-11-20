@@ -6,5 +6,6 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+aes-gcm-siv = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

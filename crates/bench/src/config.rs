@@ -27,6 +27,11 @@ pub struct Config {
     pub driver_key_file: PathBuf,
     /// The pinned Node (its unpacked directory) that runs wrangler.
     pub node_dir: PathBuf,
+    /// A sealed disk's test data key (docs/encryption.md): a file of 64
+    /// hex digits, mode 600, used when `FPAC_ENCRYPT` is set. A test key
+    /// only: a real disk's comes from its agent's fragment.
+    #[serde(default)]
+    pub test_data_key_file: Option<PathBuf>,
 }
 
 impl Config {
