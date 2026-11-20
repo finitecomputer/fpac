@@ -32,7 +32,7 @@ sha256sum target/x86_64-unknown-linux-musl/release/fpac
 
 The digest matches CI's: the same build in two folders on one machine,
 and on this machine against CI, gave the same bytes (results.md, item 8).
-A Mac with the same toolchain builds a working binary with other bytes
+A Mac with the same toolchain builds a binary with other bytes
 (the same size within 8 bytes, code laid out differently): Rust's output
 is not yet the same across host platforms, so the release is built on
 Linux.

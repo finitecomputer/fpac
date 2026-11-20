@@ -5,7 +5,7 @@ it, item by item, and every line of design.md's "Benchmarks to match"
 (section 10 of the plan) as it stands now: pass or fail, where, and from
 which evidence file. Then the items added after item 7: C and D, A
 (sealed disks, docs/encryption.md) and B (fuzzing, fuzz/README.md); then
-6 (the cleaner).
+6 (the cleaner) and 8 (the release binary).
 
 **What ran where.** Cloudflare: the stand-in Worker `fpac-spike`'s
 containers (2 vCPU, 6 GiB, 20 GB) and R2, items 1 to 5 and 7 on commit
@@ -308,6 +308,25 @@ did). **Passes**, slowly: the pass reads one extent at a time.
 The store builds for `wasm32-unknown-unknown`, the platform's Worker's
 target, so compaction can run there, beside R2, with no container egress.
 On this spike it runs as `fpac clean` in a small container.
+
+### 8. The release binary, and CI on Linux and macOS (docs/release.md)
+
+`fpac` ships as one static x86_64 Linux binary named by its SHA-256,
+`fpac-<digest>`. `rust-toolchain.toml` pins Rust 1.99.0; the musl target
+links with the toolchain's own `rust-lld`; the build's paths are
+remapped. CI's `release` job builds it twice and refuses a difference,
+keeps it as an artifact named by its digest, and publishes it on a `v*`
+tag (none made).
+
+| | |
+| -- | -- |
+| Two builds here, two target folders | `19310b1d…c08e` both |
+| CI's release job, the same commit, on GitHub's runner | `fpac-19310b1d9c364b96e0a9134615ec918010d3e1a64fdd97c23accfced5e53c08e`: the same bytes |
+| The binary | static-pie, stripped, 1.4 MB, no build machine's path in it |
+| CI on ubuntu-24.04 and macos-15 (run 44758679675) | Clippy, every test (the simulator's 24 too) and the store for wasm32 pass on both; the fuzz job and the release job pass; 6 and 12.5 minutes |
+| The same build on a Mac (arm64, same toolchain) | other bytes: the same strings, the code laid out differently, the size 8 bytes apart. Rust's output differs across host platforms, so the release is built on Linux |
+
+**Passes.**
 
 ## Leftovers, as PRs (FPAC's repo unless named)
 
