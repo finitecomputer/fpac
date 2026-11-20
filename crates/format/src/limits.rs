@@ -74,7 +74,7 @@ pub const READ_AHEAD_EXTENTS: u32 = READ_AHEAD_BYTES / EXTENT_BYTES;
 /// a scan (docs/design.md, Read-ahead), in pieces of AHEAD_PIECE_EXTENTS
 /// on several connections. A scan that stops early leaves at most this
 /// much fetched and unread.
-pub const AHEAD_EXTENTS_MAX: u32 = (32 << 20) / EXTENT_BYTES;
+pub const AHEAD_EXTENTS_MAX: u32 = (64 << 20) / EXTENT_BYTES;
 /// One get of a read-ahead window: 4 MiB, so four at once reach about
 /// what P5's four parallel gets of 50 MiB did on Cloudflare (176-194 MB/s).
 pub const AHEAD_PIECE_EXTENTS: u32 = (4 << 20) / EXTENT_BYTES;

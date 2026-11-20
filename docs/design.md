@@ -150,9 +150,9 @@ reading (it was fetched for that write), and what the next pack takes
 from the cache (the boot's extents, at most PACK_EXTENTS_MAX).
 
 **Read-ahead.** The daemon follows up to STREAMS_MAX sequential reads of
-the device. From a scan's second read it keeps AHEAD_EXTENTS_MAX (32 MiB)
+the device. From a scan's second read it keeps AHEAD_EXTENTS_MAX (64 MiB)
 fetched ahead of it, in pieces of AHEAD_PIECE_EXTENTS (4 MiB) on
-AHEAD_FETCHES connections, starting the next part of the window once less
+AHEAD_FETCHES (8) connections, starting the next part of the window once less
 than half is left ahead; a read of an extent on its way waits for it
 rather than fetching it twice. A scan that stops early leaves at most a
 window fetched and unread (gets only; reads are not billed as egress).
@@ -228,8 +228,8 @@ them together. Those already in code are marked with their file.
 | `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut: one cut's size. A cut takes all of it at one instant (a subset would reorder ext4's writes), naming it only; past it a write asks for a cut at once |
 | `UNSHIPPED_BYTES_MAX` | 4 GiB | Written and not yet landed, held in the cache file: a burst this large goes at the local disk's speed. Section 10's 4 GiB line; it bounds a crash's loss during a burst and a sleep's flush (The sleep, above) |
 | The cache's bound | the disk's free room at the mount, less 4 GiB and 2 GiB | Past it, clean extents leave (S3-FIFO); `CACHE_DISK_HEADROOM_BYTES` (2 GiB) is left for everything else on the container's disk (`fpac/src/daemon.rs`) |
-| `AHEAD_EXTENTS_MAX`, `AHEAD_PIECE_EXTENTS` | 32 MiB, 4 MiB | A sequential read's window and one get of it; four parallel gets of 50 MiB reached 176-194 MB/s on Cloudflare in P5 (`format/limits.rs`) |
-| `STREAMS_MAX`, `AHEAD_FETCHES`, `AHEAD_WINDOWS_MAX` | 8, 4, 4 | Scans followed, connections per window, windows in flight (`fpac/src/disk.rs`) |
+| `AHEAD_EXTENTS_MAX`, `AHEAD_PIECE_EXTENTS` | 64 MiB, 4 MiB | A sequential read's window and one get of it; four parallel gets of 50 MiB reached 176-194 MB/s on Cloudflare in P5 (`format/limits.rs`) |
+| `STREAMS_MAX`, `AHEAD_FETCHES`, `AHEAD_WINDOWS_MAX` | 8, 8, 4 | Scans followed, connections per window, windows in flight (`fpac/src/disk.rs`) |
 | `CRASH_PACK_EXTENTS` | 128 (8 MiB) | A periodic checkpoint's crash pack: about $0.0024 an hour of activity in egress (`store/src/lib.rs`) |
 | `CUT_SEGMENTS_MAX` | 32 | The segments one cut may need |
 | `PACK_EXTENTS_MAX` | 1,535 (96 MiB less one extent) | A wake's pack; past it, the extents written longest ago are left out. With its header the object stays within `OBJECT_BYTES_MAX`, asserted for every kind of object |
