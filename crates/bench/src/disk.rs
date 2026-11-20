@@ -684,8 +684,9 @@ fn timed(p: &dyn Place, script: &str, tag: &str) -> Result<Value, String> {
 /// (FPAC, node_modules shipped with the rest) or `local` (FPAC, node_modules
 /// on the container's own disk, so a wake installs it again). Never run on
 /// this machine: an install runs its packages' own scripts.
-pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
+pub fn npm(p: &mut dyn Place, variant: &str, workload: &str) -> Result<Value, String> {
     assert!(["own", "shipped", "local"].contains(&variant));
+    assert!(["sandbox-sdk", "heavy"].contains(&workload));
     let fpac = variant != "own";
     let w = if fpac { "/data/work" } else { "/root/work" };
     let sb = format!("{w}/sb");
@@ -700,7 +701,14 @@ pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
     // life 1: fetch, install cold, install again warm, sleep at once
     let start1 = p.start()?;
     let mount1 = if fpac { mount(p)? } else { Value::Null };
-    let fetch = timed(p, &format!("mkdir -p {sb} && cd {sb} && git init -q && git fetch -q --depth 1 {NPM_REPO} {NPM_COMMIT} && git checkout -q FETCH_HEAD"), "fetch")?;
+    // the heavy workload's package.json and lockfile are in the image
+    // (crates/bench/npm-heavy, copied to /opt/npm-heavy)
+    let get = if workload == "heavy" {
+        format!("mkdir -p {sb} && cp /opt/npm-heavy/package.json /opt/npm-heavy/package-lock.json {sb}/")
+    } else {
+        format!("mkdir -p {sb} && cd {sb} && git init -q && git fetch -q --depth 1 {NPM_REPO} {NPM_COMMIT} && git checkout -q FETCH_HEAD")
+    };
+    let fetch = timed(p, &get, "fetch")?;
     if variant == "local" {
         local_nm(p)?;
     }
@@ -725,7 +733,7 @@ pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
     let start2 = p.start()?;
     let mount2 = if fpac { mount(p)? } else { Value::Null };
     let reinstall = match variant {
-        "own" => Some(timed(p, &format!("mkdir -p {sb} && cd {sb} && git init -q && git fetch -q --depth 1 {NPM_REPO} {NPM_COMMIT} && git checkout -q FETCH_HEAD && npm ci --no-audit --no-fund --loglevel=error"), "reinstall")?),
+        "own" => Some(timed(p, &format!("{get} && cd {sb} && npm ci --no-audit --no-fund --loglevel=error"), "reinstall")?),
         "local" => {
             local_nm(p)?;
             Some(timed(p, &format!("cd {sb} && npm ci --no-audit --no-fund --loglevel=error"), "reinstall")?)
@@ -733,7 +741,9 @@ pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
         _ => None,
     };
     p.sh(&format!("cat > {sb}/fpac-require-all.cjs <<'FPAC_EOF'\n{NPM_REQUIRE_ALL}\nFPAC_EOF\necho ok"))?;
-    let misses0 = status(p)["misses"].as_u64();
+    // the daemon's first status comes a second after its mount: before it,
+    // the mount's own count
+    let misses0 = status(p)["misses"].as_u64().or_else(|| mount2["mounted"]["misses"].as_u64());
     let node_cold = timed(p, &format!("cd {sb} && timeout 600 node fpac-require-all.cjs"), "nodecold")?;
     let misses1 = status(p)["misses"].as_u64();
     let node_warm = timed(p, &format!("cd {sb} && timeout 600 node fpac-require-all.cjs"), "nodewarm")?;
@@ -741,11 +751,42 @@ pub fn npm(p: &mut dyn Place, variant: &str) -> Result<Value, String> {
     let _ = p.kill();
     let bytes = shipped["bytes_shipped"].as_u64();
     Ok(json!({
-        "evidence": "npm", "variant": variant, "workload": { "repo": NPM_REPO, "commit": NPM_COMMIT, "install": "npm ci --no-audit --no-fund (its lockfile, lockfileVersion 3)", "tree": tree.trim() },
+        "evidence": "npm", "variant": variant,
+        "workload": if workload == "heavy" { json!({ "name": "heavy", "definition": "crates/bench/npm-heavy (package.json, package-lock.json)", "install": "npm ci --no-audit --no-fund", "tree": tree.trim() }) } else { json!({ "name": "sandbox-sdk", "repo": NPM_REPO, "commit": NPM_COMMIT, "install": "npm ci --no-audit --no-fund (its lockfile, lockfileVersion 3)", "tree": tree.trim() }) },
         "life1": { "start": start1, "mount": mount1, "fetch": fetch, "install_cold": install, "install_warm_disk": again, "status_before": before, "status_after_install": after, "status_after_second": after_again, "timeline": timeline, "sleep": sleep1 },
         "shipped_bytes": bytes, "egress_usd_at_0_026_per_gb": bytes.map(|b| (b as f64 / 1e9 * 0.026 * 10000.0).round() / 10000.0),
         "life2": { "start": start2, "mount": mount2, "reinstall": reinstall, "node_cold": node_cold, "node_warm": node_warm, "misses_during_cold_start": misses0.zip(misses1).map(|(a, b)| b.saturating_sub(a)), "sleep": sleep2 },
         "what": "a Cloudflare container of the spike's Worker (2 vCPU, 6 GiB, 20 GB), the npm image (node:22-bookworm, pinned by digest) with the internet on for its starts alone; the stand-in Worker's handler and R2",
     }))
+}
+
+/// The heavy workload's lockfile (C), made once in a disposable container
+/// with the internet: `npm install --package-lock-only` of
+/// crates/bench/npm-heavy/package.json, its tree resolved as of the date
+/// the top-level pins were chosen before, no package's scripts run. Answers
+/// the lockfile's text.
+pub fn npm_lock(p: &mut dyn Place, package_json: &str, before: &str) -> Result<String, String> {
+    assert!(package_json.len() < 32 << 10 && !package_json.contains("FPAC_EOF"));
+    p.start()?;
+    let (code, out) = p.sh(&format!("mkdir -p /root/lock && cat > /root/lock/package.json <<'FPAC_EOF'\n{package_json}\nFPAC_EOF\ncd /root/lock && npm install --package-lock-only --ignore-scripts --no-audit --no-fund --loglevel=error --before={before} && wc -c < package-lock.json"))?;
+    if code != 0 {
+        return Err(format!("the lockfile: {out}"));
+    }
+    let n: usize = out.lines().rev().find_map(|l| l.trim().parse().ok()).ok_or("the lockfile's size")?;
+    // in pieces under the exec's output limit
+    let piece = 3 << 20;
+    let mut lock = String::new();
+    for at in (0..n).step_by(piece) {
+        let (code, part) = p.sh(&format!("tail -c +{} /root/lock/package-lock.json | head -c {piece}", at + 1))?;
+        if code != 0 {
+            return Err(format!("the lockfile at {at}"));
+        }
+        lock.push_str(&part);
+    }
+    let _ = p.kill();
+    if lock.len() != n {
+        return Err(format!("the lockfile came back as {} of its {n} bytes", lock.len()));
+    }
+    Ok(lock)
 }
 

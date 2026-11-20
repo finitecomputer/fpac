@@ -315,7 +315,7 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
-        "npm" => disk::npm(p.as_mut(), &flag(args, "--variant").unwrap_or_else(|| "shipped".into())),
+        "npm" => disk::npm(p.as_mut(), &flag(args, "--variant").unwrap_or_else(|| "shipped".into()), &flag(args, "--workload").unwrap_or_else(|| "sandbox-sdk".into())),
         "thrash" => disk::thrash(p.as_mut(), flag(args, "--big-files").and_then(|r| r.parse().ok()).unwrap_or(2560), flag(args, "--cache-max").and_then(|r| r.parse().ok()), !args.iter().any(|a| a == "--no-wake")),
         _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0), &mount_args),
     };
@@ -538,7 +538,17 @@ fn stage_npm(base: &str, tiny_ctx: &Path) -> Result<PathBuf, String> {
     for f in ["fpac", "fpac-probe"] {
         std::fs::copy(tiny_ctx.join(f), ctx.join(f)).map_err(|e| format!("{f}: {e}"))?;
     }
-    let dockerfile = format!("FROM {base}\nCOPY fpac-probe /usr/local/bin/fpac-probe\nCOPY fpac /usr/local/bin/fpac\nLABEL fpac.spike.deployed_at_ms=\"{}\"\nENTRYPOINT [\"/usr/local/bin/fpac-probe\", \"idle\"]\n", now_ms());
+    // the heavy workload, once its lockfile is made (`npm-lock`)
+    let heavy = repo().join("crates/bench/npm-heavy");
+    let with_heavy = heavy.join("package-lock.json").exists();
+    if with_heavy {
+        std::fs::create_dir_all(ctx.join("npm-heavy")).map_err(|e| e.to_string())?;
+        for f in ["package.json", "package-lock.json"] {
+            std::fs::copy(heavy.join(f), ctx.join("npm-heavy").join(f)).map_err(|e| format!("{f}: {e}"))?;
+        }
+    }
+    let copy_heavy = if with_heavy { "COPY npm-heavy /opt/npm-heavy\n" } else { "" };
+    let dockerfile = format!("FROM {base}\nCOPY fpac-probe /usr/local/bin/fpac-probe\nCOPY fpac /usr/local/bin/fpac\n{copy_heavy}LABEL fpac.spike.deployed_at_ms=\"{}\"\nENTRYPOINT [\"/usr/local/bin/fpac-probe\", \"idle\"]\n", now_ms());
     std::fs::write(ctx.join("Dockerfile"), dockerfile).map_err(|e| e.to_string())?;
     Ok(ctx)
 }
@@ -758,6 +768,18 @@ fn main() {
         }),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
+        // the npm benchmark's heavy lockfile, made in a disposable
+        // Cloudflare container (never here): crates/bench/npm-heavy
+        (Some("npm-lock"), _) => (|| {
+            let dir = repo().join("crates/bench/npm-heavy");
+            let pkg = std::fs::read_to_string(dir.join("package.json")).map_err(|e| e.to_string())?;
+            let before = flag(&args, "--before").ok_or("--before <date>")?;
+            let mut p = disk::Cloudflare::npm(&format!("npm-lock-{}", now_ms()), 20_000 << 20)?;
+            let lock = disk::npm_lock(&mut p, &pkg, &before)?;
+            let v: Value = serde_json::from_str(&lock).map_err(|e| format!("the lockfile: {e}"))?;
+            std::fs::write(dir.join("package-lock.json"), &lock).map_err(|e| e.to_string())?;
+            Ok(json!({ "bytes": lock.len(), "packages": v["packages"].as_object().map(|o| o.len()), "before": before }))
+        })(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),
         (Some("reset"), _) => reset(),
         (Some("engine"), _) => krun::list(),
