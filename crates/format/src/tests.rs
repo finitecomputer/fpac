@@ -85,6 +85,7 @@ fn checkpoint() -> Checkpoint {
         pack: Some(PackRef { epoch: 6, seq: 12, header_sum: [2; 32] }),
         crash_pack: Some(PackRef { epoch: 6, seq: 13, header_sum: [7; 32] }),
         pages: vec![PageRef { page: 0, epoch: 5, seq: 3, sum: [3; 32] }, PageRef { page: 7, epoch: 6, seq: 12, sum: [4; 32] }],
+        boot_pages: vec![7],
         segments: vec![(SegId { epoch: 5, seq: 1 }, [5; 32]), (SegId { epoch: 6, seq: 2 }, [6; 32])],
     }
 }

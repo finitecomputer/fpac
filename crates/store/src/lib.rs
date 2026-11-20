@@ -95,6 +95,11 @@ pub enum Kind {
     CrashPack(PackRef),
 }
 
+/// Extents a wake after a crash fetches beside its mount, at most: the
+/// newest its replay brought back, 64 MiB (ext4's recovery read 55
+/// extents as misses after a crash on Cloudflare, 2.5 to 11.8 s).
+pub const REPLAY_FETCH_EXTENTS: usize = 1024;
+
 /// A periodic checkpoint's crash pack, at most: the extents a life
 /// rewrote, newest first. ext4's journal, which a wake after a crash
 /// replays, is rewritten commit by commit; 8 MiB every five minutes of
@@ -232,6 +237,13 @@ pub struct Store {
     fenced: bool,
     boot: Vec<u64>,
     boot_seen: BTreeSet<u64>,
+    /// The extents a replay brought back, in the order its segments wrote
+    /// them: a wake after a crash fetches the newest of them beside its
+    /// mount (`replay_fetches`).
+    replayed: Vec<u64>,
+    /// The map pages this boot touched (at most BOOT_PAGES_MAX): its
+    /// checkpoints name them for the next open's round.
+    boot_pages: BTreeSet<u32>,
     /// Extents this life's cuts carried, the most recent last (each once):
     /// what the next boot is likely to read that this boot did not (a
     /// database's pages, a log's tail).
@@ -294,6 +306,8 @@ impl Store {
             fenced: false,
             boot: Vec::new(),
             boot_seen: BTreeSet::new(),
+            boot_pages: BTreeSet::new(),
+            replayed: Vec::new(),
             written: std::collections::VecDeque::new(),
             rewritten: std::collections::VecDeque::new(),
             fresh: info.head.is_none(),
@@ -338,6 +352,11 @@ impl Store {
                 s.load_page(remote, pr)?;
             }
         }
+        // the pages the last boot touched, fetched with the round
+        let boot: Vec<PageRef> = s.checkpoint.as_ref().map(|c| c.boot_pages.iter().filter_map(|p| s.unloaded.get(p).copied()).collect()).unwrap_or_default();
+        for pr in boot {
+            s.load_page(remote, pr)?;
+        }
         let pages = s.checkpoint.as_ref().map_or(0, |c| c.pages.len() as u32);
         s.opened = Opened { replayed: s.opened.replayed, extents_mapped: s.map.len() as u64, pages, pack: s.pack, crash_pack: s.crash_pack };
         assert_eq!(s.chain_end, s.applied_end, "nothing of this life is shipping yet");
@@ -363,7 +382,9 @@ impl Store {
     /// `PACK_HEAD_FETCH_BYTES`). No map page: each comes when first needed.
     pub fn open_asks(c: &Checkpoint, epoch: u64, first_seq: Option<u64>) -> Vec<Ask> {
         let mut asks: Vec<Ask> = Vec::new();
-        let heads: Vec<Ask> = [c.pack, c.crash_pack].into_iter().flatten().map(|pr| Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES }).collect();
+        let mut heads: Vec<Ask> = [c.pack, c.crash_pack].into_iter().flatten().map(|pr| Ask::Range { name: format::pack_name(pr.epoch, pr.seq), offset: 0, len: PACK_HEAD_FETCH_BYTES }).collect();
+        // and the pages the last boot touched
+        heads.extend(c.pages.iter().filter(|p| c.boot_pages.contains(&p.page)).map(|p| Ask::Whole(page_name(p))));
         let Some(first_seq) = first_seq else { return heads };
         asks.extend((first_seq..first_seq + u64::from(OPEN_SEGMENT_HEADERS)).map(|seq| Ask::Range { name: format::segment_name(SegId { epoch, seq }), offset: 0, len: SEGMENT_HEADER_BYTES_MAX as usize }));
         asks.extend(heads);
@@ -404,6 +425,39 @@ impl Store {
     fn load_page(&mut self, remote: &mut dyn RemoteGate, pr: PageRef) -> Result<(), StoreError> {
         let body = whole(remote, &page_name(&pr), PAGE_BYTES_MAX)?;
         self.install_page(pr, &body)
+    }
+
+    /// After a crash, the newest extents the replay brought back (the
+    /// crashed life's last writes: ext4's journal and metadata, which the
+    /// mount's recovery reads), up to REPLAY_FETCH_EXTENTS, as fetches of
+    /// runs within a segment: fetch them beside the mount and `install`
+    /// each. Empty after a clean sleep.
+    pub fn replay_fetches(&self) -> Vec<Fetch> {
+        let mut seen = BTreeSet::new();
+        let mut want: Vec<(u64, Loc)> = Vec::new();
+        for &e in self.replayed.iter().rev() {
+            if want.len() == REPLAY_FETCH_EXTENTS || !seen.insert(e) || self.local.contains_key(&e) {
+                continue;
+            }
+            if let Some(l) = self.map.get(&e).copied().filter(|l| !l.is_zero()) {
+                want.push((e, l));
+            }
+        }
+        // runs: consecutive places in one segment, a read-ahead's length
+        want.sort_by_key(|(_, l)| (l.seg, l.offset));
+        let mut out: Vec<Fetch> = Vec::new();
+        for (e, l) in want {
+            if let Some(f) = out.last_mut() {
+                let (_, last) = *f.run.last().expect("non-empty");
+                if last.seg == l.seg && last.offset + EXTENT_BYTES == l.offset && f.run.len() < READ_AHEAD_EXTENTS as usize {
+                    f.run.push((e, l));
+                    f.len += EXTENT_BYTES as usize;
+                    continue;
+                }
+            }
+            out.push(Fetch { name: format::segment_name(l.seg), offset: u64::from(l.offset), len: EXTENT_BYTES as usize, extent: e, run: vec![(e, l)] });
+        }
+        out
     }
 
     /// The pages a checkpoint would rewrite that are not loaded: fetch and
@@ -469,6 +523,9 @@ impl Store {
             assert!(e.extent < self.extents(), "a segment maps an extent past the volume");
             self.map.insert(e.extent, Loc { seg: h.id, offset: e.offset, len: e.len, sum: e.sum });
             self.pages_dirty.insert(page_of(e.extent));
+            if e.len > 0 {
+                self.replayed.push(e.extent);
+            }
         }
         self.segments.insert(h.id, link.sum);
         self.applied_end = link;
@@ -599,6 +656,14 @@ impl Store {
     fn note(&mut self, extent: u64) {
         if self.recording && self.boot.len() < PACK_EXTENTS_MAX as usize && self.boot_seen.insert(extent) {
             self.boot.push(extent);
+        }
+        self.note_page(extent);
+    }
+
+    /// The boot touched `extent`'s map page.
+    fn note_page(&mut self, extent: u64) {
+        if self.recording && self.boot_pages.len() < BOOT_PAGES_MAX as usize {
+            self.boot_pages.insert(page_of(extent));
         }
     }
 
@@ -764,6 +829,9 @@ impl Store {
         }
         if self.fresh {
             self.note(extent);
+        } else if was.is_none() {
+            // a write to an extent the cache does not hold may need its page
+            self.note_page(extent);
         }
         let whole_extent = offset == 0 && data.len() == EXTENT_BYTES as usize;
         if whole_extent {
@@ -978,7 +1046,8 @@ impl Store {
         }
         let segments: Vec<(SegId, Sum)> = live.iter().map(|id| (*id, *self.segments.get(id).expect("every mapped segment's seal is known"))).collect();
         assert!(segments.len() <= LIVE_SEGMENTS_MAX as usize, "live segments past their limit: the cleaner's compaction is P5's");
-        let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, crash_pack: self.crash_pack, pages: pages.into_values().collect(), segments };
+        let boot_pages: Vec<u32> = self.boot_pages.iter().copied().filter(|p| pages.contains_key(p)).collect();
+        let c = Checkpoint { epoch: self.epoch, seq, end: self.applied_end, volume_bytes: self.volume_bytes, pack: self.pack, crash_pack: self.crash_pack, pages: pages.into_values().collect(), boot_pages, segments };
         let body = format::encode_checkpoint(&c);
         let cr = CheckpointRef { epoch: self.epoch, seq, sum: format::sha256(&body) };
         out.push(Outgoing { name: format::checkpoint_name(self.epoch, seq), body, kind: Kind::Checkpoint(cr) });

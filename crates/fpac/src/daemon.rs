@@ -164,12 +164,33 @@ struct Prefetching<'a> {
     rounds: Vec<Value>,
 }
 
+/// A ranged ask larger than this is fetched as pieces of it in parallel
+/// and joined: one 4 MiB get took 250 to 590 ms on Cloudflare, four 1 MiB
+/// ones at once about a round trip (P5's four parallel gets: 176 to 194
+/// MB/s).
+const OPEN_PIECE_BYTES: usize = 1 << 20;
+
 impl Prefetching<'_> {
     fn fetch_all(&mut self, asks: Vec<Ask>) {
+        // the big ranges in pieces, joined below
+        let mut pieces: Vec<(usize, Ask)> = Vec::new();
+        for (i, a) in asks.iter().enumerate() {
+            match a {
+                Ask::Range { name, offset, len } if *len > OPEN_PIECE_BYTES => {
+                    let mut at = 0;
+                    while at < *len {
+                        let n = OPEN_PIECE_BYTES.min(len - at);
+                        pieces.push((i, Ask::Range { name: name.clone(), offset: offset + at as u64, len: n }));
+                        at += n;
+                    }
+                }
+                _ => pieces.push((i, a.clone())),
+            }
+        }
         let t = Instant::now();
         let count = asks.len();
         let (host, port) = (self.host.clone(), self.port);
-        let got = pool(asks.clone(), OPEN_FETCHES, |a| {
+        let fetched = pool(pieces.iter().map(|(_, a)| a.clone()).collect(), OPEN_FETCHES, |a| {
             let mut r = Remote::new(&host, port);
             match &a {
                 Ask::Whole(name) => {
@@ -178,17 +199,36 @@ impl Prefetching<'_> {
                 }
                 Ask::Range { name, offset, len } => {
                     let mut b = vec![0u8; *len];
-                    r.get_range(name, *offset, &mut b).ok().map(|o| {
-                        o.map(|k| {
+                    match r.get_range(name, *offset, &mut b) {
+                        Ok(o) => Some(o.map(|k| {
                             b.truncate(k);
                             b
-                        })
-                    })
+                        })),
+                        // a piece past the object's end: it ended before
+                        Err(fpac_remote::RemoteError::Refused { status: 416, .. }) => Some(None),
+                        Err(_) => None,
+                    }
                 }
             }
         });
+        // join each ask's pieces in order: absent if the first is, short
+        // where the object ended, failed if any piece failed
+        let mut joined: Vec<Option<Option<Vec<u8>>>> = vec![Some(None); asks.len()];
+        let mut started = vec![false; asks.len()];
+        for ((i, _), g) in pieces.iter().zip(fetched) {
+            let slot = &mut joined[*i];
+            match (g, slot.as_mut()) {
+                (None, _) => *slot = None,
+                (Some(None), Some(_)) if !started[*i] => {}
+                (Some(Some(b)), Some(acc)) => {
+                    started[*i] = true;
+                    acc.get_or_insert_with(Vec::new).extend_from_slice(&b);
+                }
+                _ => {}
+            }
+        }
         let mut failed = 0;
-        for (a, g) in asks.into_iter().zip(got) {
+        for (a, g) in asks.into_iter().zip(joined) {
             match g {
                 Some(g) => {
                     self.fetched.insert(a, g);
@@ -366,6 +406,32 @@ fn fetch_pack(disk: &Disk, t0: Instant, kind: &str, name: String, h: fpac_format
     event(t0, kind, json!({ "extents": h.entries.len(), "from": from, "waited_at": *disk.waited.lock().unwrap(), "installed": installed.into_inner(), "bytes": h.entries.len() as u64 * EXTENT_BYTES as u64 }));
 }
 
+/// A crash wake's fetch of what its replay brought back: PACK_FETCHES
+/// ranged gets at once, each installed as it arrives.
+fn fetch_replayed(disk: &Disk, t0: Instant, fetches: Vec<fpac_store::Fetch>) {
+    let n = fetches.len();
+    let installed = std::sync::atomic::AtomicU32::new(0);
+    pool(fetches, PACK_FETCHES, |f| {
+        let mut r = disk.remote();
+        let mut window = vec![0u8; f.len];
+        let got = r.get_range(&f.name, f.offset, &mut window);
+        disk.give_back(r);
+        if let Ok(Some(k)) = got {
+            let mut g = disk.inner.lock().unwrap();
+            let ok = {
+                let disk::Inner { store, cache } = &mut *g;
+                store.install(cache, &f, &window[..k], &mut vec![0u8; EXTENT_BYTES as usize])
+            };
+            if ok.is_ok() {
+                installed.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = disk.took(&mut g, f.extents());
+        }
+        disk.arrived(f.extents());
+    });
+    event(t0, "replay-fetched", json!({ "fetches": n, "installed": installed.into_inner() }));
+}
+
 fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
     move |disk: &Disk, p: &Progress| {
         let (dirty, shipping, epoch) = {
@@ -408,6 +474,14 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
     let disk = Arc::new(Disk::new(store, cache, host, port, cache_max));
     let progress = Arc::new(Progress::default());
     // the pack's head before the mount; the rest of it beside the mount
+    // after a crash: the newest extents the replay brought back, beside
+    // the mount (ext4's recovery reads them)
+    let replay = disk.inner.lock().unwrap().store.replay_fetches();
+    if !replay.is_empty() {
+        disk.expect_pack(replay.iter().flat_map(|f| f.extents().collect::<Vec<_>>()).map(|e| (e, usize::MAX)));
+        let d = disk.clone();
+        std::thread::spawn(move || fetch_replayed(&d, t0, replay));
+    }
     for (kind, name, pr, head) in packs {
         if let Some((name, h, from)) = pack_header(&disk, t0, kind, name, pr, head) {
             let d = disk.clone();

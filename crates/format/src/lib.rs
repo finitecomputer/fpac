@@ -177,8 +177,9 @@ impl<'a> R<'a> {
 
 const SEGMENT_MAGIC: &[u8; 8] = b"FPACSEG1";
 const PAGE_MAGIC: &[u8; 8] = b"FPACMAP1";
-/// The second checkpoint format: a crash pack beside the boot pack.
-const CHECKPOINT_MAGIC: &[u8; 8] = b"FPACCKP2";
+/// The third checkpoint format: a crash pack beside the boot pack, and
+/// the map pages the last boot touched.
+const CHECKPOINT_MAGIC: &[u8; 8] = b"FPACCKP3";
 /// The second pack format: each entry names its extent's place (P5's lazy
 /// map pages: a pack's extents need no page).
 const PACK_MAGIC: &[u8; 8] = b"FPACPAK2";
@@ -430,6 +431,10 @@ pub struct Checkpoint {
     pub crash_pack: Option<PackRef>,
     /// Every page that has an entry, ascending.
     pub pages: Vec<PageRef>,
+    /// The map pages the last boot touched, ascending (at most
+    /// BOOT_PAGES_MAX), each one of `pages`: the next open fetches them
+    /// in its one round, so the boot's path needs no page.
+    pub boot_pages: Vec<u32>,
     /// Every segment the map refers to, ascending, with its object's
     /// SHA-256: what a cleaner must keep.
     pub segments: Vec<(SegId, Sum)>,
@@ -469,6 +474,11 @@ pub fn encode_checkpoint(c: &Checkpoint) -> Vec<u8> {
         w.u64(id.epoch);
         w.u64(id.seq);
         w.bytes(s);
+    }
+    assert!(c.boot_pages.len() <= BOOT_PAGES_MAX as usize && c.boot_pages.windows(2).all(|w| w[0] < w[1]));
+    w.u32(u32::try_from(c.boot_pages.len()).expect("bounded"));
+    for p in &c.boot_pages {
+        w.u32(*p);
     }
     w.seal();
     assert!(w.0.len() as u64 <= CHECKPOINT_BYTES_MAX);
@@ -522,13 +532,25 @@ pub fn decode_checkpoint(b: &[u8]) -> Result<Checkpoint, FormatError> {
         }
         segments.push((id, s));
     }
+    let boot_n = r.u32()?;
+    if boot_n > BOOT_PAGES_MAX {
+        return Err(FormatError::Limit("a checkpoint's boot pages"));
+    }
+    let mut boot_pages: Vec<u32> = Vec::with_capacity(boot_n as usize);
+    for _ in 0..boot_n {
+        let p = r.u32()?;
+        if boot_pages.last().is_some_and(|q| *q >= p) || !pages.iter().any(|pr| pr.page == p) {
+            return Err(FormatError::Layout("a checkpoint's boot page"));
+        }
+        boot_pages.push(p);
+    }
     r.sealed()?;
     if r.at != b.len() {
         return Err(FormatError::Layout("bytes past a checkpoint"));
     }
     let pack = if flags & 1 == 1 { Some(pack) } else { None };
     let crash_pack = if flags & 2 == 2 { Some(crash_pack) } else { None };
-    Ok(Checkpoint { epoch, seq, end, volume_bytes, pack, crash_pack, pages, segments })
+    Ok(Checkpoint { epoch, seq, end, volume_bytes, pack, crash_pack, pages, boot_pages, segments })
 }
 
 /// A pack's header: its extents in the order they will be read, each with

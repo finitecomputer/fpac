@@ -677,8 +677,9 @@ fn a_remote_that_always_lies_gives_an_error_not_bytes() {
     life.cache = MemCache::default();
     let r = life.store.read(life.remote, &mut life.cache, 9, &mut buf);
     assert!(matches!(r, Err(StoreError::Corrupt(ref why)) if why.contains("tries")), "{r:?}");
-    // the extent's map page (loaded on this first read), then its tries
-    assert_eq!(life.remote.gets - gets, 1 + u64::from(FETCH_TRIES_MAX));
+    // its tries only: its map page came with the open's round (the last
+    // boot touched it)
+    assert_eq!(life.remote.gets - gets, u64::from(FETCH_TRIES_MAX));
 }
 
 // Goal: a cache that returns other bytes for a clean extent is caught by
@@ -845,11 +846,12 @@ impl RemoteGate for Recording<'_> {
     }
 }
 
-// Goal: an open reads no map page, however many the disk has, except
-// those its replay changed (a wake after a crash); a page comes when an
-// extent of it is first read. Two rounds after a sleep: the checkpoint,
-// then the replay's headers and the pack's head at once. Method: a disk
-// with pages 0, 1 and 3 and a crashed life's segments on page 0; open it
+// Goal: an open reads no map page, however many the disk has, but those
+// the last boot touched (in its one round) and those its replay changed (a
+// wake after a crash); any other page comes when an extent of it is first
+// read. Two rounds after a sleep: the checkpoint, then the pack's head and
+// the boot's pages at once. Method: a disk with pages 0, 1 and 3 whose
+// boot touched 0 only, and a crashed life's segments on page 0; open it
 // through a gate that records, then read an extent of page 3.
 #[test]
 fn an_open_reads_no_page_but_those_its_replay_changed() {
@@ -857,12 +859,15 @@ fn an_open_reads_no_page_but_those_its_replay_changed() {
     let mut platform = Platform { head: None, running: 0 };
     let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
     life.post_head().unwrap();
-    // extents across the pages, as ext4's metadata is spread
+    // extents across the pages, as ext4's metadata is spread; the boot
+    // (recording) touches page 0 only
+    life.store.stop_boot();
     for e in [0u64, 1, 2, 4095, 4096, 8191, 12_288] {
         let b = content(200 + e);
         life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
         life.model.live.insert(e, b);
     }
+    life.store.record_boot();
     life.store.read(life.remote, &mut life.cache, 0, &mut vec![0u8; EXT]).unwrap();
     life.sleep(&mut Rng(3)).unwrap();
     let exp = life.model.after_crash(life.remote);
@@ -871,10 +876,11 @@ fn an_open_reads_no_page_but_those_its_replay_changed() {
     let mut gate = Recording { inner: &mut remote, rounds: Vec::new(), reads: Vec::new() };
     let s = Store::open(&mut gate, &OpenInfo { epoch: 2, volume_bytes: VOLUME, head: platform.head }).unwrap();
     assert_eq!(s.opened().pages, 3);
-    assert_eq!(s.pages_unloaded(), 3);
     assert_eq!(gate.rounds.len(), 1, "one round after the checkpoint");
     assert!(matches!(&gate.reads[..gate.rounds[0].0], [Ask::Whole(n)] if n.starts_with("e1/c")), "{:?}", gate.reads);
-    assert!(!gate.reads.iter().chain(gate.rounds[0].1.iter()).any(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))), "no page: {:?}", gate.rounds);
+    let pages_asked: Vec<&Ask> = gate.rounds[0].1.iter().filter(|a| matches!(a, Ask::Whole(n) if n.contains("/m"))).collect();
+    assert!(pages_asked.len() == 1 && matches!(pages_asked[0], Ask::Whole(n) if n.ends_with("-0")), "the boot's page only: {:?}", gate.rounds);
+    assert_eq!(s.pages_unloaded(), 2, "the boot's page is loaded, the others not");
     assert!(gate.rounds[0].1.iter().any(|a| matches!(a, Ask::Range { name, len, .. } if name.starts_with("e1/p") && *len == fpac_store::PACK_HEAD_FETCH_BYTES)), "the pack's head");
     assert!(!gate.reads.iter().chain(gate.rounds[0].1.iter()).any(|a| matches!(a, Ask::Range { name, .. } if name.contains("/s"))), "a clean sleep: no segment asked for: {:?}", gate.rounds);
     for r in &gate.reads[gate.rounds[0].0..] {
@@ -950,6 +956,53 @@ fn a_crash_wake_finds_the_rewritten_in_its_crash_pack() {
     let exp = life.model.after_crash(life.remote);
     let life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
     assert!(life.store.crash_pack_to_fetch().is_none(), "a sleep drops the crash pack");
+}
+
+// Goal: a wake after a crash fetches what its replay brought back (the
+// crashed life's writes since its checkpoint) in a few ranged gets, and
+// reads them without a miss. Method: write extents in two flushes, crash,
+// open, install each of replay_fetches, read with the remote counted.
+#[test]
+fn a_crash_wake_fetches_what_its_replay_brought_back() {
+    let mut remote = SimRemote::new(17, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for (i, e) in [30u64, 31, 32, 900].into_iter().enumerate() {
+        let b = content(950 + i as u64);
+        life.store.write(life.remote, &mut life.cache, e, 0, &b).unwrap();
+        life.model.live.insert(e, b);
+        if i == 1 {
+            life.flush().unwrap();
+            life.land_all(&mut Rng(2)).unwrap();
+        }
+    }
+    life.flush().unwrap();
+    life.land_all(&mut Rng(2)).unwrap();
+    // a crash: no checkpoint since the head's
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    assert_eq!(life.store.opened().replayed, 2);
+    let fetches = life.store.replay_fetches();
+    let named: BTreeSet<u64> = fetches.iter().flat_map(|f| f.extents().collect::<Vec<_>>()).collect();
+    assert_eq!(named, [30u64, 31, 32, 900].into_iter().collect(), "every extent the replay brought back");
+    assert!(fetches.len() <= 3, "in runs, not one by one: {}", fetches.len());
+    for f in &fetches {
+        let mut window = vec![0u8; f.len];
+        let n = life.remote.get_range(&f.name, f.offset, &mut window).unwrap().unwrap();
+        life.store.install(&mut life.cache, f, &window[..n], &mut vec![0u8; EXT]).unwrap();
+    }
+    let gets = life.remote.gets;
+    for e in [30u64, 31, 32, 900] {
+        life.read_check(e).unwrap();
+    }
+    assert_eq!(life.remote.gets, gets, "no miss after the replay's fetch");
+    // a clean sleep's next wake fetches nothing so
+    life.post_head().unwrap();
+    life.sleep(&mut Rng(2)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let life = open(&mut remote, &mut platform, 3, exp, u64::MAX);
+    assert!(life.store.replay_fetches().is_empty());
 }
 
 // Goal: a new disk's first wake has its boot's files in its pack: the

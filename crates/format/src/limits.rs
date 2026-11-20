@@ -83,7 +83,11 @@ pub const SEGMENT_FIXED_BYTES: u32 = 96;
 pub const SEGMENT_ENTRY_BYTES: u32 = 24;
 
 /// A checkpoint object's largest size: its pages and its live segments.
-pub const CHECKPOINT_BYTES_MAX: u64 = 192 + PAGES_MAX as u64 * 56 + LIVE_SEGMENTS_MAX as u64 * 48 + 32;
+pub const CHECKPOINT_BYTES_MAX: u64 = 192 + PAGES_MAX as u64 * 56 + LIVE_SEGMENTS_MAX as u64 * 48 + 4 + BOOT_PAGES_MAX as u64 * 4 + 32;
+/// Map pages a boot's checkpoint names for the next open to fetch with its
+/// round, at most: Hermes' boot touched 2 to 9 on Cloudflare, each a round
+/// trip of about 100 ms when fetched on demand.
+pub const BOOT_PAGES_MAX: u32 = 64;
 
 const _: () = assert!(SEGMENT_BYTES_TARGET <= SEGMENT_BYTES_MAX);
 const _: () = assert!(SEGMENT_EXTENTS_TARGET <= SEGMENT_EXTENTS_MAX);
