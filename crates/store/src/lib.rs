@@ -25,6 +25,7 @@
 //! it follows). A contradiction in our own state is corruption: the store
 //! refuses to go on.
 
+pub mod evict;
 pub mod gates;
 pub mod head;
 
@@ -479,22 +480,39 @@ impl Store {
     /// each. Empty after a clean sleep.
     pub fn replay_fetches(&self) -> Vec<Fetch> {
         let mut seen = BTreeSet::new();
-        let mut want: Vec<(u64, Loc)> = Vec::new();
+        let mut want: Vec<u64> = Vec::new();
         for &e in self.replayed.iter().rev() {
-            if want.len() == REPLAY_FETCH_EXTENTS || !seen.insert(e) || self.local.contains_key(&e) {
+            if want.len() == REPLAY_FETCH_EXTENTS || !seen.insert(e) {
                 continue;
             }
-            if let Some(l) = self.map.get(&e).copied().filter(|l| !l.is_zero()) {
-                want.push((e, l));
-            }
+            want.push(e);
         }
-        // runs: consecutive places in one segment, a read-ahead's length
+        self.fetches_for(want, READ_AHEAD_EXTENTS as usize)
+    }
+
+    /// A sequential read's next extents (docs/design.md, Read-ahead): those
+    /// in `from..to` the cache does not hold and the map places, as
+    /// fetches of runs within a segment of at most `run_max` extents, for
+    /// the caller to make in parallel and `install` (each extent once,
+    /// whoever asks). An extent whose page is not loaded is left to its
+    /// read.
+    pub fn ahead(&self, from: u64, to: u64, run_max: usize) -> Vec<Fetch> {
+        assert!(to >= from && to - from <= u64::from(AHEAD_EXTENTS_MAX), "a read-ahead window within its limit");
+        self.fetches_for((from..to.min(self.extents())).collect(), run_max)
+    }
+
+    /// The fetches for `extents` the cache does not hold and the map
+    /// places: runs of consecutive places in one segment, at most
+    /// `run_max` extents each.
+    fn fetches_for(&self, extents: Vec<u64>, run_max: usize) -> Vec<Fetch> {
+        assert!(run_max >= 1 && run_max <= SEGMENT_EXTENTS_MAX as usize);
+        let mut want: Vec<(u64, Loc)> = extents.into_iter().filter(|e| !self.local.contains_key(e)).filter_map(|e| self.map.get(&e).copied().filter(|l| !l.is_zero()).map(|l| (e, l))).collect();
         want.sort_by_key(|(_, l)| (l.seg, l.offset));
         let mut out: Vec<Fetch> = Vec::new();
         for (e, l) in want {
             if let Some(f) = out.last_mut() {
                 let (_, last) = *f.run.last().expect("non-empty");
-                if last.seg == l.seg && last.offset + self.stride() == l.offset && f.run.len() < READ_AHEAD_EXTENTS as usize {
+                if last.seg == l.seg && last.offset + self.stride() == l.offset && f.run.len() < run_max {
                     f.run.push((e, l));
                     f.len += self.stride() as usize;
                     continue;
@@ -700,6 +718,14 @@ impl Store {
     /// Extents the cache holds (clean, dirty or shipping).
     pub fn cached_extents(&self) -> usize {
         self.local.len()
+    }
+
+    /// Whether the cache holds `extent` as the store's bytes (clean) and it
+    /// may leave: not one the boot read (or, on a new disk, wrote), which
+    /// the next pack takes from the cache (at most PACK_EXTENTS_MAX, so
+    /// 100 MB stays).
+    pub fn may_leave(&self, extent: u64) -> bool {
+        self.local.get(&extent) == Some(&Local::Clean) && !self.boot_seen.contains(&extent)
     }
 
     /// Whether the cache holds `extent`.
@@ -1094,10 +1120,13 @@ impl Store {
     /// Segment `seq` of this life landed. The map moves a whole cut at a
     /// time, in segment order: a cut counts only once every segment of it
     /// has landed, so the map (and any checkpoint of it) is always a real
-    /// moment of the disk; a segment that landed early waits.
-    pub fn landed(&mut self, seq: u64) {
+    /// moment of the disk; a segment that landed early waits. Answers the
+    /// extents that became clean (the cache's policy may drop them now).
+    pub fn landed(&mut self, seq: u64) -> Vec<u64> {
         let s = self.shipping.get_mut(&seq).expect("a segment this life shipped");
         s.landed = true;
+        // the extents that became clean, for the cache's policy
+        let mut cleaned = Vec::new();
         // Bounded by the segments in flight.
         loop {
             // the first cut in flight: its segments up to its last
@@ -1114,7 +1143,7 @@ impl Store {
                 }
             }
             if !complete {
-                return;
+                return cleaned;
             }
             for q in cut {
                 let s = self.shipping.remove(&q).expect("present");
@@ -1125,6 +1154,7 @@ impl Store {
                     self.pages_dirty.insert(page_of(*e));
                     if self.local.get(e) == Some(&Local::Shipping(q)) {
                         self.set_local(*e, Some(Local::Clean));
+                        cleaned.push(*e);
                     }
                     if !loc.is_zero() {
                         // the most recent PACK_EXTENTS_MAX, each once,

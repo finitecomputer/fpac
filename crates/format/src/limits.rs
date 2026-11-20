@@ -70,6 +70,14 @@ pub const PACK_OBJECT_BYTES_MAX: u64 = PACK_HEADER_BYTES_MAX + PACK_BYTES_MAX;
 /// a 1 MiB range costs about what 64 KiB does (docs/spike.md, P2).
 pub const READ_AHEAD_BYTES: u32 = 1 << 20;
 pub const READ_AHEAD_EXTENTS: u32 = READ_AHEAD_BYTES / EXTENT_BYTES;
+/// A sequential read's window, at most: what the daemon fetches ahead of
+/// a scan (docs/design.md, Read-ahead), in pieces of AHEAD_PIECE_EXTENTS
+/// on several connections. A scan that stops early leaves at most this
+/// much fetched and unread.
+pub const AHEAD_EXTENTS_MAX: u32 = (64 << 20) / EXTENT_BYTES;
+/// One get of a read-ahead window: 4 MiB, so four at once reach about
+/// what P5's four parallel gets of 50 MiB did on Cloudflare (176-194 MB/s).
+pub const AHEAD_PIECE_EXTENTS: u32 = (4 << 20) / EXTENT_BYTES;
 
 /// A fetch whose bytes fail their checksum is fetched again this many
 /// times in all before the read fails: a wrong read was seen on
@@ -97,4 +105,5 @@ const _: () = assert!((SEGMENT_HEADER_BYTES_MAX as u64) + SEGMENT_EXTENTS_MAX as
 const _: () = assert!(SEGMENT_BYTES_MAX < 100 << 20, "the intercept's body limit");
 const _: () = assert!(PACK_OBJECT_BYTES_MAX < 100 << 20, "the intercept's body limit");
 const _: () = assert!(READ_AHEAD_EXTENTS >= 1 && READ_AHEAD_EXTENTS <= SEGMENT_EXTENTS_MAX);
+const _: () = assert!(AHEAD_PIECE_EXTENTS >= 1 && AHEAD_PIECE_EXTENTS <= SEGMENT_EXTENTS_MAX && AHEAD_PIECE_EXTENTS <= AHEAD_EXTENTS_MAX);
 const _: () = assert!(CHECKPOINT_BYTES_MAX < 100 << 20);

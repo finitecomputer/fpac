@@ -115,6 +115,51 @@ once**: the cache file dies with the container, so syncing it would
 protect nothing; every cut is a whole moment of the device, so the
 order ext4's journal relies on holds in the store.
 
+**The unshipped bound, `UNSHIPPED_BYTES_MAX` = 4 GiB** (the owner's
+budget is 2 to 4 GiB, held on disk; 4 because section 10's sequential
+line writes 4 GiB in one burst). Written and not yet landed, it is held
+in the cache file, and the shadow file beside it holds at most as much
+again. Past it, a write to an extent not already dirty waits for a
+landing. What it costs:
+
+- **The loss window.** A crash loses what had not landed: about a second
+  of writes when the disk keeps up (FLUSH_MS and a put), and at most
+  4 GiB during a burst, which is the burst's last 50 to 80 s (4 GiB at
+  the 86 MB/s Cloudflare shipped behind section 10's burst, or at the
+  50 MB/s its puts sustained in P2). The owner accepted about a minute.
+- **The sleep's flush.** A sleep ships the backlog first: up to 50 to
+  80 s right after a 4 GiB burst (measured on Cloudflare: 52 s and 82 s
+  for 3.2 and 3.4 GB left after a 100 GB fill, `wake.json`), and 2.3 to
+  3.7 s otherwise, at 1 to 100 GB. **Decided (the owner, 2026-11-20):**
+  the 4 GiB budget stays and section 10's sleep line holds for a disk at
+  rest; right after a burst a sleep takes as long as shipping its backlog
+  does. A wake cancels a sleep, so a person who comes back never waits
+  on it.
+
+## The cache
+
+The cache file is bounded (`fpac/src/daemon.rs`, `cache_bound`): what its
+disk has free at the mount, less the shadow file's worst case
+(UNSHIPPED_BYTES_MAX) and CACHE_DISK_HEADROOM_BYTES for everything else
+on that disk, at most the volume. A disk with less room than twice the
+unshipped budget is refused at the mount. Past the bound, clean extents
+leave, chosen by **S3-FIFO** (`store/src/evict.rs`): an extent's first
+taking goes into a small queue, and only one used again there moves to
+the main queue, so a one-pass scan (a build reading its outputs once)
+passes through and out without pushing out what the agent uses again.
+An extent read ahead counts its first read as its taking. Never dropped:
+what is unshipped (the cache is its only copy), what a partial write is
+reading (it was fetched for that write), and what the next pack takes
+from the cache (the boot's extents, at most PACK_EXTENTS_MAX).
+
+**Read-ahead.** The daemon follows up to STREAMS_MAX sequential reads of
+the device. From a scan's second read it keeps AHEAD_EXTENTS_MAX (64 MiB)
+fetched ahead of it, in pieces of AHEAD_PIECE_EXTENTS (4 MiB) on
+AHEAD_FETCHES (8) connections, starting the next part of the window once less
+than half is left ahead; a read of an extent on its way waits for it
+rather than fetching it twice. A scan that stops early leaves at most a
+window fetched and unread (gets only; reads are not billed as egress).
+
 ## Consistency and failure
 
 - **One writer.** A disk's epoch is the platform's start generation. The
@@ -139,8 +184,8 @@ order ext4's journal relies on holds in the store.
   back a checkpoint.
 - **A put is idempotent** (contract.md): `Same` is our own earlier put;
   `Conflict` is another writer, and the daemon stops.
-- **A slow or absent store.** Unsent data piles up on the container's
-  disk. Past a cap (1 GiB or 60 s), writes slow down rather than go on
+- **A slow or absent store.** Unsent data piles up in the cache file.
+  Past UNSHIPPED_BYTES_MAX, writes to new extents wait rather than go on
   unprotected.
 
 ### Each cache names its source
@@ -184,7 +229,10 @@ them together. Those already in code are marked with their file.
 | `EXTENT_BYTES` | 64 KiB | The unit fetched, shipped and checked (`format/limits.rs`, as the rest below) |
 | `SEGMENT_BYTES_TARGET`, `SEGMENT_BYTES_MAX` | 8 MiB, 64 MiB | A put costs about the same to 8 MiB; a bigger cut is a group of segments |
 | `DIRTY_BYTES_MAX` | 256 MiB | Written and not yet cut: one cut's size. A cut takes all of it at one instant (a subset would reorder ext4's writes), naming it only; past it a write asks for a cut at once |
-| `UNSHIPPED_BYTES_MAX` | 4 GiB | Written and not yet landed, held in the cache file: a burst this large goes at the local disk's speed. Section 10's 4 GiB line; it bounds a crash's loss during a burst and a sleep's flush (about 85 s at 50 MB/s) |
+| `UNSHIPPED_BYTES_MAX` | 4 GiB | Written and not yet landed, held in the cache file: a burst this large goes at the local disk's speed. Section 10's 4 GiB line; it bounds a crash's loss during a burst and a sleep's flush (The sleep, above) |
+| The cache's bound | the disk's free room at the mount, less 4 GiB and 2 GiB | Past it, clean extents leave (S3-FIFO); `CACHE_DISK_HEADROOM_BYTES` (2 GiB) is left for everything else on the container's disk (`fpac/src/daemon.rs`) |
+| `AHEAD_EXTENTS_MAX`, `AHEAD_PIECE_EXTENTS` | 64 MiB, 4 MiB | A sequential read's window and one get of it; four parallel gets of 50 MiB reached 176-194 MB/s on Cloudflare in P5 (`format/limits.rs`) |
+| `STREAMS_MAX`, `AHEAD_FETCHES`, `AHEAD_WINDOWS_MAX` | 8, 8, 4 | Scans followed, connections per window, windows in flight (`fpac/src/disk.rs`) |
 | `CRASH_PACK_EXTENTS` | 128 (8 MiB) | A periodic checkpoint's crash pack: about $0.0024 an hour of activity in egress (`store/src/lib.rs`) |
 | `CUT_SEGMENTS_MAX` | 32 | The segments one cut may need |
 | `PACK_EXTENTS_MAX` | 1,535 (96 MiB less one extent) | A wake's pack; past it, the extents written longest ago are left out. With its header the object stays within `OBJECT_BYTES_MAX`, asserted for every kind of object |
@@ -215,7 +263,7 @@ the cache; "cold" is after a wake on a host with an empty cache.
 | SQLite: 10,000 single-row transactions (`FULL`, `NORMAL`); 1 M rows in one; 100,000 point reads | ≤ 1.25× local |
 | Sequential write, 4 GiB and an fsync | ≥ 0.7× local; shipped behind it at ≥ 50 MB/s |
 | 4 KiB random write, 30 s and an fsync | ≥ 0.7× local |
-| A sleep's flush | ≤ 4 s at any size |
+| A sleep's flush | ≤ 4 s for a disk at rest (after a burst: its backlog's shipping, decided) |
 
 **The sniff test:** the store alone should read cached blocks at 1 GB/s
 and take writes at 300 MB/s on a workstation; through the loop device it
@@ -304,9 +352,6 @@ quote them as they are.
 - **Live segments are never compacted**: an extent rewritten often
   leaves old segments live while any extent in them is current. Bounded
   by LIVE_SEGMENTS_MAX (asserted); the cleaner's compaction is the fix.
-- **`fpac mount --cache-max` is a measurement aid** (first in, first out,
-  never what is unshipped or mid-write): the product's cache bound,
-  scan-resistant, is a PR of its own (docs/costs.md).
 - **The image must carry mke2fs** for a new disk (Hermes' image has
   none; the spike's harness made the disk from the tiny image).
 - The probe's FUSE file is backed by a plain local file (`LocalFile`): a

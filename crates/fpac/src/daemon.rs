@@ -20,10 +20,11 @@ use fpac_device::linux::{self, FuseMount, Loop};
 use fpac_device::serve::{Backing, File};
 use fpac_format::limits::EXTENT_BYTES;
 use fpac_remote::Remote;
+use fpac_store::evict::Taken;
 use fpac_store::{Ask, OpenInfo, PackView, Store, StoreError};
 use serde_json::{json, Value};
 
-use crate::disk::{self, Disk, FileCache};
+use crate::disk::{self, pool, Disk, FileCache};
 use crate::flush::{self, Progress};
 
 /// The intercepted host the guest reaches the remote by.
@@ -40,6 +41,9 @@ const OPEN_MS_MAX: u64 = 60_000;
 /// consistent with files still open (a sleep's caller stops its programs
 /// first; this is the guard if one is left).
 const UMOUNT_MS_MAX: u64 = 2_000;
+/// Room the cache leaves on its disk for everything else there (the
+/// image's own files, logs, a program's scratch).
+const CACHE_DISK_HEADROOM_BYTES: u64 = 2 << 30;
 /// The kernel's writeback in the guest (docs/contract.md, the loss
 /// window): a page only written goes to the device within 5 s, not
 /// Linux's default 30 s, and the flusher wakes every second.
@@ -83,7 +87,8 @@ pub fn main() {
             let host = arg(&args, "--host").unwrap_or_else(|| REMOTE_HOST.into());
             let port: u16 = arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(80);
             let cache = PathBuf::from(arg(&args, "--cache").unwrap_or_else(|| "/var/lib/fpac/cache".into()));
-            // a measurement aid (docs/costs.md): the cache's bound in bytes
+            // a lower cache bound than the disk's room, in bytes: a
+            // measurement aid (docs/costs.md)
             let cache_max: Option<u64> = arg(&args, "--cache-max").and_then(|b| b.parse().ok());
             // a sealed disk (docs/encryption.md): its data key, 64 hex
             // digits in a file the caller made (never on a command line)
@@ -146,26 +151,6 @@ fn lock_memory() -> bool {
 /// is about 100 ms, so all of them go at once.
 const OPEN_FETCHES: usize = 64;
 
-/// Runs `jobs` on at most `workers` threads, in order of start, each
-/// answer in its job's place.
-fn pool<T: Send, R: Send>(jobs: Vec<T>, workers: usize, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let n = jobs.len();
-    let jobs = std::sync::Mutex::new(jobs.into_iter().enumerate().collect::<std::collections::VecDeque<_>>());
-    let out = std::sync::Mutex::new((0..n).map(|_| None).collect::<Vec<Option<R>>>());
-    std::thread::scope(|s| {
-        for _ in 0..workers.min(n) {
-            s.spawn(|| {
-                // Bounded by the jobs.
-                loop {
-                    let Some((i, job)) = jobs.lock().unwrap().pop_front() else { break };
-                    let r = f(job);
-                    out.lock().unwrap()[i] = Some(r);
-                }
-            });
-        }
-    });
-    out.into_inner().unwrap().into_iter().map(|r| r.expect("every job ran")).collect()
-}
 
 /// The remote for an open. The store names its second round at once
 /// (`prefetch`: pages, the replay's first headers, the pack's head); this
@@ -383,7 +368,7 @@ fn pack_header(disk: &Disk, t0: Instant, kind: &str, name: String, pr: fpac_form
                     let disk::Inner { store, cache } = &mut *g;
                     store.pack_install(cache, &v, v.images_at, &b[at..at + held * stride]).unwrap_or(0)
                 };
-                let _ = disk.took(&mut g, v.header.entries.iter().take(held).map(|(e, _)| *e));
+                let _ = disk.took(&mut g, v.header.entries.iter().take(held).map(|(e, _)| *e), Taken::Ahead);
                 k
             };
             let install_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -427,7 +412,7 @@ fn fetch_pack(disk: &Disk, t0: Instant, kind: &str, v: PackView, from: u64) {
             if let Ok(k) = k {
                 installed.fetch_add(k, Ordering::Relaxed);
             }
-            let _ = disk.took(&mut g, entries.iter().skip(first).take(count).map(|(e, _)| *e));
+            let _ = disk.took(&mut g, entries.iter().skip(first).take(count).map(|(e, _)| *e), Taken::Ahead);
             drop(g);
             install_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
@@ -457,7 +442,7 @@ fn fetch_replayed(disk: &Disk, t0: Instant, fetches: Vec<fpac_store::Fetch>) {
             if ok.is_ok() {
                 installed.fetch_add(1, Ordering::Relaxed);
             }
-            let _ = disk.took(&mut g, f.extents());
+            let _ = disk.took(&mut g, f.extents(), Taken::Ahead);
         }
         disk.arrived(f.extents());
     });
@@ -485,8 +470,8 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
         let s = json!({
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
-            "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "checkpoints": p.checkpoints.load(Ordering::Relaxed), "shipping_behind": p.behind.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
+            "unshipped_extents": disk.inner.lock().unwrap().store.unshipped_extents(), "planned_segments": disk.inner.lock().unwrap().store.planned(), "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "page_loads": disk.stats.page_loads.load(Ordering::Relaxed), "ahead_windows": disk.stats.ahead_windows.load(Ordering::Relaxed), "ahead_extents": disk.stats.ahead_extents.load(Ordering::Relaxed), "ahead_waits": disk.stats.ahead_waits.load(Ordering::Relaxed), "pages_unloaded": disk.inner.lock().unwrap().store.pages_unloaded(), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed), "cpu_ms": cpu_ms(),
             "lock_waits_over_1ms": disk.stats.lock_waits_over_1ms.load(Ordering::Relaxed), "lock_wait_max_us": disk.stats.lock_wait_max_us.load(Ordering::Relaxed),
@@ -497,6 +482,29 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             let _ = std::fs::rename(&tmp, state.join("status.json"));
         }
     }
+}
+
+/// The cache's bound (docs/design.md, The cache): what the cache file's
+/// disk has free at the mount, less the shadow file's worst case (the
+/// unshipped budget, UNSHIPPED_BYTES_MAX) and CACHE_DISK_HEADROOM_BYTES,
+/// and at most the volume. `--cache-max` may only lower it. A disk with
+/// less room than twice the unshipped budget is refused: writes there
+/// could fill it.
+fn cache_bound(cache_path: &Path, volume: u64, asked: Option<u64>) -> Result<u64, String> {
+    use fpac_format::limits::UNSHIPPED_BYTES_MAX;
+    let dir = cache_path.parent().unwrap_or(Path::new("/"));
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: statvfs fills the struct it is given, for a NUL-ended path.
+    let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut v) } != 0 {
+        return Err(format!("the cache's disk: {}", std::io::Error::last_os_error()));
+    }
+    let free = v.f_bavail.saturating_mul(v.f_frsize);
+    let bound = free.saturating_sub(UNSHIPPED_BYTES_MAX + CACHE_DISK_HEADROOM_BYTES).min(volume);
+    if bound < 2 * UNSHIPPED_BYTES_MAX && asked.is_none() {
+        return Err(format!("the cache's disk has {free} bytes free: the cache needs {} at least", 3 * UNSHIPPED_BYTES_MAX + CACHE_DISK_HEADROOM_BYTES));
+    }
+    Ok(asked.map_or(bound, |a| a.min(bound)) / EXTENT_BYTES as u64 * EXTENT_BYTES as u64)
 }
 
 fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cache_max: Option<u64>, key: Option<[u8; 32]>) -> Result<(), String> {
@@ -519,7 +527,10 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
     // trusted (docs/encryption.md)
     let cache_seal = key.map(|k| (Arc::new(fpac_format::Sealer::new(&k, &disk_name)), store.epoch()));
     let cache = FileCache::create(cache_path, volume, cache_seal).map_err(|e| format!("the cache file: {e}"))?;
-    let disk = Arc::new(Disk::new(store, cache, host, port, cache_max).map_err(|e| format!("the cache file: {e}"))?);
+    let bound = cache_bound(cache_path, volume, cache_max)?;
+    event(t0, "cache", json!({ "bound_bytes": bound, "asked_bytes": cache_max }));
+    let disk = Arc::new(Disk::new(store, cache, host, port, bound).map_err(|e| format!("the cache file: {e}"))?);
+    disk.set_me();
     let progress = Arc::new(Progress::default());
     // the pack's head before the mount; the rest of it beside the mount
     // after a crash: the newest extents the replay brought back, beside

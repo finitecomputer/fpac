@@ -313,6 +313,9 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
     let volume: u64 = flag(args, "--volume-gb").and_then(|g| g.parse::<u64>().ok()).map_or(20_000 << 20, |g| g << 30);
     let mount_args = flag(args, "--cache-max").map(|b| format!("--cache-max {b}")).unwrap_or_default();
     let mut p: Box<dyn disk::Place> = match place {
+        // an npm install runs its packages' own scripts: never here
+        _ if scenario == "npm" && place != "cloudflare" => return Err("the npm benchmark runs in a disposable Cloudflare container only".into()),
+        _ if scenario == "npm" => Box::new(disk::Cloudflare::npm(&format!("npm-{}", now_ms()), volume)?),
         "krun" => Box::new(disk::Krun::new(&krun_image()?.0, &format!("disk-{scenario}"), volume)?),
         _ => Box::new(disk::Cloudflare::new(&format!("{scenario}-{}", now_ms()), volume)?),
     };
@@ -320,6 +323,7 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
+        "npm" => disk::npm(p.as_mut(), &flag(args, "--variant").unwrap_or_else(|| "shipped".into()), &flag(args, "--workload").unwrap_or_else(|| "sandbox-sdk".into())),
         "thrash" => disk::thrash(p.as_mut(), flag(args, "--big-files").and_then(|r| r.parse().ok()).unwrap_or(2560), flag(args, "--cache-max").and_then(|r| r.parse().ok()), !args.iter().any(|a| a == "--no-wake")),
         _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0), &mount_args),
     };
@@ -517,6 +521,14 @@ fn stage_worker(c: &Config, key: &net::Key, image_ctx: &Path) -> Result<PathBuf,
     assert!(!cfg.contains("${"), "every placeholder filled");
     // `FPAC_HERMES_IMAGE`: a second image of the class, Hermes with fpac
     // mounting /data before its own entrypoint (docs/results.md)
+    // `FPAC_NPM_IMAGE`: the npm benchmark's image (C), a pinned node base
+    // with fpac and the probe; the only image a start may give the internet
+    if let Ok(base) = std::env::var("FPAC_NPM_IMAGE") {
+        let ctx = stage_npm(&base, image_ctx)?;
+        let entry = format!("\"npm\": {{ \"dockerfile\": \"{}\", \"build_context\": \"{}\" }},\n        \"tiny\":", ctx.join("Dockerfile").display(), ctx.display());
+        assert!(cfg.contains("\"tiny\":"), "the images map");
+        cfg = cfg.replacen("\"tiny\":", &entry, 1);
+    }
     if let Ok(base) = std::env::var("FPAC_HERMES_IMAGE") {
         let ctx = stage_hermes(&base, image_ctx)?;
         let entry = format!("\"hermes\": {{ \"dockerfile\": \"{}\", \"build_context\": \"{}\" }},\n        \"tiny\":", ctx.join("Dockerfile").display(), ctx.display());
@@ -525,6 +537,30 @@ fn stage_worker(c: &Config, key: &net::Key, image_ctx: &Path) -> Result<PathBuf,
     }
     std::fs::write(dir.join("wrangler.jsonc"), cfg).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+/// The npm image's build context (C): `base` (a node image, pinned by its
+/// digest) with fpac and fpac-probe copied in; nothing is run at build.
+fn stage_npm(base: &str, tiny_ctx: &Path) -> Result<PathBuf, String> {
+    assert!(base.contains("@sha256:"), "the npm image's base is pinned by its digest");
+    let ctx = work_dir().join("npm-image");
+    std::fs::create_dir_all(&ctx).map_err(|e| e.to_string())?;
+    for f in ["fpac", "fpac-probe"] {
+        std::fs::copy(tiny_ctx.join(f), ctx.join(f)).map_err(|e| format!("{f}: {e}"))?;
+    }
+    // the heavy workload, once its lockfile is made (`npm-lock`)
+    let heavy = repo().join("crates/bench/npm-heavy");
+    let with_heavy = heavy.join("package-lock.json").exists();
+    if with_heavy {
+        std::fs::create_dir_all(ctx.join("npm-heavy")).map_err(|e| e.to_string())?;
+        for f in ["package.json", "package-lock.json"] {
+            std::fs::copy(heavy.join(f), ctx.join("npm-heavy").join(f)).map_err(|e| format!("{f}: {e}"))?;
+        }
+    }
+    let copy_heavy = if with_heavy { "COPY npm-heavy /opt/npm-heavy\n" } else { "" };
+    let dockerfile = format!("FROM {base}\nCOPY fpac-probe /usr/local/bin/fpac-probe\nCOPY fpac /usr/local/bin/fpac\n{copy_heavy}LABEL fpac.spike.deployed_at_ms=\"{}\"\nENTRYPOINT [\"/usr/local/bin/fpac-probe\", \"idle\"]\n", now_ms());
+    std::fs::write(ctx.join("Dockerfile"), dockerfile).map_err(|e| e.to_string())?;
+    Ok(ctx)
 }
 
 /// The Hermes image's build context: `base` with the fpac binary (from the
@@ -710,7 +746,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -742,6 +778,18 @@ fn main() {
         }),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
+        // the npm benchmark's heavy lockfile, made in a disposable
+        // Cloudflare container (never here): crates/bench/npm-heavy
+        (Some("npm-lock"), _) => (|| {
+            let dir = repo().join("crates/bench/npm-heavy");
+            let pkg = std::fs::read_to_string(dir.join("package.json")).map_err(|e| e.to_string())?;
+            let before = flag(&args, "--before").ok_or("--before <date>")?;
+            let mut p = disk::Cloudflare::npm(&format!("npm-lock-{}", now_ms()), 20_000 << 20)?;
+            let lock = disk::npm_lock(&mut p, &pkg, &before)?;
+            let v: Value = serde_json::from_str(&lock).map_err(|e| format!("the lockfile: {e}"))?;
+            std::fs::write(dir.join("package-lock.json"), &lock).map_err(|e| e.to_string())?;
+            Ok(json!({ "bytes": lock.len(), "packages": v["packages"].as_object().map(|o| o.len()), "before": before }))
+        })(),
         (Some("inventory"), _) => inventory(args.get(2).map(String::as_str).unwrap_or("now")),
         (Some("reset"), _) => reset(),
         (Some("engine"), _) => krun::list(),
@@ -764,7 +812,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two
