@@ -848,6 +848,33 @@ fn an_open_reads_in_two_rounds() {
     life.read_check(12_288).unwrap();
 }
 
+// Goal: a bounded cache drops only what the store holds: a clean extent
+// leaves and reads back right (fetched again); a dirty one stays, since
+// the cache is its only copy. Method: write, flush and land one extent,
+// write another, evict both.
+#[test]
+fn only_clean_extents_leave_the_cache() {
+    let mut remote = SimRemote::new(13, CALM);
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    let (a, b) = (content(400), content(401));
+    life.store.write(life.remote, &mut life.cache, 7, 0, &a).unwrap();
+    life.model.live.insert(7, a);
+    life.flush().unwrap();
+    life.land_all(&mut Rng(3)).unwrap();
+    life.store.write(life.remote, &mut life.cache, 8, 0, &b).unwrap();
+    life.model.live.insert(8, b);
+    let gets = life.remote.gets;
+    assert!(life.store.evict(&mut life.cache, 7).unwrap(), "clean: dropped");
+    assert!(!life.store.is_cached(7));
+    assert!(!life.store.evict(&mut life.cache, 8).unwrap(), "dirty: kept");
+    assert!(life.store.is_cached(8));
+    life.read_check(7).unwrap();
+    assert!(life.remote.gets > gets, "the dropped extent was fetched again");
+    life.read_check(8).unwrap();
+}
+
 // Goal: a put that meets another writer's bytes fences the life: it
 // ships nothing more. Method: plant other bytes at the name of the
 // life's next segment, then flush.

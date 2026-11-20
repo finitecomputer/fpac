@@ -80,6 +80,10 @@ pub struct Stats {
     pub syncs: AtomicU64,
     /// Reads that waited for the pack to bring their extent.
     pub pack_waits: AtomicU64,
+    /// Clean extents dropped to keep the cache within `--cache-max`.
+    pub evictions: AtomicU64,
+    /// Writes answered with an error (the kernel sees EIO).
+    pub write_errors: AtomicU64,
 }
 
 /// The first extents a read waited for the pack to bring, kept for the
@@ -104,11 +108,57 @@ pub struct Disk {
     /// Where in the pack the first reads that waited for it found their
     /// extents.
     pub waited: Mutex<Vec<usize>>,
+    /// `--cache-max`, in extents: past it, clean extents leave the cache
+    /// first in, first out. A measurement aid for docs/costs.md (a working
+    /// set larger than the cache), not the product's policy; None keeps
+    /// every extent touched.
+    cache_max: Option<usize>,
+    /// The extents the cache took, in the order it took them, each once.
+    order: Mutex<(std::collections::VecDeque<u64>, std::collections::HashSet<u64>)>,
+    /// Extents a partial write is reading first: never dropped between
+    /// the fetch of their bytes and the write over them.
+    pinned: Mutex<std::collections::HashMap<u64, u32>>,
 }
 
 impl Disk {
-    pub fn new(store: Store, cache: FileCache, host: &str, port: u16) -> Disk {
-        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()) }
+    pub fn new(store: Store, cache: FileCache, host: &str, port: u16, cache_max_bytes: Option<u64>) -> Disk {
+        let cache_max = cache_max_bytes.map(|b| (b / EXTENT_BYTES as u64) as usize);
+        Disk { inner: Mutex::new(Inner { store, cache }), cut: Condvar::new(), pool: Mutex::new(Vec::new()), host: host.to_string(), port, stats: Stats::default(), fenced: AtomicBool::new(false), coming: Mutex::new(Default::default()), came: Condvar::new(), waited: Mutex::new(Vec::new()), cache_max, order: Mutex::new(Default::default()), pinned: Mutex::new(Default::default()) }
+    }
+
+    /// Notes extents the cache just took, then, past `cache_max`, drops
+    /// clean ones, oldest first; never those it just took, which the
+    /// caller is using (a partial write's read, say). Called with the
+    /// store's lock held.
+    pub(crate) fn took(&self, inner: &mut Inner, extents: impl Iterator<Item = u64>) -> Result<(), StoreError> {
+        let Some(max) = self.cache_max else { return Ok(()) };
+        let mut o = self.order.lock().unwrap();
+        let (queue, queued) = &mut *o;
+        let mut fresh = std::collections::HashSet::new();
+        for e in extents {
+            fresh.insert(e);
+            if queued.insert(e) {
+                queue.push_back(e);
+            }
+        }
+        // Bounded: one pass over the queue at most.
+        let mut tries = queue.len();
+        while inner.store.cached_extents() > max && tries > 0 {
+            tries -= 1;
+            let Some(e) = queue.pop_front() else { break };
+            if fresh.contains(&e) || self.pinned.lock().unwrap().contains_key(&e) {
+                queue.push_back(e);
+            } else if inner.store.evict(&mut inner.cache, e)? {
+                queued.remove(&e);
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            } else if inner.store.is_cached(e) {
+                // dirty or shipping: kept, and asked again later
+                queue.push_back(e);
+            } else {
+                queued.remove(&e);
+            }
+        }
+        Ok(())
     }
 
     pub fn expect_pack(&self, extents: impl Iterator<Item = (u64, usize)>) {
@@ -174,8 +224,12 @@ impl Disk {
             match self.get(&f) {
                 Ok(window) => {
                     let mut g = self.inner.lock().unwrap();
-                    let Inner { store, cache } = &mut *g;
-                    if store.install(cache, &f, &window, buf)? {
+                    let installed = {
+                        let Inner { store, cache } = &mut *g;
+                        store.install(cache, &f, &window, buf)?
+                    };
+                    self.took(&mut g, f.extents())?;
+                    if installed {
                         return Ok(());
                     }
                     last = format!("{}: the extent's checksum does not match", f.name);
@@ -212,8 +266,22 @@ impl Disk {
         Err(last.unwrap_or(StoreError::Unavailable("a read".into())))
     }
 
-    /// `data` at `offset` within one extent.
+    /// `data` at `offset` within one extent, the extent pinned in the cache
+    /// while a partial write reads it first.
     pub fn write_extent(&self, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
+        *self.pinned.lock().unwrap().entry(extent).or_insert(0) += 1;
+        let r = self.write_extent_pinned(extent, offset, data);
+        let mut p = self.pinned.lock().unwrap();
+        if let Some(n) = p.get_mut(&extent) {
+            *n -= 1;
+            if *n == 0 {
+                p.remove(&extent);
+            }
+        }
+        r
+    }
+
+    fn write_extent_pinned(&self, extent: u64, offset: u32, data: &[u8]) -> Result<(), StoreError> {
         self.wait_for_pack(extent);
         // Bounded: a few fetches, and waits for cuts while the store is
         // full (the flusher cuts at least once a second).
@@ -228,7 +296,11 @@ impl Disk {
                             self.stats.full_waits.fetch_add(1, Ordering::Relaxed);
                             g = self.cut.wait_timeout(g, Duration::from_millis(FULL_WAIT_MS)).unwrap().0;
                         }
-                        other => break other?,
+                        other => {
+                            let need = other?;
+                            self.took(&mut g, std::iter::once(extent))?;
+                            break need;
+                        }
                     }
                 }
             };
@@ -299,7 +371,10 @@ impl Backing for Disk {
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), BackingError> {
         for (e, within, n, at) in pieces(offset, data.len()) {
-            self.write_extent(e, within, &data[at..at + n]).map_err(eio)?;
+            if let Err(err) = self.write_extent(e, within, &data[at..at + n]) {
+                self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(eio(err));
+            }
         }
         Ok(())
     }

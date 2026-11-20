@@ -104,6 +104,12 @@ fn object_ms() -> u64 {
     std::env::var("FPAC_FOLDER_OBJECT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
+/// `FPAC_FOLDER_PUT_BYTES_PER_S`: a put's rate per connection on the folder
+/// remote (`Folder::put_bytes_per_s`), named in every result it shapes.
+fn put_bytes_per_s() -> u64 {
+    std::env::var("FPAC_FOLDER_PUT_BYTES_PER_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 impl Place for Krun {
     fn start(&mut self) -> Result<Value, String> {
         self.kill()?;
@@ -114,6 +120,7 @@ impl Place for Krun {
         let mut folder = Folder::new(&self.root, "disk", self.epoch);
         folder.volume_bytes = self.volume;
         folder.object_ms = object_ms();
+        folder.put_bytes_per_s = put_bytes_per_s();
         *folder.head.lock().unwrap() = self.head;
         let remote = folder.start(Listen::Unix(listener));
         let name = format!("fpac-disk-{}", self.epoch);
@@ -140,10 +147,13 @@ impl Place for Krun {
     }
 
     fn what(&self) -> String {
-        let delay = match object_ms() {
+        let mut delay = match object_ms() {
             0 => String::new(),
             ms => format!(", each object call delayed {ms} ms (as R2's)"),
         };
+        if put_bytes_per_s() > 0 {
+            delay.push_str(&format!(", puts sharing {} MB/s (the rate a Cloudflare container sustained to R2)", put_bytes_per_s() as f64 / 1e6));
+        }
         format!("a krun microVM per life (2 vCPU, 6 GiB, 20 GB); the folder remote on a unix socket on this machine{delay}: a STAND-IN for the route and for R2")
     }
 
@@ -208,7 +218,12 @@ impl Place for Cloudflare {
 
 /// Starts the daemon and waits for its mount: its events, by name, in ms.
 pub fn mount(p: &dyn Place) -> Result<Value, String> {
-    let (code, out) = p.sh("mkdir -p /run/fpac && setsid nohup /usr/local/bin/fpac mount --dir /data > /run/fpac/log 2>&1 < /dev/null & echo started")?;
+    mount_with(p, "")
+}
+
+/// `fpac mount` with more arguments (`--cache-max <bytes>`, say).
+pub fn mount_with(p: &dyn Place, extra: &str) -> Result<Value, String> {
+    let (code, out) = p.sh(&format!("mkdir -p /run/fpac && setsid nohup /usr/local/bin/fpac mount --dir /data {extra} > /run/fpac/log 2>&1 < /dev/null & echo started"))?;
     if code != 0 || !out.contains("started") {
         return Err(format!("the daemon did not start: {out}"));
     }
@@ -476,6 +491,89 @@ pub fn wake(p: &mut dyn Place, gb: u64, wakes: u32, asleep_s: u64) -> Result<Val
         }));
     }
     Ok(json!({ "what": p.what(), "gb": gb, "asleep_s_before_the_first_wake": asleep_s, "first": { "start": st, "mount": m, "fill_ms": fill_ms, "fill_df": out.trim(), "sleep": s }, "wakes": lives }))
+}
+
+/// A build's target directory, as a job: `$T/target` filled with
+/// $BIG files of 4 MiB (from a random blob in memory, so the source is not
+/// the bottleneck) and 10,000 small files of 16 KiB, synced, the page cache
+/// dropped, and every file read back. Each step `name ms`.
+const BUILD: &str = r#"set -e
+now() { date +%s%N; }
+ms() { echo $(( ($(now) - $1) / 1000000 )); }
+drop() { sync; echo 3 > /proc/sys/vm/drop_caches; }
+[ -f /dev/shm/blob ] || head -c 67108864 /dev/urandom > /dev/shm/blob
+rm -rf $T/target; mkdir -p $T/target
+t=$(now)
+i=0; while [ $i -lt $BIG ]; do d=$T/target/deps$((i / 64)); mkdir -p $d; dd if=/dev/shm/blob of=$d/lib$i.rlib bs=4M count=1 skip=$((i % 16)) status=none; i=$((i + 1)); done
+i=0; while [ $i -lt 100 ]; do d=$T/target/incremental/s$i; mkdir -p $d; j=0; while [ $j -lt 100 ]; do dd if=/dev/shm/blob of=$d/w$j.o bs=16K count=1 skip=$(( (i * 100 + j) % 4096 )) status=none; j=$((j + 1)); done; i=$((i + 1)); done
+echo "write_ms $(ms $t)"
+t=$(now); sync; echo "sync_ms $(ms $t)"
+echo 3 > /proc/sys/vm/drop_caches
+t=$(now); find $T/target -type f -exec cat {} + > /dev/null; echo "read_back_ms $(ms $t)"
+echo "bytes $(du -sb $T/target | cut -f1)""#;
+
+/// A job longer than one exec may wait (the engine's socket gives up at
+/// 600 s): the script written to the guest, run detached, its exit code
+/// polled every 5 s, at most three hours; then its output.
+fn sh_long(p: &dyn Place, script: &str, env: &str, tag: &str) -> Result<(i64, String), String> {
+    p.sh(&format!("cat > /tmp/{tag}.sh <<'FPAC_EOF'\n{script}\nFPAC_EOF\nrm -f /tmp/{tag}.out /tmp/{tag}.exit; echo written"))?;
+    let (code, out) = p.sh(&format!("setsid nohup sh -c \"{env} sh /tmp/{tag}.sh > /tmp/{tag}.out 2>&1; echo \\$? > /tmp/{tag}.exit\" > /dev/null 2>&1 < /dev/null & echo started"))?;
+    if code != 0 || !out.contains("started") {
+        return Err(format!("the job did not start: {out}"));
+    }
+    // Bounded: three hours of polls.
+    for _ in 0..2160 {
+        std::thread::sleep(Duration::from_secs(5));
+        if let Ok((0, exit)) = p.sh(&format!("cat /tmp/{tag}.exit")) {
+            let code: i64 = exit.trim().parse().unwrap_or(-1);
+            let (_, out) = p.sh(&format!("cat /tmp/{tag}.out"))?;
+            return Ok((code, out));
+        }
+    }
+    Err(format!("{tag}: no end in three hours"))
+}
+
+/// Samples the daemon's status each second into /tmp/status.log.
+const SAMPLER: &str = "rm -f /tmp/status.log; setsid nohup sh -c 'while true; do cat /run/fpac/status.json 2>/dev/null; echo; sleep 1; done' > /tmp/status.log 2>&1 < /dev/null & echo $! > /tmp/sampler.pid; echo started";
+
+/// The thrash test (docs/costs.md): a build's target directory larger than
+/// the cache. The job on the container's own disk; on FPAC with the cache
+/// bounded at `cache_bytes` (or not), its status sampled each second; a
+/// sleep; then a wake and the same files read back cold.
+pub fn thrash(p: &mut dyn Place, big_files: u64, cache_bytes: Option<u64>, wake: bool) -> Result<Value, String> {
+    let st = p.start()?;
+    let (code, out) = sh_long(p, BUILD, &format!("T=/var/tmp/local BIG={big_files}"), "local")?;
+    let local = if code == 0 { rows(&out) } else { json!({ "error": out }) };
+    p.sh("rm -rf /var/tmp/local/target")?;
+    let extra = cache_bytes.map(|b| format!("--cache-max {b}")).unwrap_or_default();
+    let m = mount_with(p, &extra)?;
+    p.sh(SAMPLER)?;
+    let (code, out) = sh_long(p, BUILD, &format!("T=/data BIG={big_files}"), "fpac")?;
+    let fpac = if code == 0 { rows(&out) } else { json!({ "error": out }) };
+    let after_job = status(p);
+    let (_, kernel) = p.sh("dmesg | grep -iE 'ext4|i/o error|loop0' | tail -n 20")?;
+    let _ = p.sh("kill $(cat /tmp/sampler.pid) 2>/dev/null; true");
+    let (_, log) = p.sh("cat /tmp/status.log")?;
+    let timeline: Vec<Value> = log.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|s| json!({ "up_ms": s["up_ms"], "dirty": s["dirty_extents"], "shipping": s["shipping_segments"], "shipped": s["bytes_shipped"], "full_waits": s["full_waits"], "misses": s["misses"], "evictions": s["evictions"], "cached": s["cached_extents"], "write_errors": s["write_errors"] })).collect();
+    let sl = sleep(p)?;
+    p.kill()?;
+    if !wake {
+        return Ok(json!({ "what": p.what(), "big_files": big_files, "cache_max_bytes": cache_bytes, "local": local, "fpac": { "start": st, "mount": m["mounted"], "job": fpac, "status_after_job": after_job, "kernel": kernel, "timeline": timeline, "sleep": sl } }));
+    }
+    // a wake: the cache died with the container; the same files read cold
+    let st2 = p.start()?;
+    let m2 = mount_with(p, &extra)?;
+    let (code, out) = sh_long(p, "now() { date +%s%N; }; t=$(now); find /data/target -type f -exec cat {} + > /dev/null; echo \"read_back_after_a_wake_ms $(( ($(now) - t) / 1000000 ))\"", "", "cold")?;
+    let cold = if code == 0 { rows(&out) } else { json!({ "error": out }) };
+    let after_wake = status(p);
+    let sl2 = sleep(p)?;
+    p.kill()?;
+    Ok(json!({
+        "what": p.what(), "big_files": big_files, "cache_max_bytes": cache_bytes,
+        "local": local,
+        "fpac": { "start": st, "mount": m["mounted"], "job": fpac, "status_after_job": after_job, "kernel": kernel, "timeline": timeline, "sleep": sl },
+        "after_a_wake": { "start": st2, "mount": m2["mounted"], "job": cold, "status": after_wake, "sleep": sl2 },
+    }))
 }
 
 /// The git source the clone reads: 7,260 files in 121 directories (react's

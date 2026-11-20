@@ -295,6 +295,7 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
+        "thrash" => disk::thrash(p.as_mut(), flag(args, "--big-files").and_then(|r| r.parse().ok()).unwrap_or(2560), flag(args, "--cache-max").and_then(|r| r.parse().ok()), !args.iter().any(|a| a == "--no-wake")),
         _ => disk::wake(p.as_mut(), flag(args, "--gb").and_then(|r| r.parse().ok()).unwrap_or(1), flag(args, "--wakes").and_then(|r| r.parse().ok()).unwrap_or(3), flag(args, "--asleep-s").and_then(|r| r.parse().ok()).unwrap_or(0)),
     };
     let objects = p.objects();
@@ -652,7 +653,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -684,7 +685,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "hermes"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two

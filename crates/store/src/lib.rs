@@ -113,6 +113,11 @@ pub struct Fetch {
 }
 
 impl Fetch {
+    /// The extents this fetch may install.
+    pub fn extents(&self) -> impl Iterator<Item = u64> + '_ {
+        self.run.iter().map(|(e, _)| *e)
+    }
+
     /// The same fetch for the extent asked for alone.
     pub fn single(&self) -> Fetch {
         let first = self.run[0];
@@ -390,6 +395,28 @@ impl Store {
 
     pub fn shipping(&self) -> usize {
         self.shipping.len()
+    }
+
+    /// Extents the cache holds (clean, dirty or shipping).
+    pub fn cached_extents(&self) -> usize {
+        self.local.len()
+    }
+
+    /// Whether the cache holds `extent`.
+    pub fn is_cached(&self, extent: u64) -> bool {
+        self.local.contains_key(&extent)
+    }
+
+    /// Drops a clean extent from the cache: its bytes are the store's, and
+    /// a later read fetches them again. A dirty or shipping extent stays
+    /// (the cache is its only copy). Answers whether it was dropped.
+    pub fn evict(&mut self, cache: &mut dyn CacheGate, extent: u64) -> Result<bool, StoreError> {
+        if self.local.get(&extent) != Some(&Local::Clean) {
+            return Ok(false);
+        }
+        cache.punch(extent)?;
+        self.set_local(extent, None);
+        Ok(true)
     }
 
     /// What must land before this life may ship: a checkpoint of what it

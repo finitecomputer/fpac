@@ -51,6 +51,12 @@ pub struct Folder {
     /// as P2 measured it (about 90 ms a get), so a krun run shows how many
     /// round trips a wake waits for. 0, the default, adds nothing.
     pub object_ms: u64,
+    /// Puts share this rate, in bytes a second (0: no limit), each waiting
+    /// its turn on one pipe: the shipping rate a Cloudflare container
+    /// sustained to R2 (47 to 51 MB/s), for a krun run of a write-heavy job.
+    pub put_bytes_per_s: u64,
+    /// When the shared pipe is next free.
+    pipe: std::sync::Mutex<Option<std::time::Instant>>,
     live: AtomicUsize,
 }
 
@@ -70,7 +76,7 @@ impl Folder {
     pub fn new(root: &Path, disk: &str, epoch: u64) -> Folder {
         assert!(epoch > 0);
         assert!(!disk.is_empty() && disk.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
-        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, volume_bytes: 1 << 30, head: std::sync::Mutex::new(None), faults: Faults::default(), object_ms: 0, live: AtomicUsize::new(0) }
+        Folder { root: root.to_path_buf(), disk: disk.to_string(), epoch, volume_bytes: 1 << 30, head: std::sync::Mutex::new(None), faults: Faults::default(), object_ms: 0, put_bytes_per_s: 0, pipe: std::sync::Mutex::new(None), live: AtomicUsize::new(0) }
     }
 
     /// A later life of the same disk: the same folder and head, a new
@@ -78,7 +84,7 @@ impl Folder {
     pub fn next_life(&self, epoch: u64) -> Folder {
         assert!(epoch > self.epoch);
         let head = *self.head.lock().unwrap();
-        Folder { root: self.root.clone(), disk: self.disk.clone(), epoch, volume_bytes: self.volume_bytes, head: std::sync::Mutex::new(head), faults: Faults::default(), object_ms: self.object_ms, live: AtomicUsize::new(0) }
+        Folder { root: self.root.clone(), disk: self.disk.clone(), epoch, volume_bytes: self.volume_bytes, head: std::sync::Mutex::new(head), faults: Faults::default(), object_ms: self.object_ms, put_bytes_per_s: self.put_bytes_per_s, pipe: std::sync::Mutex::new(None), live: AtomicUsize::new(0) }
     }
 
     pub fn start(self, listen: Listen) -> Running {
@@ -137,6 +143,17 @@ impl Folder {
         let route = req.path.strip_prefix("/o/");
         if route.is_some() && self.object_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.object_ms));
+        }
+        if req.method == "PUT" && route.is_some() && self.put_bytes_per_s > 0 {
+            let done = {
+                let mut next = self.pipe.lock().unwrap();
+                let now = std::time::Instant::now();
+                let start = next.map_or(now, |n| n.max(now));
+                let done = start + std::time::Duration::from_secs_f64(req.body.len() as f64 / self.put_bytes_per_s as f64);
+                *next = Some(done);
+                done
+            };
+            std::thread::sleep(done.saturating_duration_since(std::time::Instant::now()));
         }
         match (req.method.as_str(), req.path.as_str(), route) {
             ("GET", "/open", _) => {

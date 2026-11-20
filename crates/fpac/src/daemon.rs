@@ -74,7 +74,9 @@ pub fn main() {
             let host = arg(&args, "--host").unwrap_or_else(|| REMOTE_HOST.into());
             let port: u16 = arg(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(80);
             let cache = PathBuf::from(arg(&args, "--cache").unwrap_or_else(|| "/var/lib/fpac/cache".into()));
-            match mount(Path::new(&dir), &host, port, &state, &cache) {
+            // a measurement aid (docs/costs.md): the cache's bound in bytes
+            let cache_max: Option<u64> = arg(&args, "--cache-max").and_then(|b| b.parse().ok());
+            match mount(Path::new(&dir), &host, port, &state, &cache, cache_max) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("{}", json!({ "fpac": "error", "why": e }));
@@ -90,7 +92,7 @@ pub fn main() {
             }
         },
         _ => {
-            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] | fpac status [--state dir]");
+            eprintln!("usage: fpac mount --dir <path> [--host h] [--port p] [--state dir] [--cache file] [--cache-max bytes] | fpac status [--state dir]");
             std::process::exit(2);
         }
     }
@@ -307,8 +309,12 @@ fn pack_header(disk: &Disk, t0: Instant, head: Option<Vec<u8>>) -> Option<(Strin
             disk.expect_pack(h.entries.iter().enumerate().skip(held).map(|(i, (e, _))| (*e, i)));
             let installed = {
                 let mut g = disk.inner.lock().unwrap();
-                let disk::Inner { store, cache } = &mut *g;
-                store.pack_install(cache, &h, h.len() as u64, &b[h.len()..h.len() + held * ext]).unwrap_or(0)
+                let k = {
+                    let disk::Inner { store, cache } = &mut *g;
+                    store.pack_install(cache, &h, h.len() as u64, &b[h.len()..h.len() + held * ext]).unwrap_or(0)
+                };
+                let _ = disk.took(&mut g, h.entries.iter().take(held).map(|(e, _)| *e));
+                k
             };
             event(t0, "pack-header", json!({ "extents": h.entries.len(), "head_extents": held, "head_installed": installed }));
             Some((name, h, held as u64))
@@ -332,16 +338,20 @@ fn fetch_pack(disk: &Disk, t0: Instant, name: String, h: fpac_format::PackHeader
         let mut b = vec![0u8; len as usize];
         let got = r.get_range(&name, off, &mut b);
         disk.give_back(r);
-        if let Ok(Some(n)) = got {
-            let mut g = disk.inner.lock().unwrap();
-            let disk::Inner { store, cache } = &mut *g;
-            if let Ok(k) = store.pack_install(cache, &h, off, &b[..n - n % EXTENT_BYTES as usize]) {
-                installed.fetch_add(k, Ordering::Relaxed);
-            }
-        }
-        // this range's extents are no longer coming
         let first = ((off - h.len() as u64) / EXTENT_BYTES as u64) as usize;
         let count = (len / EXTENT_BYTES as u64) as usize;
+        if let Ok(Some(n)) = got {
+            let mut g = disk.inner.lock().unwrap();
+            let k = {
+                let disk::Inner { store, cache } = &mut *g;
+                store.pack_install(cache, &h, off, &b[..n - n % EXTENT_BYTES as usize])
+            };
+            if let Ok(k) = k {
+                installed.fetch_add(k, Ordering::Relaxed);
+            }
+            let _ = disk.took(&mut g, h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
+        }
+        // this range's extents are no longer coming
         disk.arrived(h.entries.iter().skip(first).take(count).map(|(e, _)| *e));
     });
     disk.arrived(h.entries.iter().map(|(e, _)| *e));
@@ -358,7 +368,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
             "epoch": epoch, "up_ms": t0.elapsed().as_millis() as u64, "dirty_extents": dirty, "shipping_segments": shipping,
             "cuts": p.cuts.load(Ordering::Relaxed), "segments": p.segments.load(Ordering::Relaxed), "bytes_shipped": p.bytes.load(Ordering::Relaxed),
             "checkpoints": p.checkpoints.load(Ordering::Relaxed), "durable_ms": p.durable_ms.load(Ordering::SeqCst), "head_posted": p.head_posted.load(Ordering::SeqCst),
-            "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
+            "misses": disk.stats.misses.load(Ordering::Relaxed), "pack_waits": disk.stats.pack_waits.load(Ordering::Relaxed), "evictions": disk.stats.evictions.load(Ordering::Relaxed), "write_errors": disk.stats.write_errors.load(Ordering::Relaxed), "cached_extents": disk.inner.lock().unwrap().store.cached_extents(), "fetch_retries": disk.stats.fetch_retries.load(Ordering::Relaxed),
             "read_errors": disk.stats.read_errors.load(Ordering::Relaxed), "full_waits": disk.stats.full_waits.load(Ordering::Relaxed),
             "syncs": disk.stats.syncs.load(Ordering::Relaxed),
             "fenced": disk.fenced.load(Ordering::SeqCst), "now_ms": flush::now_ms(),
@@ -370,7 +380,7 @@ fn status_writer(state: PathBuf, t0: Instant) -> impl Fn(&Disk, &Progress) {
     }
 }
 
-fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> Result<(), String> {
+fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cache_max: Option<u64>) -> Result<(), String> {
     let t0 = Instant::now();
     let signals = block_signals();
     let locked = lock_memory();
@@ -387,7 +397,7 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path) -> 
     event(t0, "opened", json!({ "disk": disk_name, "epoch": store.epoch(), "volume_bytes": volume, "new": fresh, "replayed": store.opened().replayed, "extents_mapped": store.opened().extents_mapped, "pages": store.opened().pages, "rounds": rounds, "memory_locked": locked, "writeback_set": writeback }));
     store.record_boot();
     let cache = FileCache::create(cache_path, volume).map_err(|e| format!("the cache file: {e}"))?;
-    let disk = Arc::new(Disk::new(store, cache, host, port));
+    let disk = Arc::new(Disk::new(store, cache, host, port, cache_max));
     let progress = Arc::new(Progress::default());
     // the pack's head before the mount; the rest of it beside the mount
     if let Some((name, h, from)) = pack_header(&disk, t0, pack_head) {

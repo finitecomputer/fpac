@@ -1,0 +1,66 @@
+{
+  "evidence": "billing",
+  "measured_at": "2026-11-19, queried after the runs",
+  "how": "Cloudflare's GraphQL Analytics API on the account the spike ran on, filtered to the spike's own container application, Worker script and buckets (their identifiers are kept outside this repository). Datasets: containersUsageAdaptiveGroups (sum: txBytes, cpuTimeSec, allocatedMemory, allocatedDisk; it has no field for bytes received), containersMetricsAdaptiveGroups (sum: rxBytes, txBytes), workersInvocationsAdaptive (sum: requests, cpuTimeUs), r2OperationsAdaptiveGroups (sum: requests by actionType), r2BandwidthUsageAdaptiveGroups (sum: bytesUpload, bytesDownload). The billing API (/accounts/{id}/billing/usage, /billing/usage/paygo) answered 403 to the spike's token, so the invoice itself was not read.",
+  "windows": [
+    {
+      "what": "the 10 GB fill of cloudflare-10gb-after-an-hour (wake.json), nothing else of the spike running",
+      "utc": [
+        "2026-11-19T21:47:00Z",
+        "2026-11-19T21:50:00Z"
+      ],
+      "known": "the run stored 11.02 GB of objects between 21:46:30 and 21:50:00",
+      "container_usage_tx_bytes": 9852090919,
+      "container_metrics_tx_bytes": 9214775834,
+      "container_metrics_rx_bytes": 7506253,
+      "r2_put_object": 1231,
+      "r2_bytes_upload": 10175074704,
+      "worker_invocations": 49,
+      "worker_invocations_are": "the driver's own calls (exec and status), not the puts"
+    },
+    {
+      "what": "the product client's 50,000 checked ranged reads (rangecheck.json, cloudflare-fresh-remote), nothing else of the spike running",
+      "utc": [
+        "2026-11-19T20:33:00Z",
+        "2026-11-19T20:35:00Z"
+      ],
+      "r2_get_object": 36599,
+      "r2_bytes_download": 26516127744,
+      "container_metrics_rx_bytes": 27971239666,
+      "container_usage_tx_bytes": 59858932,
+      "container_metrics_tx_bytes": 59409884,
+      "worker_invocations": 11,
+      "worker_invocations_are": "the driver's polls, not the reads"
+    },
+    {
+      "what": "the spike's whole day on Cloudflare (P2 to P5)",
+      "utc": [
+        "2026-11-19T16:00:00Z",
+        "2026-11-20T00:00:00Z"
+      ],
+      "container_usage_tx_GB": 58.31,
+      "container_metrics_tx_GB": 55.69,
+      "container_metrics_rx_GB": 301.19,
+      "container_cpu_s": 3443,
+      "container_memory_GiB_s": 52998,
+      "container_disk_GB_s": 176661,
+      "r2_GB": {
+        "download": 292.69,
+        "upload": 60.62
+      },
+      "r2_ops": {
+        "ListObjects": 132,
+        "PutBucket": 6,
+        "DeleteObjects": 50,
+        "HeadObject": 43,
+        "PutObject": 9323,
+        "DeleteBucket": 5,
+        "HeadBucket": 75,
+        "GetObject": 1101039
+      },
+      "worker_requests": 404713,
+      "worker_cpu_s": 608.4,
+      "worker_requests_are": "about 400,000 from the outside route (rangecheck-outside.json: four runs of 100,000 reads from this machine, no container) and the driver's calls; none of the container's 700,000 intercepted gets"
+    }
+  ]
+}

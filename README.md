@@ -83,6 +83,9 @@ cargo run --release -p fpac-bench -- reset
   evidence, the debt, the risks.
 - [docs/spike.md](docs/spike.md): the spike: its acceptance, constraints
   and results.
+- [docs/costs.md](docs/costs.md): what a disk costs a person on
+  Cloudflare (intercepted puts are billed egress; reads are not), and what
+  a working set larger than the cache does.
 
 ## License
 
