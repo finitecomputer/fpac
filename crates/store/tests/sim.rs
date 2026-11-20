@@ -640,6 +640,35 @@ fn sealed_lives_crash_anywhere_and_never_hand_out_wrong_bytes() {
     assert!(errors * 100 < reads, "{errors} of {reads} reads failed: a wrong sealed extent is not fetched again");
 }
 
+// Goal: a sealed disk whose map page is full (4,096 entries) opens again:
+// the seal's magic and tag do not push the page past what an open takes
+// (a sealed 1 GB fill on krun could not open: a page 20 bytes over).
+// Method: every extent of page 1 punched (a zeroed extent still has an
+// entry), sealed, slept; then opened and read.
+#[test]
+fn a_sealed_disk_with_a_full_page_opens() {
+    let mut remote = SimRemote::new(16, CALM);
+    remote.seal = Some(std::sync::Arc::new(Sealer::new(&[6u8; 32], "sim")));
+    let mut platform = Platform { head: None, running: 0 };
+    let mut life = open(&mut remote, &mut platform, 1, BTreeMap::new(), u64::MAX);
+    life.post_head().unwrap();
+    for e in 4096..8192u64 {
+        life.punch(e).unwrap();
+        if e % 1024 == 0 {
+            life.flush().unwrap();
+            life.land_all(&mut Rng(7)).unwrap();
+        }
+    }
+    let b = content(900);
+    life.store.write(life.remote, &mut life.cache, 4100, 0, &b).unwrap();
+    life.model.live.insert(4100, b);
+    life.sleep(&mut Rng(7)).unwrap();
+    let exp = life.model.after_crash(life.remote);
+    let mut life = open(&mut remote, &mut platform, 2, exp, u64::MAX);
+    life.read_check(4100).unwrap();
+    life.read_check(5000).unwrap();
+}
+
 // Goal: a sealed disk opens only with its key: another key, another
 // disk's name, or no key at all is refused at the open, before any read.
 // Method: a sealed life that writes and sleeps; three opens of it.

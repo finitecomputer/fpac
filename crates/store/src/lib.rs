@@ -410,7 +410,7 @@ impl Store {
 
     fn fetch_checkpoint(&mut self, remote: &mut dyn RemoteGate, cr: CheckpointRef) -> Result<Checkpoint, StoreError> {
         let name = format::checkpoint_name(cr.epoch, cr.seq);
-        let body = whole(remote, &name, CHECKPOINT_BYTES_MAX)?;
+        let body = whole(remote, &name, self.whole_max(CHECKPOINT_BYTES_MAX))?;
         if format::sha256(&body) != cr.sum {
             return Err(StoreError::Corrupt(format!("{name} is not the checkpoint the head names")));
         }
@@ -468,7 +468,7 @@ impl Store {
 
     /// Fetches and installs a page.
     fn load_page(&mut self, remote: &mut dyn RemoteGate, pr: PageRef) -> Result<(), StoreError> {
-        let body = whole(remote, &page_name(&pr), PAGE_BYTES_MAX)?;
+        let body = whole(remote, &page_name(&pr), self.whole_max(PAGE_BYTES_MAX))?;
         self.install_page(pr, &body)
     }
 
@@ -635,6 +635,12 @@ impl Store {
     /// Whether this disk's objects are sealed.
     pub fn sealed(&self) -> bool {
         self.seal.is_some()
+    }
+
+    /// A whole object's limit as stored: its plain limit, and its seal's
+    /// magic and tag on a sealed disk.
+    fn whole_max(&self, plain: u64) -> u64 {
+        plain + if self.seal.is_some() { format::seal::SEALED_OBJECT_EXTRA_BYTES } else { 0 }
     }
 
     /// An image's bytes in a segment: 64 KiB, and its tag when sealed.
@@ -1440,6 +1446,8 @@ const _: () = assert!(format::limits::SEGMENT_BYTES_MAX <= fpac_remote::limits::
 const _: () = assert!(format::limits::PACK_OBJECT_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
 const _: () = assert!(format::limits::CHECKPOINT_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
 const _: () = assert!(format::limits::PAGE_BYTES_MAX <= fpac_remote::limits::OBJECT_BYTES_MAX);
+const _: () = assert!(format::limits::CHECKPOINT_BYTES_MAX + format::seal::SEALED_OBJECT_EXTRA_BYTES <= fpac_remote::limits::OBJECT_BYTES_MAX);
+const _: () = assert!(format::limits::PAGE_BYTES_MAX + format::seal::SEALED_OBJECT_EXTRA_BYTES <= fpac_remote::limits::OBJECT_BYTES_MAX);
 
 fn remote_err_on(name: &str) -> impl Fn(RemoteError) -> StoreError + '_ {
     move |e| match from_remote(e) {

@@ -35,6 +35,9 @@ pub const SEALED_PREFIX_BYTES: u32 = 16;
 pub(crate) const SEGMENT_SEALED_MAGIC: &[u8; 8] = b"FPACSEGS";
 pub(crate) const PACK_SEALED_MAGIC: &[u8; 8] = b"FPACPAKS";
 const OBJECT_SEALED_MAGIC: &[u8; 8] = b"FPACSEAL";
+/// What sealing adds to a whole object (a page, a checkpoint): its magic
+/// and its tag. A sealed object's limit is its plain limit and this.
+pub const SEALED_OBJECT_EXTRA_BYTES: u64 = 8 + TAG_BYTES as u64;
 /// The associated data's first bytes: which scheme sealed it.
 const DOMAIN: &[u8; 8] = b"fpacsiv1";
 
