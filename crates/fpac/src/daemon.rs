@@ -84,6 +84,8 @@ fn clean(host: &str, port: u16, sizes: &Path, budget: u64) -> Result<Value, Stri
         let mut gate = Remote::new(host, port);
         fpac_store::clean::compact(&mut gate, &info, &map, budget, |h| {
             let ok = r.post_head(h).is_ok();
+            // as it happens, so a cleaner killed partway says how far it got
+            eprintln!("{}", json!({ "fpac": "clean-head", "head": h.encode(), "taken": ok, "ms": t0.elapsed().as_secs_f64() * 1000.0 }));
             posts.push(json!({ "head": h.encode(), "taken": ok }));
             ok
         })
