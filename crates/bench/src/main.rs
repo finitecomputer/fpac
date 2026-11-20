@@ -312,25 +312,6 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
     // larger than the guest's 20 GB disk needs one)
     let volume: u64 = flag(args, "--volume-gb").and_then(|g| g.parse::<u64>().ok()).map_or(20_000 << 20, |g| g << 30);
     let mount_args = flag(args, "--cache-max").map(|b| format!("--cache-max {b}")).unwrap_or_default();
-    if scenario == "clean" {
-        // the cleaner's routes are the stand-in Worker's (Cloudflare only);
-        // its disk is named clean-…, the one kind the Worker lets a delete
-        // pass name an age under a day for
-        if place != "cloudflare" {
-            return Err("the cleaner's run is on Cloudflare only".into());
-        }
-        let mut c = disk::Cloudflare::new(&format!("clean-{}", now_ms()), volume)?;
-        let kill_after = Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(2500));
-        let r = disk::clean(&mut c, kill_after);
-        let objects = disk::Place::objects(&c);
-        let cleaned = disk::Place::cleanup(&mut c);
-        return r.map(|mut v| {
-            v["objects_at_end"] = objects;
-            v["bulk_data_deleted"] = cleaned;
-            v["sealed"] = json!(false);
-            v
-        });
-    }
     let mut p: Box<dyn disk::Place> = match place {
         // an npm install runs its packages' own scripts: never here
         _ if scenario == "npm" && place != "cloudflare" => return Err("the npm benchmark runs in a disposable Cloudflare container only".into()),
@@ -342,6 +323,10 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         "lives" => disk::smoke(p.as_mut()),
         "crash" => disk::crash(p.as_mut(), flag(args, "--rounds").and_then(|r| r.parse().ok()).unwrap_or(50)),
         "tools" => disk::tools(p.as_mut()),
+        // the cleaner (docs/design.md, The cleaner): a Cloudflare disk is
+        // named clean-…, the one kind the Worker lets a delete pass name an
+        // age under a day for
+        "clean" => disk::clean(p.as_mut(), Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(2500))),
         // the cache gives room back (docs/design.md, The cache)
         "room" => disk::room(p.as_mut(), flag(args, "--ceiling-gib").and_then(|g| g.parse::<u64>().ok()).unwrap_or(6) << 30),
         // what sealing costs on this place's CPU (docs/encryption.md)

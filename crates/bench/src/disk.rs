@@ -35,6 +35,14 @@ pub trait Place {
     fn objects(&self) -> Value;
     /// Deletes the disk's objects (bulk test data).
     fn cleanup(&mut self) -> Value;
+    /// The disk's head as the platform stores it (never a guest's word)
+    /// and its objects: name, bytes, age in ms.
+    fn listing(&self) -> Result<(Option<String>, Vec<Stored>), String>;
+    /// A checkpoint's bytes, and the SHA-256 the store holds for them.
+    fn object(&self, name: &str) -> Result<(Vec<u8>, String), String>;
+    /// Deletes the named objects at least `age_ms_min` old, beside no
+    /// running life: {deleted, bytes, young, absent} or {refused}.
+    fn delete(&mut self, names: &[String], age_ms_min: u64) -> Result<Value, String>;
 }
 
 pub struct Krun {
@@ -166,6 +174,54 @@ impl Place for Krun {
         let _ = std::fs::remove_dir_all(&self.root);
         json!("the folder removed")
     }
+
+    fn listing(&self) -> Result<(Option<String>, Vec<Stored>), String> {
+        // the head the folder (the platform's stand-in) keeps
+        let head = match &self.life {
+            Some((_, r)) => *r.folder.head.lock().unwrap(),
+            None => self.head,
+        };
+        let disk = self.root.join("disk");
+        let now = std::time::SystemTime::now();
+        let mut objects = Vec::new();
+        // Bounded by the folder's files: e<epoch>/<name>.
+        for life in std::fs::read_dir(&disk).into_iter().flatten().flatten() {
+            for o in std::fs::read_dir(life.path()).into_iter().flatten().flatten() {
+                let m = o.metadata().map_err(|e| e.to_string())?;
+                let age = m.modified().ok().and_then(|t| now.duration_since(t).ok()).map_or(0, |d| d.as_millis() as u64);
+                objects.push((format!("{}/{}", life.file_name().to_string_lossy(), o.file_name().to_string_lossy()), m.len(), age));
+            }
+        }
+        objects.sort();
+        Ok((head.map(|h| h.encode()), objects))
+    }
+
+    fn object(&self, name: &str) -> Result<(Vec<u8>, String), String> {
+        let b = std::fs::read(self.root.join("disk").join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let sum = hex(&fpac_remote::sha256(&b));
+        Ok((b, sum))
+    }
+
+    fn delete(&mut self, names: &[String], age_ms_min: u64) -> Result<Value, String> {
+        if self.life.is_some() {
+            return Ok(json!({ "refused": "a life is running" }));
+        }
+        let (_, objects) = self.listing()?;
+        let stored: std::collections::BTreeMap<&str, (u64, u64)> = objects.iter().map(|(n, b, a)| (n.as_str(), (*b, *a))).collect();
+        let (mut deleted, mut bytes, mut young, mut absent) = (0u64, 0u64, Vec::new(), Vec::new());
+        for n in names {
+            match stored.get(n.as_str()) {
+                None => absent.push(n.clone()),
+                Some((_, age)) if *age < age_ms_min => young.push(n.clone()),
+                Some((b, _)) => {
+                    std::fs::remove_file(self.root.join("disk").join(n)).map_err(|e| format!("{n}: {e}"))?;
+                    deleted += 1;
+                    bytes += b;
+                }
+            }
+        }
+        Ok(json!({ "deleted": deleted, "bytes": bytes, "young": young, "absent": absent }))
+    }
 }
 
 pub struct Cloudflare {
@@ -197,114 +253,100 @@ impl Cloudflare {
     fn call(&self, path: &str, body: &Value) -> Result<Value, String> {
         net::worker(self.c.host(), &self.key, "POST", path, body, Duration::from_secs(300))
     }
+}
 
-    /// The disk's stored head (the platform's, never a guest's) and its
-    /// objects: (name, bytes, age in ms).
-    fn listing(&self) -> Result<(Option<String>, Vec<Stored>), String> {
-        let l = self.call("/clean/list", &json!({ "disk": self.disk }))?;
-        let objects = l["objects"]
-            .as_array()
-            .ok_or("no objects listed")?
-            .iter()
-            .map(|o| Some((o[0].as_str()?.to_string(), o[1].as_u64()?, o[2].as_u64()?)))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a malformed listing")?;
-        Ok((l["head"].as_str().map(str::to_string), objects))
+/// A cleaner's life (docs/design.md, The cleaner): a fresh guest for the
+/// disk, a new epoch, and `fpac clean` against its segments' sizes from
+/// the store's listing (with the disk's key, when it is sealed). Killed
+/// `kill_after` in, if given.
+pub fn cleaner(p: &mut dyn Place, kill_after: Option<Duration>) -> Result<Value, String> {
+    let (_, objects) = p.listing()?;
+    let mut sizes = String::new();
+    for (name, bytes, _) in &objects {
+        let seg = name.strip_prefix('e').and_then(|r| r.split_once("/s")).and_then(|(e, q)| Some((e.parse::<u64>().ok()?, q.parse::<u64>().ok()?)));
+        if let Some((e, q)) = seg {
+            sizes.push_str(&format!("{e} {q} {bytes}\n"));
+        }
     }
+    // one exec's body is the Worker's DRIVER_BODY_BYTES_MAX (64 KiB)
+    if sizes.len() > 48 << 10 {
+        return Err(format!("{} bytes of sizes: past what one exec carries", sizes.len()));
+    }
+    let start = p.start()?;
+    let (code, out) = p.sh(&format!("cat > /tmp/sizes <<'EOF'\n{sizes}EOF\necho sized"))?;
+    if code != 0 || !out.contains("sized") {
+        return Err(format!("the sizes file: {out}"));
+    }
+    let run = format!("/usr/local/bin/fpac clean --sizes /tmp/sizes{}", key_arg(p)?);
+    let t0 = Instant::now();
+    let r = match kill_after {
+        None => {
+            let (code, out) = p.sh(&run)?;
+            if code != 0 {
+                return Err(format!("the cleaner: {out}"));
+            }
+            json!({ "start": start, "segments_listed": sizes.lines().count(), "out": guest_event(&out, "cleaned")?, "exec_ms": t0.elapsed().as_millis() as u64 })
+        }
+        Some(after) => {
+            p.sh(&format!("setsid nohup {run} > /tmp/clean.log 2>&1 < /dev/null & echo started"))?;
+            std::thread::sleep(after);
+            let (_, log) = p.sh("cat /tmp/clean.log")?;
+            json!({ "start": start, "killed_after_ms": after.as_millis() as u64, "finished_before_the_kill": log.contains("\"cleaned\""), "log": log.chars().take(2000).collect::<String>() })
+        }
+    };
+    p.kill()?;
+    Ok(r)
+}
 
-    /// A cleaner's life (docs/design.md, The cleaner): a fresh container
-    /// for the disk, a new epoch, and `fpac clean` against its segments'
-    /// sizes from the listing. Killed `kill_after` in, if given.
-    pub fn cleaner(&mut self, kill_after: Option<Duration>) -> Result<Value, String> {
-        let (_, objects) = self.listing()?;
-        let mut sizes = String::new();
-        for (name, bytes, _) in &objects {
-            let seg = name.strip_prefix('e').and_then(|r| r.split_once("/s")).and_then(|(e, q)| Some((e.parse::<u64>().ok()?, q.parse::<u64>().ok()?)));
-            if let Some((e, q)) = seg {
-                sizes.push_str(&format!("{e} {q} {bytes}\n"));
+/// The delete pass, as the platform runs it: the stored head, the
+/// checkpoints kept before it (each checked against the store's SHA-256,
+/// the head's against the head's), `plan_deletes`, then the store's
+/// delete, which checks each object's age again and refuses beside a
+/// running life.
+pub fn delete_pass(p: &mut dyn Place, age_ms_min: u64) -> Result<Value, String> {
+    p.kill()?;
+    let t0 = Instant::now();
+    let (line, objects) = p.listing()?;
+    let line = line.ok_or("the disk has no head")?;
+    let head = fpac_store::Head::decode(&line).ok_or("a malformed head")?;
+    let names: Vec<String> = objects.iter().map(|(n, _, _)| n.clone()).collect();
+    let kept_ids = fpac_store::clean::kept_checkpoints(&head, &names);
+    let mut kept = Vec::new();
+    for (e, q) in &kept_ids {
+        let (bytes, stored_sum) = p.object(&format!("e{e}/c{q}"))?;
+        let sum = fpac_remote::sha256(&bytes);
+        if hex(&sum) != stored_sum {
+            return Err(format!("e{e}/c{q}: not the bytes the store holds"));
+        }
+        if let Some(h) = head.checkpoint.filter(|h| (h.epoch, h.seq) == (*e, *q)) {
+            if sum != h.sum {
+                return Err(format!("e{e}/c{q}: not the checkpoint the head names"));
             }
         }
-        // one exec's body is the Worker's DRIVER_BODY_BYTES_MAX (64 KiB)
-        if sizes.len() > 48 << 10 {
-            return Err(format!("{} bytes of sizes: past what one exec carries", sizes.len()));
-        }
-        let start = self.start()?;
-        let (code, out) = self.sh(&format!("cat > /tmp/sizes <<'EOF'\n{sizes}EOF\necho sized"))?;
-        if code != 0 || !out.contains("sized") {
-            return Err(format!("the sizes file: {out}"));
-        }
-        let run = "/usr/local/bin/fpac clean --sizes /tmp/sizes";
-        let t0 = Instant::now();
-        let r = match kill_after {
-            None => {
-                let (code, out) = self.sh(run)?;
-                if code != 0 {
-                    return Err(format!("the cleaner: {out}"));
-                }
-                json!({ "start": start, "segments_listed": sizes.lines().count(), "out": guest_event(&out, "cleaned")?, "exec_ms": t0.elapsed().as_millis() as u64 })
-            }
-            Some(after) => {
-                self.sh(&format!("setsid nohup {run} > /tmp/clean.log 2>&1 < /dev/null & echo started"))?;
-                std::thread::sleep(after);
-                let (_, log) = self.sh("cat /tmp/clean.log")?;
-                json!({ "start": start, "killed_after_ms": after.as_millis() as u64, "finished_before_the_kill": log.contains("\"cleaned\""), "log": log.chars().take(2000).collect::<String>() })
-            }
-        };
-        self.kill()?;
-        Ok(r)
+        kept.push(fpac_store::clean::read_checkpoint(&bytes).map_err(|e| e.to_string())?);
     }
-
-    /// The delete pass, as the platform runs it: the stored head, the
-    /// checkpoints kept before it (each checked against R2's SHA-256, the
-    /// head's against the head's), `plan_deletes`, then the Worker's
-    /// delete, which checks each object's age again and refuses beside a
-    /// running container.
-    pub fn delete_pass(&mut self, age_ms_min: u64) -> Result<Value, String> {
-        self.kill()?;
-        let t0 = Instant::now();
-        let (line, objects) = self.listing()?;
-        let line = line.ok_or("the disk has no head")?;
-        let head = fpac_store::Head::decode(&line).ok_or("a malformed head")?;
-        let names: Vec<String> = objects.iter().map(|(n, _, _)| n.clone()).collect();
-        let kept_ids = fpac_store::clean::kept_checkpoints(&head, &names);
-        let mut kept = Vec::new();
-        for (e, q) in &kept_ids {
-            let c = self.call("/clean/checkpoint", &json!({ "disk": self.disk, "name": format!("e{e}/c{q}") }))?;
-            let bytes = unhex(c["hex"].as_str().ok_or("no checkpoint")?)?;
-            let sum = ring::digest::digest(&ring::digest::SHA256, &bytes);
-            if Some(hex(sum.as_ref()).as_str()) != c["sha256"].as_str() {
-                return Err(format!("e{e}/c{q}: not the bytes R2 holds"));
-            }
-            if let Some(h) = head.checkpoint.filter(|h| (h.epoch, h.seq) == (*e, *q)) {
-                if sum.as_ref() != h.sum {
-                    return Err(format!("e{e}/c{q}: not the checkpoint the head names"));
-                }
-            }
-            kept.push(fpac_store::clean::read_checkpoint(&bytes).map_err(|e| e.to_string())?);
+    let ages: Vec<(String, u64)> = objects.iter().map(|(n, _, a)| (n.clone(), *a)).collect();
+    let plan = fpac_format::plan_deletes(&kept, head.epoch, &ages, age_ms_min);
+    let size: std::collections::BTreeMap<&str, u64> = objects.iter().map(|(n, b, _)| (n.as_str(), *b)).collect();
+    let planned_bytes: u64 = plan.iter().map(|n| size[n.as_str()]).sum();
+    let (mut deleted, mut bytes, mut young, mut absent) = (0u64, 0u64, 0usize, 0usize);
+    for chunk in plan.chunks(1000) {
+        let d = p.delete(chunk, age_ms_min)?;
+        if let Some(why) = d["refused"].as_str() {
+            return Err(format!("the delete was refused: {why}"));
         }
-        let ages: Vec<(String, u64)> = objects.iter().map(|(n, _, a)| (n.clone(), *a)).collect();
-        let plan = fpac_format::plan_deletes(&kept, head.epoch, &ages, age_ms_min);
-        let size: std::collections::BTreeMap<&str, u64> = objects.iter().map(|(n, b, _)| (n.as_str(), *b)).collect();
-        let planned_bytes: u64 = plan.iter().map(|n| size[n.as_str()]).sum();
-        let (mut deleted, mut bytes, mut young, mut absent) = (0u64, 0u64, 0usize, 0usize);
-        for chunk in plan.chunks(1000) {
-            let d = self.call("/clean/delete", &json!({ "disk": self.disk, "names": chunk, "age_ms_min": age_ms_min }))?;
-            if let Some(why) = d["refused"].as_str() {
-                return Err(format!("the delete was refused: {why}"));
-            }
-            deleted += d["deleted"].as_u64().unwrap_or(0);
-            bytes += d["bytes"].as_u64().unwrap_or(0);
-            young += d["young"].as_array().map_or(0, Vec::len);
-            absent += d["absent"].as_array().map_or(0, Vec::len);
-        }
-        let kind = |p: char| plan.iter().filter(|n| n.split_once('/').is_some_and(|(_, r)| r.starts_with(p))).count();
-        Ok(json!({
-            "head": line, "objects_listed": objects.len(), "kept_checkpoints": kept_ids.iter().map(|(e, q)| format!("e{e}/c{q}")).collect::<Vec<_>>(),
-            "age_ms_min": age_ms_min, "planned": plan.len(), "planned_bytes": planned_bytes,
-            "planned_by_kind": { "segments": kind('s'), "pages": kind('m'), "checkpoints": kind('c'), "packs": kind('p') },
-            "deleted": deleted, "deleted_bytes": bytes, "young": young, "absent": absent, "ms": t0.elapsed().as_millis() as u64,
-        }))
+        deleted += d["deleted"].as_u64().unwrap_or(0);
+        bytes += d["bytes"].as_u64().unwrap_or(0);
+        young += d["young"].as_array().map_or(0, Vec::len);
+        absent += d["absent"].as_array().map_or(0, Vec::len);
     }
+    let kind = |p: char| plan.iter().filter(|n| n.split_once('/').is_some_and(|(_, r)| r.starts_with(p))).count();
+    Ok(json!({
+        "head": line, "objects_listed": objects.len(), "kept_checkpoints": kept_ids.iter().map(|(e, q)| format!("e{e}/c{q}")).collect::<Vec<_>>(),
+        "age_ms_min": age_ms_min, "planned": plan.len(), "planned_bytes": planned_bytes,
+        "planned_by_kind": { "segments": kind('s'), "pages": kind('m'), "checkpoints": kind('c'), "packs": kind('p') },
+        "deleted": deleted, "deleted_bytes": bytes, "young": young, "absent": absent, "ms": t0.elapsed().as_millis() as u64,
+    }))
 }
 
 /// An object of a disk as the store lists it: name, bytes, age in ms.
@@ -356,6 +398,27 @@ impl Place for Cloudflare {
         let _ = self.kill();
         net::worker(self.c.host(), &self.key, "POST", "/objects/delete", &json!({ "prefix": format!("disks/{}/", self.disk) }), Duration::from_secs(600)).unwrap_or(Value::Null)
     }
+
+    fn listing(&self) -> Result<(Option<String>, Vec<Stored>), String> {
+        let l = self.call("/clean/list", &json!({ "disk": self.disk }))?;
+        let objects = l["objects"]
+            .as_array()
+            .ok_or("no objects listed")?
+            .iter()
+            .map(|o| Some((o[0].as_str()?.to_string(), o[1].as_u64()?, o[2].as_u64()?)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("a malformed listing")?;
+        Ok((l["head"].as_str().map(str::to_string), objects))
+    }
+
+    fn object(&self, name: &str) -> Result<(Vec<u8>, String), String> {
+        let c = self.call("/clean/checkpoint", &json!({ "disk": self.disk, "name": name }))?;
+        Ok((unhex(c["hex"].as_str().ok_or_else(|| format!("{name}: absent"))?)?, c["sha256"].as_str().unwrap_or("").to_string()))
+    }
+
+    fn delete(&mut self, names: &[String], age_ms_min: u64) -> Result<Value, String> {
+        self.call("/clean/delete", &json!({ "disk": self.disk, "names": names, "age_ms_min": age_ms_min }))
+    }
 }
 
 /// Whether this run's disks are sealed (`FPAC_ENCRYPT` set): the test
@@ -378,19 +441,20 @@ pub fn mount(p: &dyn Place) -> Result<Value, String> {
     mount_with(p, "")
 }
 
+/// The daemon's key argument for this run (` --key-file …`, the test key
+/// put in the guest's tmpfs, mode 600), or nothing when the disk is plain.
+fn key_arg(p: &dyn Place) -> Result<String, String> {
+    let Some(hex) = sealed_key()? else { return Ok(String::new()) };
+    let (code, out) = p.sh(&format!("mkdir -p /run/fpac && (umask 077; printf '%s\\n' {hex} > /run/fpac/key) && echo keyed"))?;
+    if code != 0 || !out.contains("keyed") {
+        return Err(format!("the key file: {out}"));
+    }
+    Ok(" --key-file /run/fpac/key".into())
+}
+
 /// `fpac mount` with more arguments (`--cache-max <bytes>`, say).
 pub fn mount_with(p: &dyn Place, extra: &str) -> Result<Value, String> {
-    let extra = match sealed_key()? {
-        // the test key into the guest's tmpfs, mode 600, then named
-        Some(hex) => {
-            let (code, out) = p.sh(&format!("mkdir -p /run/fpac && (umask 077; printf '%s\\n' {hex} > /run/fpac/key) && echo keyed"))?;
-            if code != 0 || !out.contains("keyed") {
-                return Err(format!("the key file: {out}"));
-            }
-            format!("{extra} --key-file /run/fpac/key")
-        }
-        None => extra.to_string(),
-    };
+    let extra = format!("{extra}{}", key_arg(p)?);
     let (code, out) = p.sh(&format!("mkdir -p /run/fpac && setsid nohup /usr/local/bin/fpac mount --dir /data {extra} > /run/fpac/log 2>&1 < /dev/null & echo started"))?;
     if code != 0 || !out.contains("started") {
         return Err(format!("the daemon did not start: {out}"));
@@ -588,8 +652,8 @@ const CHECK_CLEAN_OK: [&str; 7] = ["big-ok", "files-ok", "sqlite-ok", "rows-ok",
 /// its end, two lives so the kept checkpoints move past the old segments,
 /// the delete pass, and the disk checked again; the store's objects
 /// before and after each.
-pub fn clean(p: &mut Cloudflare, kill_after: Duration) -> Result<Value, String> {
-    let life = |p: &mut Cloudflare, script: &str, ok: &[&str]| -> Result<Value, String> {
+pub fn clean(p: &mut dyn Place, kill_after: Duration) -> Result<Value, String> {
+    let life = |p: &mut dyn Place, script: &str, ok: &[&str]| -> Result<Value, String> {
         let st = p.start()?;
         let m = mount(p)?;
         let (code, out) = p.sh(script)?;
@@ -604,16 +668,16 @@ pub fn clean(p: &mut Cloudflare, kill_after: Duration) -> Result<Value, String> 
     r["life1"] = life(p, &format!("{WRITE_A}\n{WRITE_BIG}"), &["written"])?;
     r["life2"] = life(p, REWRITE_BIG, &["rewritten"])?;
     r["objects_before"] = p.objects();
-    r["cleaner_killed"] = p.cleaner(Some(kill_after))?;
+    r["cleaner_killed"] = cleaner(p, Some(kill_after))?;
     r["check_after_the_kill"] = life(p, CHECK_CLEAN, &CHECK_CLEAN_OK)?;
     r["objects_after_the_kill"] = p.objects();
-    r["cleaner"] = p.cleaner(None)?;
+    r["cleaner"] = cleaner(p, None)?;
     r["objects_after_compaction"] = p.objects();
     for i in 1..=2 {
         r[format!("life_after_{i}")] = life(p, &format!("echo {i} > /data/note && sync && echo noted"), &["noted"])?;
     }
     r["objects_before_deletes"] = p.objects();
-    r["deletes"] = p.delete_pass(0)?;
+    r["deletes"] = delete_pass(p, 0)?;
     r["objects_after_deletes"] = p.objects();
     r["check_after_deletes"] = life(p, CHECK_CLEAN, &CHECK_CLEAN_OK)?;
     Ok(r)
