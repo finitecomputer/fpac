@@ -327,6 +327,8 @@ fn disk_scenario(scenario: &str, place: &str, args: &[String]) -> Result<Value, 
         // named clean-…, the one kind the Worker lets a delete pass name an
         // age under a day for
         "clean" => disk::clean(p.as_mut(), Duration::from_millis(flag(args, "--kill-after-ms").and_then(|m| m.parse().ok()).unwrap_or(2500))),
+        // a write when the cache's disk is full (docs/design.md, The cache)
+        "full" => disk::full(p.as_mut()),
         // the cache gives room back (docs/design.md, The cache)
         "room" => disk::room(p.as_mut(), flag(args, "--ceiling-gib").and_then(|g| g.parse::<u64>().ok()).unwrap_or(6) << 30),
         // what sealing costs on this place's CPU (docs/encryption.md)
@@ -761,7 +763,7 @@ fn main() {
         (Some("path"), "krun") => krun_path(),
         (Some("path"), "cloudflare") => cf_path(),
         (Some("rangecheck"), p) => rangecheck(p, &args),
-        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead" | "clean" | "room")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
+        (Some(s @ ("lives" | "crash" | "wake" | "tools" | "thrash" | "npm" | "aead" | "clean" | "room" | "full")), place @ ("krun" | "cloudflare")) => disk_scenario(s, place, &args),
         // A command in the running Cloudflare container, for debugging a run.
         (Some("exec"), _) => Config::load().and_then(|c| {
             let key = net::Key::load_or_make(&c.driver_key_file);
@@ -845,7 +847,7 @@ fn main() {
     };
     match result {
         Ok(mut v) => {
-            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead", "clean", "room"].contains(&args[1].as_str()) {
+            if write_it && ["probe", "path", "ranges", "rangecheck", "lives", "crash", "wake", "tools", "thrash", "hermes", "npm", "aead", "clean", "room", "full"].contains(&args[1].as_str()) {
                 v["measured_at_ms"] = json!(now_ms());
                 v["commit"] = commit();
                 // the outside place writes a file of its own, so the two

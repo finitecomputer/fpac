@@ -767,6 +767,54 @@ pub fn room(p: &mut dyn Place, ceiling: u64) -> Result<Value, String> {
     }))
 }
 
+/// A full disk (docs/design.md, The cache): a life syncs 256 MiB of files
+/// (each acknowledged: its fsync returned; some still unshipped), then a
+/// writer beside the daemon takes every byte left on the cache's disk,
+/// past the cache's floor, and the life writes new data. That write must
+/// fail loudly: the program sees "No space left on device", and the
+/// daemon counts and logs a typed no-space error, unfenced. Then the room
+/// comes back, the sleep ships everything, and the next life finds every
+/// acknowledged file.
+pub fn full(p: &mut dyn Place) -> Result<Value, String> {
+    let st = p.start()?;
+    let m = mount(p)?;
+    let free = guest_free(p)?;
+    // a computer's own disk only, never one this run should not fill
+    if free > 25 << 30 {
+        return Err(format!("the guest's disk has {free} bytes free: not a computer's 20 GB disk, so not filled"));
+    }
+    let (code, out) = p.sh("set -e; mkdir -p /data/acked; for i in $(seq 1 64); do head -c 4194304 /dev/urandom > /data/acked/a$i; sync /data/acked/a$i; done; sha256sum /data/acked/* > /data/acked.sha256; sync; echo acked")?;
+    if code != 0 || !out.contains("acked") {
+        return Err(format!("the acknowledged files: {out}"));
+    }
+    let acked = status(p);
+    // every byte: what an unprivileged writer may take, then the root's
+    // reserve, until nothing is left (three rounds, two seconds apart, so
+    // whatever the cache gives back is taken too)
+    let (_, fill) = p.sh("fallocate -l $(df -B1 --output=avail /var/lib/fpac | tail -n 1) /var/lib/ballast; for i in 1 2 3; do dd if=/dev/zero of=/var/lib/ballast-$i bs=1M status=none 2>&1 | tail -n 1; sleep 2; done; echo free-blocks $(stat -f -c %f /var/lib/fpac)")?;
+    let (_, new) = p.sh("dd if=/dev/urandom of=/data/new bs=1M count=64 conv=fsync status=none 2>&1; echo exit=$?")?;
+    std::thread::sleep(Duration::from_secs(2));
+    let after = status(p);
+    let (_, log) = p.sh("grep -E 'no-space|\"error\"' /run/fpac/log | head -n 5")?;
+    let (_, reread) = p.sh("sha256sum -c --quiet /data/acked.sha256 && echo acked-readable")?;
+    p.sh("rm -f /var/lib/ballast /var/lib/ballast-*")?;
+    let s1 = sleep(p)?;
+    p.kill()?;
+    let st2 = p.start()?;
+    let m2 = mount(p)?;
+    let (_, check) = p.sh("sha256sum -c --quiet /data/acked.sha256 && echo acked-ok")?;
+    let s2 = sleep(p)?;
+    p.kill()?;
+    let loud = !new.contains("exit=0") && new.contains("No space left on device");
+    let typed = after["no_space_errors"].as_u64().unwrap_or(0) > 0 && log.contains("no-space");
+    let ok = loud && typed && after["fenced"] == false && s1["flushed"]["error"].is_null() && check.contains("acked-ok");
+    Ok(json!({
+        "what": p.what(), "ok": ok, "failed_loudly": loud, "typed": typed,
+        "life1": { "start": st, "mount": m, "free_bytes": free, "acked": acked, "fill": fill, "new_write": new, "after": after, "log": log, "reread_while_full": reread, "sleep": s1 },
+        "life2": { "start": st2, "mount": m2, "check": check, "sleep": s2 },
+    }))
+}
+
 /// Rounds of a guest killed mid-write, each next life checked.
 pub fn crash(p: &mut dyn Place, rounds: u32) -> Result<Value, String> {
     let mut required: u64 = 0;
