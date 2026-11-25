@@ -20,7 +20,6 @@ fpac-remote = { path = "crates/remote" }
 fpac-testkit = { path = "crates/testkit" }
 fpac-format = { path = "crates/format" }
 fpac-store = { path = "crates/store" }
-fpac = { path = "crates/fpac" }
 # Syscalls: /dev/fuse, the loop device's ioctls, mount, prctl, mlockall.
 libc = "=0.2.189"
 # A put names its body's SHA-256, which the remote checks (docs/contract.md).
