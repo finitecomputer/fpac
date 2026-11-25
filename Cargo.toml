@@ -39,8 +39,8 @@ serde_json = "=1.0.151"
 # The driver alone (never the guest): TLS to the deployed Worker and to
 # Cloudflare's API, and the ECDSA P-256 key that signs its calls.
 ring = "=0.17.14"
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "=1.0.9"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "=1.0.12"
 
 # The seatbelt stays on, as sandcastle's and macrofiche's: a failed
 # assertion takes the whole process down, never one thread of it while the
