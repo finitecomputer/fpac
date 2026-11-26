@@ -101,6 +101,18 @@ written, ships it with whatever is still shipping, writes the pack and a
 checkpoint naming it, posts the head **marked clean**, and exits. The
 platform then destroys the container.
 
+**A remote that does not answer at the sleep.** Its puts, its head and
+the map pages its checkpoint rewrites and has not loaded are all asked
+again until they answer, pausing up to 5 s between tries. That's
+unbounded on purpose: the caller's bound on the stop (a platform
+destroys the container past it) ends a stop that never lands. Its head
+is then not marked clean, and the next life replays what landed, as
+after a crash, so no synced write is lost. A page refused as asked (a
+4xx) is not asked again; one that comes back damaged is tried 5 times
+more. v0.1.0 tried a sleep's page loads only 5 times more, with no
+pause, and exited unclean while the remote was down. A periodic
+checkpoint still does, and fails then.
+
 While awake: a cut about once a second when something changed. **A cut
 only names its extents**; each segment is built from the cache file
 when a put slot is free, and eight puts are in flight at once, each

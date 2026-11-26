@@ -679,3 +679,125 @@ fn mount(dir: &Path, host: &str, port: u16, state: &Path, cache_path: &Path, cac
     event(t0, "exit", json!({}));
     last.map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use fpac_device::serve::Backing;
+    use fpac_format::limits::PAGE_EXTENTS;
+    use fpac_testkit::folder::{Folder, Listen};
+
+    use super::*;
+
+    const E: u64 = EXTENT_BYTES as u64;
+    /// An extent in the disk's first map page, and two in its second.
+    const IN_PAGE_0: u64 = 3;
+    const IN_PAGE_1: u64 = PAGE_EXTENTS as u64 + 7;
+
+    /// A life of the disk `folder` holds: its remote served on a port of
+    /// this host, its store opened, its disk over a cache in `dir`, and
+    /// the segments its open replayed.
+    fn life(folder: Folder, dir: &Path) -> (Arc<Folder>, Arc<Disk>, u32) {
+        let running = folder.start(Listen::Tcp(std::net::TcpListener::bind("127.0.0.1:0").unwrap()));
+        let port = running.port.expect("a TCP port");
+        let Opened { store, volume, .. } = open_store("127.0.0.1", port, None).unwrap();
+        let replayed = store.opened().replayed;
+        let cache = FileCache::create(&dir.join(format!("cache-e{}", store.epoch())), volume, None).unwrap();
+        let disk = Arc::new(Disk::new(store, cache, "127.0.0.1", port, volume).unwrap());
+        disk.set_me();
+        (running.folder, disk, replayed)
+    }
+
+    fn write(disk: &Disk, extent: u64, byte: u8) {
+        disk.write_at(extent * E, &vec![byte; E as usize]).unwrap();
+    }
+
+    fn read(disk: &Disk, extent: u64) -> u8 {
+        let mut b = vec![0u8; E as usize];
+        disk.read_at(extent * E, &mut b).unwrap();
+        assert!(b.iter().all(|x| *x == b[0]), "extent {extent} reads as one write");
+        b[0]
+    }
+
+    /// Two lives: the first writes in both pages and sleeps clean; the
+    /// second opens with neither page loaded and writes in the second,
+    /// which its sleep's checkpoint must load. Answers the second life,
+    /// its first segments landed (as its last turn begins), and the dir.
+    fn second_life(name: &str) -> (std::path::PathBuf, Arc<Folder>, Arc<Disk>, Progress) {
+        let dir = std::env::temp_dir().join(format!("fpac-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, disk, _) = life(Folder::new(&dir, "disk", 1), &dir);
+        write(&disk, IN_PAGE_0, 0xa1);
+        write(&disk, IN_PAGE_1, 0xa2);
+        flush::last(&disk, &Progress::default()).unwrap();
+        assert!(first.head.lock().unwrap().is_some_and(|h| h.clean), "the first life slept clean");
+        let (second, disk, _) = life(first.next_life(2), &dir);
+        write(&disk, IN_PAGE_1, 0xb2);
+        write(&disk, IN_PAGE_1 + 1, 0xb3);
+        let p = Progress::default();
+        flush::first_head(&disk, &p).unwrap();
+        flush::flush_once(&disk, &p).unwrap();
+        // else this proves nothing: its sleep's checkpoint loads a page
+        let needs = disk.inner.lock().unwrap().store.checkpoint_needs(true);
+        assert!(!needs.is_empty(), "the second life's sleep must load a page it never read");
+        (dir, second, disk, p)
+    }
+
+    /// The third life: what it replayed, and each extent as it reads.
+    fn third_life(dir: &Path, second: &Folder) -> (u32, [u8; 3]) {
+        let (_, disk, replayed) = life(second.next_life(3), dir);
+        (replayed, [read(&disk, IN_PAGE_0), read(&disk, IN_PAGE_1), read(&disk, IN_PAGE_1 + 1)])
+    }
+
+    #[test]
+    fn a_sleep_whose_page_loads_are_refused_asks_again_and_sleeps_clean() {
+        let (dir, second, disk, p) = second_life("sleep-loads");
+        // one refusal more than a periodic checkpoint's tries (v0.1.0's
+        // sleep gave up there), then the store answers
+        let refused = flush::PAGE_TRIES + 1;
+        second.faults.unavailable_page_gets.store(refused, Ordering::SeqCst);
+        let last = flush::last(&disk, &p);
+        assert!(last.is_ok(), "the sleep waits for its page loads: {last:?}");
+        assert_eq!(second.faults.unavailable_page_gets.load(Ordering::SeqCst), 0, "every refusal was asked through");
+        assert!(second.head.lock().unwrap().is_some_and(|h| h.epoch == 2 && h.clean), "its head is clean");
+        // the next life replays nothing, and reads every write
+        assert_eq!(third_life(&dir, &second), (0, [0xa1, 0xb2, 0xb3]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_live_read_asks_again_for_a_page_that_came_back_damaged() {
+        let (dir, second, disk, _) = second_life("read-damaged");
+        // the second life never read the first page: this read loads it,
+        // and its first answer is damaged
+        second.faults.damage_page_gets.store(1, Ordering::SeqCst);
+        assert_eq!(read(&disk, IN_PAGE_0), 0xa1, "the read asks again and reads the first life's write");
+        assert_eq!(second.faults.damage_page_gets.load(Ordering::SeqCst), 0, "else this proves nothing: the page came back damaged once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sleep_whose_page_is_refused_for_good_fails_at_once_and_a_crash_open_keeps_every_write() {
+        let (dir, second, disk, p) = second_life("sleep-refused");
+        // the store refuses the page as asked (a 4xx), every time: a call
+        // never tried again, unlike a remote that is down
+        second.faults.refuse_page_gets.store(u32::MAX, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = disk.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(flush::last(&d, &p));
+        });
+        // bounded: a sleep that asked a refusal again would never end
+        let last = rx.recv_timeout(Duration::from_secs(10)).expect("the sleep ends: a refusal is not asked again");
+        assert!(matches!(&last, Err(StoreError::Refused(_))), "its error: {last:?}");
+        assert_eq!(second.faults.refuse_page_gets.load(Ordering::SeqCst), u32::MAX - 1, "asked once: a refusal is not asked again");
+        assert!(second.head.lock().unwrap().is_some_and(|h| h.epoch == 2 && !h.clean), "its head is not clean");
+        // every write landed before the checkpoint: the next life replays it
+        let (replayed, read) = third_life(&dir, &second);
+        assert!(replayed > 0, "a head not clean is replayed");
+        assert_eq!(read, [0xa1, 0xb2, 0xb3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

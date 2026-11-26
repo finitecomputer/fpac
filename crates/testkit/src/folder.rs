@@ -30,6 +30,15 @@ pub struct Faults {
     pub lose_put_answer: AtomicU32,
     /// Answer the next N calls 503 without doing them.
     pub unavailable: AtomicU32,
+    /// Answer the next N gets of map pages (`e<epoch>/m<seq>-<page>`) 503:
+    /// an outage that lands on a checkpoint's page loads alone.
+    pub unavailable_page_gets: AtomicU32,
+    /// Answer the next N gets of map pages 403: a refusal, never tried
+    /// again.
+    pub refuse_page_gets: AtomicU32,
+    /// Serve the next N gets of map pages with one byte flipped, under the
+    /// stored checksum: an answer damaged on its way.
+    pub damage_page_gets: AtomicU32,
     /// Send the next N ranged gets' heads and half their bodies, then
     /// close: an answer cut short.
     pub cut_get_body: AtomicU32,
@@ -141,6 +150,15 @@ impl Folder {
             return Ok(true);
         }
         let route = req.path.strip_prefix("/o/");
+        let page = route.and_then(|n| n.split_once('/')).is_some_and(|(_, o)| o.starts_with('m'));
+        if req.method == "GET" && page && take(&self.faults.unavailable_page_gets) {
+            answer(s, 503, &[], b"unavailable (a fault asked for)")?;
+            return Ok(true);
+        }
+        if req.method == "GET" && page && take(&self.faults.refuse_page_gets) {
+            answer(s, 403, &[], b"refused (a fault asked for)")?;
+            return Ok(true);
+        }
         if route.is_some() && self.object_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.object_ms));
         }
@@ -200,7 +218,12 @@ impl Folder {
             None => {
                 let mut bytes = Vec::with_capacity(len as usize);
                 f.read_to_end(&mut bytes)?;
-                answer(s, 200, &[(SHA256_HEADER, hex(&sha256(&bytes)))], &bytes)
+                let sum = hex(&sha256(&bytes));
+                let page = name.split_once('/').is_some_and(|(_, o)| o.starts_with('m'));
+                if page && !bytes.is_empty() && take(&self.faults.damage_page_gets) {
+                    bytes[0] ^= 0xff;
+                }
+                answer(s, 200, &[(SHA256_HEADER, sum)], &bytes)
             }
             Some(r) => match parse_range(r) {
                 Some((a, _)) if a >= len => answer(s, 416, &[], b"the range starts past the end"),

@@ -13,7 +13,7 @@ use fpac_remote::{Head, HeadAnswer, RemoteError};
 use fpac_store::{ship, Kind, Outgoing, StoreError};
 use serde_json::json;
 
-use crate::disk::{Disk, Inner};
+use crate::disk::{Disk, Inner, PageError};
 
 /// How often a cut is taken while something changed: the loss window
 /// for synced writes (docs/contract.md).
@@ -208,16 +208,7 @@ pub fn checkpoint(disk: &Disk, p: &Progress, clean: bool) -> Result<(), StoreErr
     // segments, so none becomes dirty meanwhile)
     let needs = disk.inner.lock().unwrap().store.checkpoint_needs(clean);
     for pr in needs {
-        // Bounded: an unavailable remote is retried a few times, then the
-        // checkpoint waits for the next turn.
-        let mut tries = 0;
-        loop {
-            match disk.load_page(pr) {
-                Ok(()) => break,
-                Err(StoreError::Unavailable(_)) if tries < 5 => tries += 1,
-                Err(e) => return Err(e),
-            }
-        }
+        load_page(disk, pr, clean)?;
     }
     let (objs, epoch) = {
         let mut g = disk.inner.lock().unwrap();
@@ -239,6 +230,39 @@ pub fn checkpoint(disk: &Disk, p: &Progress, clean: bool) -> Result<(), StoreErr
     post_head(disk, &Head { epoch, checkpoint: Some(cr), clean })?;
     p.checkpoints.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Tries of a page load a checkpoint makes again before it fails (v0.1.0's):
+/// a periodic one's for any failure of the remote, a sleep's for an answer
+/// that came back damaged or malformed.
+pub const PAGE_TRIES: u32 = 5;
+
+/// One page a checkpoint rewrites, loaded. A sleep's (`clean`) asks a
+/// remote that is down again as its puts do, pausing up to PAUSE_MS_MAX:
+/// unbounded on purpose, as theirs is (its caller's bound on the stop, a
+/// platform's destroy, ends one that never lands, its head not clean). A
+/// refusal it does not ask again. Everything else of the remote is tried
+/// PAGE_TRIES times more; the store's own refusal of the page, not again.
+fn load_page(disk: &Disk, pr: fpac_format::PageRef, clean: bool) -> Result<(), StoreError> {
+    let mut pause = 100;
+    let mut tries = 0;
+    loop {
+        let e = match disk.fetch_page(pr) {
+            Ok(()) => return Ok(()),
+            Err(PageError::Store(e)) => return Err(e),
+            Err(PageError::Remote(e)) => e,
+        };
+        match e {
+            RemoteError::Unavailable(why) if clean => {
+                eprintln!("{}", json!({ "fpac": "page-retry", "page": pr.page, "why": why, "pause_ms": pause }));
+                std::thread::sleep(Duration::from_millis(pause));
+                pause = (pause * 2).min(PAUSE_MS_MAX);
+            }
+            e @ RemoteError::Refused { .. } if clean => return Err(StoreError::Refused(format!("{}: {e}", fpac_store::page_name(&pr)))),
+            _ if tries < PAGE_TRIES => tries += 1,
+            e => return Err(StoreError::Unavailable(e.to_string())),
+        }
+    }
 }
 
 /// A put that ended: its segment and its bytes, and how.
