@@ -629,10 +629,13 @@ fn deploy() -> Result<Value, String> {
     let key = net::Key::load_or_make(&c.driver_key_file);
     let (ctx, tag) = stage()?;
     let dir = stage_worker(&c, &key, &ctx)?;
-    if !dir.join("node_modules/wrangler").exists() {
-        let path = format!("{}:{}", c.node_dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
-        run(Command::new(c.node_dir.join("bin/npm")).current_dir(&dir).args(["ci", "--no-audit", "--no-fund"]).env("PATH", path))?;
-    }
+    // `npm ci` at every deploy: the work directory outlives a checkout's
+    // lockfile, and an install kept because `node_modules/wrangler` was
+    // there ran the wrangler of an older lockfile after an update. A
+    // recorded hash would save the install's seconds, not a deploy's
+    // minutes of image builds.
+    let path = format!("{}:{}", c.node_dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    run(Command::new(c.node_dir.join("bin/npm")).current_dir(&dir).args(["ci", "--no-audit", "--no-fund"]).env("PATH", path))?;
     let token = c.token();
     let a = &c.account_id;
     let (s, _) = net::api(&token, "GET", &format!("/accounts/{a}/r2/buckets/{}", c.bucket_name), None)?;

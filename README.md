@@ -48,7 +48,7 @@ What it showed (2026-11-19):
 
 ## Build and test
 
-Rust 1.99.0, pinned by `rust-toolchain.toml` (rustup installs it), on
+Rust 1.100.0, pinned by `rust-toolchain.toml` (rustup installs it), on
 Linux or macOS:
 
 ```sh
