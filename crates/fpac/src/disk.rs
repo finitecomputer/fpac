@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use fpac_device::serve::{Backing, BackingError};
 use fpac_format::limits::{AHEAD_EXTENTS_MAX, AHEAD_PIECE_EXTENTS, DIRTY_EXTENTS_MAX, EXTENT_BYTES, FETCH_TRIES_MAX, PACK_BYTES_MAX, UNSHIPPED_BYTES_MAX};
-use fpac_remote::Remote;
+use fpac_remote::{Remote, RemoteError};
 use fpac_format::{PageRef, Place, Sealer};
 use fpac_store::evict::{Evictor, Taken, Verdict};
 use fpac_store::{page_name, CacheGate, Fetch, Need, Read, Store, StoreError};
@@ -691,8 +691,18 @@ impl Disk {
     }
 
     /// A map page, fetched without the lock and installed under it
-    /// (lazy pages: docs/design.md).
+    /// (lazy pages: docs/design.md). Every failure of the remote is one to
+    /// try again, as a read's or a write's bound allows.
     pub fn load_page(&self, pr: PageRef) -> Result<(), StoreError> {
+        self.fetch_page(pr).map_err(|e| match e {
+            PageError::Remote(e) => StoreError::Unavailable(e.to_string()),
+            PageError::Store(e) => e,
+        })
+    }
+
+    /// `load_page`, the remote's failure kept as it said it: a sleep's
+    /// checkpoint asks again only a remote that is down (flush.rs).
+    pub fn fetch_page(&self, pr: PageRef) -> Result<(), PageError> {
         let mut r = self.remote();
         let mut body = Vec::new();
         let got = r.get(&page_name(&pr), &mut |b| body.extend_from_slice(b));
@@ -700,10 +710,10 @@ impl Disk {
         match got {
             Ok(Some(_)) => {
                 self.stats.page_loads.fetch_add(1, Ordering::Relaxed);
-                self.inner.lock().unwrap().store.install_page(pr, &body)
+                self.inner.lock().unwrap().store.install_page(pr, &body).map_err(PageError::Store)
             }
-            Ok(None) => Err(StoreError::Corrupt(format!("{} is gone, and a checkpoint names it", page_name(&pr)))),
-            Err(e) => Err(StoreError::Unavailable(e.to_string())),
+            Ok(None) => Err(PageError::Store(StoreError::Corrupt(format!("{} is gone, and a checkpoint names it", page_name(&pr))))),
+            Err(e) => Err(PageError::Remote(e)),
         }
     }
 
@@ -897,6 +907,14 @@ fn pieces(offset: u64, len: usize) -> impl Iterator<Item = (u64, u32, usize, usi
         at += n;
         Some(piece)
     })
+}
+
+/// Why a map page did not load: the remote's answer, its kind kept, or
+/// the store's (its page refused as malformed, or gone).
+#[derive(Debug)]
+pub enum PageError {
+    Remote(RemoteError),
+    Store(StoreError),
 }
 
 impl Backing for Disk {
